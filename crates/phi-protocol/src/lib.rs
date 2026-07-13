@@ -79,12 +79,12 @@ pub struct CommandSpec {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelSpec {
+    pub provider: String,
     pub id: String,
+    pub model: String,
     pub label: String,
     #[serde(default)]
     pub description: String,
-    #[serde(default)]
-    pub default: bool,
     #[serde(default)]
     pub reasoning: Vec<PickerOptionSpec>,
     #[serde(default)]

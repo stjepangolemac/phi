@@ -4,12 +4,11 @@
 (define (init encoded-config)
   (define config (string->jsexpr encoded-config))
   (value->jsexpr-string
-    (hash 'messages '() 'pending_call "" 'estimated_tokens 0
-          'compactions 0 'last_usage (hash)
-          'model (default-model-id)
-          'reasoning (default-model-reasoning)
-          'service_tier (default-model-service-tier)
-          'context_char_budget (hash-ref config 'context_char_budget))))
+    (make-state '() "" 0 (hash) (hash-ref config 'context_char_budget)
+                (or (hash-try-get config 'model) "")
+                (or (hash-try-get config 'reasoning) "")
+                (or (hash-try-get config 'service_tier) "")
+                "ready" "")))
 
 (define (on-event encoded-state encoded-event)
   (define state (string->jsexpr encoded-state))
@@ -20,10 +19,11 @@
   (define compactions (hash-ref state 'compactions))
   (define last-usage (hash-ref state 'last_usage))
   (define context-budget (hash-ref state 'context_char_budget))
-  (define model (or (hash-try-get state 'model) (default-model-id)))
-  (define reasoning (or (hash-try-get state 'reasoning) (default-model-reasoning)))
-  (define service-tier
-    (or (hash-try-get state 'service_tier) (default-model-service-tier)))
+  (define model (hash-ref state 'model))
+  (define reasoning (hash-ref state 'reasoning))
+  (define service-tier (hash-ref state 'service_tier))
+  (define activity (hash-ref state 'activity))
+  (define pending-finish (hash-ref state 'pending_finish))
   (define next-state state)
   (define effect
     (cond
@@ -32,13 +32,9 @@
              (append messages
                      (list (hash 'kind "message" 'role "user"
                                  'content (hash-ref event 'content)))))
-       (define compacted (compact-messages messages context-budget))
-       (if (< (length compacted) (length messages))
-           (set! compactions (+ compactions 1)))
-       (set! messages compacted)
        (set! next-state
              (make-state messages "" compactions last-usage context-budget
-                         model reasoning service-tier))
+                         model reasoning service-tier "working" ""))
        (request-effect messages model reasoning service-tier)]
       [(equal? event-type "model_selected")
        (set! model (hash-ref event 'model))
@@ -46,45 +42,78 @@
        (set! service-tier (hash-ref event 'service_tier))
        (set! next-state
              (make-state messages pending-call compactions last-usage
-                         context-budget model reasoning service-tier))
+                         context-budget model reasoning service-tier "ready" ""))
        (hash 'type "finish" 'content
              (string-append "Model set to " model " · " reasoning
                             " · " service-tier))]
       [(equal? event-type "http_completed")
-       (if (not (hash-ref event 'success))
-           (hash 'type "finish" 'content (hash-ref event 'error))
-           (let ([call (provider-call (hash-ref event 'events))]
-                 [usage (provider-usage (hash-ref event 'events))]
-                 [preserved (provider-preserved-items (hash-ref event 'events))])
-             (if usage (set! last-usage usage))
-             (set! messages (append messages preserved))
-             (if call
-                 (begin
-                   (set! messages (append messages (list call)))
-                   (set! next-state
-                         (make-state messages (hash-ref call 'call_id)
-                                     compactions last-usage context-budget
-                                     model reasoning service-tier))
-                   (hash 'type "run_tool"
-                         'name (hash-ref call 'name)
-                         'arguments (provider-arguments call)))
-                 (let ([content (provider-output (hash-ref event 'events))]
-                       [phase (provider-message-phase (hash-ref event 'events))])
-                   (set! messages
-                         (append messages
-                                 (list (if phase
-                                           (hash 'kind "message" 'role "assistant"
-                                                 'content content 'phase phase)
-                                           (hash 'kind "message" 'role "assistant"
-                                                 'content content)))))
-                   (set! next-state
-                         (make-state messages "" compactions
-                                     last-usage context-budget model
-                                     reasoning service-tier))
-                   (hash 'type "finish"
-                         'content (if (equal? content "")
-                                      "Model returned no output."
-                                      content))))))]
+       (cond
+         [(not (hash-ref event 'success))
+          (set! next-state
+                (make-state messages "" compactions last-usage context-budget
+                            model reasoning service-tier "ready" ""))
+          (hash 'type "finish" 'content (hash-ref event 'error))]
+         [(equal? activity "compacting")
+          (set! messages
+                (complete-selected-compaction
+                  messages context-budget (hash-ref event 'events)))
+          (set! compactions (+ compactions 1))
+          (set! last-usage (hash))
+          (if (equal? pending-finish "")
+              (begin
+                (set! next-state
+                      (make-state messages "" compactions last-usage
+                                  context-budget model reasoning service-tier
+                                  "working" ""))
+                (request-effect messages model reasoning service-tier))
+              (begin
+                (set! next-state
+                      (make-state messages "" compactions last-usage
+                                  context-budget model reasoning service-tier
+                                  "ready" ""))
+                (hash 'type "finish" 'content pending-finish)))]
+         [else
+          (define events (hash-ref event 'events))
+          (define call (provider-call-for model events))
+          (define usage (provider-usage-for model events))
+          (define preserved (provider-preserved-items-for model events))
+          (if usage (set! last-usage usage))
+          (set! messages (append messages preserved))
+          (if call
+              (begin
+                (set! messages (append messages (list call)))
+                (set! next-state
+                      (make-state messages (hash-ref call 'call_id)
+                                  compactions last-usage context-budget
+                                  model reasoning service-tier "working" ""))
+                (hash 'type "run_tool"
+                      'name (hash-ref call 'name)
+                      'arguments (provider-arguments-for model call)))
+              (let* ([content (provider-output-for model events)]
+                     [finished-content (if (equal? content "")
+                                           "Model returned no output."
+                                           content)]
+                     [phase (provider-message-phase-for model events)])
+                (set! messages
+                      (append messages
+                              (list (if phase
+                                        (hash 'kind "message" 'role "assistant"
+                                              'content content 'phase phase)
+                                        (hash 'kind "message" 'role "assistant"
+                                              'content content)))))
+                (if (selected-compaction-needed? messages context-budget)
+                    (begin
+                      (set! next-state
+                            (make-state messages "" compactions last-usage
+                                        context-budget model reasoning service-tier
+                                        "compacting" finished-content))
+                      (start-selected-compaction messages context-budget))
+                    (begin
+                      (set! next-state
+                            (make-state messages "" compactions last-usage
+                                        context-budget model reasoning service-tier
+                                        "ready" ""))
+                      (hash 'type "finish" 'content finished-content)))))])]
       [(equal? event-type "tool_completed")
        (set! messages
              (append messages
@@ -92,29 +121,38 @@
                                  'call_id pending-call
                                  'content (value->jsexpr-string
                                             (hash-ref event 'result))))))
-       (set! messages (compact-messages messages context-budget))
-       (set! next-state
-             (make-state messages "" compactions last-usage context-budget
-                         model reasoning service-tier))
-       (request-effect messages model reasoning service-tier)]
+       (if (selected-compaction-needed? messages context-budget)
+           (begin
+             (set! next-state
+                   (make-state messages "" compactions last-usage context-budget
+                               model reasoning service-tier "compacting" ""))
+             (start-selected-compaction messages context-budget))
+           (begin
+             (set! next-state
+                   (make-state messages "" compactions last-usage context-budget
+                               model reasoning service-tier "working" ""))
+             (request-effect messages model reasoning service-tier)))]
       [else (hash 'type "finish" 'content "Unsupported event.")]))
   (value->jsexpr-string
     (hash 'state (value->jsexpr-string next-state)
           'effects (list effect))))
 
 (define (request-effect messages model reasoning service-tier)
-  (provider-effect
-    (build-prompt messages agent-instructions (registered-tools))
+  (provider-request
+    (build-selected-prompt messages agent-instructions (registered-tools))
     model reasoning service-tier))
 
 (define (make-state messages pending-call compactions last-usage context-budget
-                    model reasoning service-tier)
+                    model reasoning service-tier activity pending-finish)
   (hash 'messages messages
         'pending_call pending-call
-        'estimated_tokens (quotient (string-length (value->jsexpr-string messages)) 4)
+        'estimated_tokens
+          (quotient (string-length (value->jsexpr-string messages)) 4)
         'compactions compactions
         'last_usage last-usage
         'model model
         'reasoning reasoning
         'service_tier service-tier
+        'activity activity
+        'pending_finish pending-finish
         'context_char_budget context-budget))

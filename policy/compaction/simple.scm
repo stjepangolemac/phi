@@ -1,72 +1,45 @@
-;; Keep the newest usable context and replace older turns with a small marker.
-(define (compact-messages messages max-chars)
-  (if (<= (encoded-length messages) max-chars)
-      messages
-      (let* ([minimum (if (and (> (length messages) 1)
-                               (equal? (hash-ref (last-message messages) 'kind)
-                                       "tool_result"))
-                          2
-                          1)]
-             [recent-count (min 6 (length messages))]
-             [recent (drop-first messages (- (length messages) recent-count))])
-        (fit-recent recent minimum max-chars))))
+;; Summarize oversized history through any registered model.
+(define (compaction-needed? messages max-chars _config)
+  (> (encoded-length messages) max-chars))
 
-(define (fit-recent recent minimum max-chars)
-  (define candidate (cons (compaction-marker) recent))
+(define (start-compaction messages _max-chars config)
+  (provider-request
+    (hash 'instructions
+          "Summarize the conversation for another model that will continue the work. Preserve user requirements, decisions, file paths, code changes, tool results, unresolved work, and current state. Be concise and return only the summary."
+          'messages (portable-messages messages)
+          'tools '())
+    (hash-ref config 'model)
+    (hash-ref config 'reasoning)
+    (hash-ref config 'service_tier)))
+
+(define (complete-compaction _messages max-chars events config)
+  (define summary
+    (provider-output-for (hash-ref config 'model) events))
+  (if (equal? summary "")
+      (error! "compactor returned no summary")
+      (fit-summary summary max-chars)))
+
+(define (portable-messages messages)
+  (cond
+    [(null? messages) '()]
+    [(equal? (hash-ref (car messages) 'kind) "provider_item")
+     (portable-messages (cdr messages))]
+    [else (cons (car messages) (portable-messages (cdr messages)))]))
+
+(define (fit-summary summary max-chars)
+  (define candidate
+    (list (hash 'kind "message" 'role "user"
+                'content (string-append "Conversation summary:\n" summary))))
   (cond
     [(<= (encoded-length candidate) max-chars) candidate]
-    [(> (length recent) minimum)
-     (fit-recent (cdr recent) minimum max-chars)]
+    [(equal? summary "") (error! "compaction budget is too small")]
     [else
-     (fit-required recent max-chars (encoded-length recent))]))
-
-;; A single message or tool call/result pair can itself exceed the budget.
-(define (fit-required required max-chars content-limit)
-  (define candidate
-    (cons (compaction-marker)
-          (map (lambda (message) (truncate-message message content-limit))
-               required)))
-  (if (or (<= (encoded-length candidate) max-chars)
-          (= content-limit 0))
-      candidate
-      (fit-required required max-chars (quotient content-limit 2))))
-
-(define (truncate-message message limit)
-  (define kind (hash-ref message 'kind))
-  (cond
-    [(equal? kind "message")
-     (hash 'kind kind
-           'role (hash-ref message 'role)
-           'content (truncate-text (hash-ref message 'content) limit))]
-    [(equal? kind "tool_call")
-     (hash 'kind kind
-           'call_id (hash-ref message 'call_id)
-           'name (hash-ref message 'name)
-           'arguments (truncate-text (hash-ref message 'arguments) limit))]
-    [(equal? kind "tool_result")
-     (hash 'kind kind
-           'call_id (hash-ref message 'call_id)
-           'content (truncate-text (hash-ref message 'content) limit))]
-    [else message]))
-
-(define (truncate-text text limit)
-  (if (> (string-length text) limit)
-      (string-append (substring text 0 limit) "...[truncated]")
-      text))
-
-(define (compaction-marker)
-  (hash 'kind "message" 'role "user"
-        'content "Earlier context was compacted."))
+     (fit-summary
+       (substring summary 0 (quotient (string-length summary) 2))
+       max-chars)]))
 
 (define (encoded-length messages)
   (string-length (value->jsexpr-string messages)))
 
-(define (last-message messages)
-  (if (null? (cdr messages))
-      (car messages)
-      (last-message (cdr messages))))
-
-(define (drop-first items count)
-  (if (or (= count 0) (null? items))
-      items
-      (drop-first (cdr items) (- count 1))))
+(register-compactor! "simple" compaction-needed? start-compaction
+                     complete-compaction)

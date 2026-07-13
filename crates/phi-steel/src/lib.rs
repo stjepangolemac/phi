@@ -1,4 +1,7 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use phi_protocol::{CommandSpec, Event, ModelSpec, PolicyOutput};
@@ -10,9 +13,18 @@ pub struct Policy {
 }
 
 const PLUGIN_PRELUDE: &str = r#"
+(require-builtin steel/json)
+(require-builtin steel/hash)
+
 (define command-registry '())
 (define model-registry '())
 (define tool-registry '())
+(define provider-registry '())
+(define prompt-builder-registry '())
+(define compactor-registry '())
+(define selected-prompt-builder "")
+(define selected-compactor "")
+(define selected-compactor-config (hash))
 (define agent-instructions "")
 (define session-id "")
 
@@ -28,8 +40,38 @@ const PLUGIN_PRELUDE: &str = r#"
   (set! command-registry
         (append command-registry (list (hash 'spec spec 'handler handler)))))
 
-(define (register-model! spec)
-  (set! model-registry (append model-registry (list spec))))
+(define (register-provider! name effect call arguments output usage preserved phase)
+  (set! provider-registry
+        (append provider-registry
+                (list (hash 'name name 'effect effect 'call call
+                            'arguments arguments 'output output 'usage usage
+                            'preserved preserved 'phase phase)))))
+
+(define (register-model! provider spec)
+  (define model (hash-ref spec 'id))
+  (set! model-registry
+        (append model-registry
+                (list (hash-insert
+                        (hash-insert
+                          (hash-insert spec 'provider provider)
+                          'model model)
+                        'id (string-append provider "/" model))))))
+
+(define (register-prompt-builder! name builder)
+  (set! prompt-builder-registry
+        (append prompt-builder-registry (list (hash 'name name 'builder builder)))))
+
+(define (register-compactor! name needed start complete)
+  (set! compactor-registry
+        (append compactor-registry
+                (list (hash 'name name 'needed needed 'start start
+                            'complete complete)))))
+
+(define (select-prompt-builder! name) (set! selected-prompt-builder name))
+(define (select-compactor! name config)
+  (set! selected-compactor name)
+  (set! selected-compactor-config config))
+(define (load-plugin! _) #t)
 
 (define (registered-command-specs)
   (map (lambda (entry) (hash-ref entry 'spec)) command-registry))
@@ -38,25 +80,59 @@ const PLUGIN_PRELUDE: &str = r#"
 (define (registered-tools) tool-registry)
 (define (runtime-session-id) session-id)
 
-(define (default-model-id)
-  (define (find-default models)
-    (cond [(null? models) (error! "provider registered no default model")]
-          [(hash-ref (car models) 'default) (hash-ref (car models) 'id)]
-          [else (find-default (cdr models))]))
-  (find-default model-registry))
+(define (find-named entries name)
+  (cond [(null? entries) (error! (string-append "component not found: " name))]
+        [(equal? name (hash-ref (car entries) 'name)) (car entries)]
+        [else (find-named (cdr entries) name)]))
 
-(define (default-model-spec)
-  (define (find-default models)
-    (cond [(null? models) (error! "provider registered no default model")]
-          [(hash-ref (car models) 'default) (car models)]
-          [else (find-default (cdr models))]))
-  (find-default model-registry))
+(define (model-spec id)
+  (define (find models)
+    (cond [(null? models) (error! (string-append "model not found: " id))]
+          [(equal? id (hash-ref (car models) 'id)) (car models)]
+          [else (find (cdr models))]))
+  (find model-registry))
 
-(define (default-model-reasoning)
-  (hash-ref (default-model-spec) 'default_reasoning))
+(define (model-provider id)
+  (find-named provider-registry (hash-ref (model-spec id) 'provider)))
 
-(define (default-model-service-tier)
-  (hash-ref (default-model-spec) 'default_service_tier))
+(define (provider-request prompt model reasoning service-tier)
+  ((hash-ref (model-provider model) 'effect)
+   prompt (hash-ref (model-spec model) 'model) reasoning service-tier))
+(define (provider-call-for model events)
+  ((hash-ref (model-provider model) 'call) events))
+(define (provider-arguments-for model call)
+  ((hash-ref (model-provider model) 'arguments) call))
+(define (provider-output-for model events)
+  ((hash-ref (model-provider model) 'output) events))
+(define (provider-usage-for model events)
+  ((hash-ref (model-provider model) 'usage) events))
+(define (provider-preserved-items-for model events)
+  ((hash-ref (model-provider model) 'preserved) events))
+(define (provider-message-phase-for model events)
+  ((hash-ref (model-provider model) 'phase) events))
+
+(define (build-selected-prompt messages instructions tools)
+  ((hash-ref (find-named prompt-builder-registry selected-prompt-builder) 'builder)
+   messages instructions tools))
+
+(define (selected-compaction-needed? messages max-chars)
+  ((hash-ref (find-named compactor-registry selected-compactor) 'needed)
+   messages max-chars selected-compactor-config))
+
+(define (start-selected-compaction messages max-chars)
+  ((hash-ref (find-named compactor-registry selected-compactor) 'start)
+   messages max-chars selected-compactor-config))
+
+(define (complete-selected-compaction messages max-chars events)
+  ((hash-ref (find-named compactor-registry selected-compactor) 'complete)
+   messages max-chars events selected-compactor-config))
+
+(define (validate-composition!)
+  (if (equal? selected-prompt-builder "") (error! "no prompt builder selected"))
+  (if (equal? selected-compactor "") (error! "no compactor selected"))
+  (find-named prompt-builder-registry selected-prompt-builder)
+  (find-named compactor-registry selected-compactor)
+  #t)
 
 (define (dispatch-command name state arguments)
   (define (find entries)
@@ -68,34 +144,33 @@ const PLUGIN_PRELUDE: &str = r#"
 "#;
 
 impl Policy {
-    pub fn load(agent: &Path, provider: &Path, prompt: &Path, compaction: &Path) -> Result<Self> {
+    pub fn load(agent: &Path, plugins: &[PathBuf], main: &Path) -> Result<Self> {
         Self::load_with_state(
             agent,
-            provider,
-            prompt,
-            compaction,
-            r#"{"context_char_budget":24000}"#,
+            plugins,
+            main,
+            r#"{"context_char_budget":24000,"model":"openai/gpt-5.6-luna","reasoning":"low","service_tier":"default"}"#,
             None,
         )
     }
 
     pub fn load_with_state(
         agent: &Path,
-        provider: &Path,
-        prompt: &Path,
-        compaction: &Path,
+        plugins: &[PathBuf],
+        main: &Path,
         config: &str,
         state: Option<String>,
     ) -> Result<Self> {
         let mut vm = Engine::new_sandboxed();
-        let source = format!(
-            "{}\n{}\n{}\n{}\n{}",
-            PLUGIN_PRELUDE,
-            fs::read_to_string(provider)?,
-            fs::read_to_string(compaction)?,
-            fs::read_to_string(prompt)?,
-            fs::read_to_string(agent)?
-        );
+        let mut source = String::from(PLUGIN_PRELUDE);
+        for plugin in plugins {
+            source.push('\n');
+            source.push_str(&fs::read_to_string(plugin)?);
+        }
+        source.push('\n');
+        source.push_str(&fs::read_to_string(main)?);
+        source.push('\n');
+        source.push_str(&fs::read_to_string(agent)?);
         vm.compile_and_run_raw_program(source)
             .context("load Steel policy")?;
         eval_string(
@@ -105,6 +180,7 @@ impl Policy {
                 scheme_string(config)
             ),
         )?;
+        eval_string(&mut vm, "(begin (validate-composition!) \"\")")?;
         let state = match state {
             Some(state) => state,
             None => eval_string(&mut vm, &format!("(init {})", scheme_string(config)))?,
@@ -158,6 +234,36 @@ impl Policy {
     }
 }
 
+pub fn composition_plugins(main: &Path) -> Result<Vec<String>> {
+    let mut vm = Engine::new_sandboxed();
+    let source = format!(
+        r#"(require-builtin steel/json)
+            (define discovered-plugins '())
+            (define (load-plugin! name)
+              (set! discovered-plugins (append discovered-plugins (list name))))
+            (define (select-prompt-builder! _) #t)
+            (define (select-compactor! _ __) #t)
+            {}
+        "#,
+        fs::read_to_string(main)?
+    );
+    vm.compile_and_run_raw_program(source)
+        .context("load Steel composition")?;
+    let encoded = eval_string(&mut vm, "(value->jsexpr-string discovered-plugins)")?;
+    serde_json::from_str(&encoded).context("decode composition plugins")
+}
+
+pub fn check_plugin(entrypoint: &Path) -> Result<()> {
+    let mut vm = Engine::new_sandboxed();
+    vm.compile_and_run_raw_program(format!(
+        "{}\n{}",
+        PLUGIN_PRELUDE,
+        fs::read_to_string(entrypoint)?
+    ))
+    .context("load Steel plugin")?;
+    Ok(())
+}
+
 #[derive(serde::Deserialize)]
 struct PluginCommandOutput {
     state: serde_json::Value,
@@ -176,13 +282,19 @@ fn scheme_string(value: &str) -> String {
     serde_json::to_string(value).expect("string serialization cannot fail")
 }
 
-pub fn check(agent: &Path, provider: &Path, prompt: &Path, compaction: &Path) -> Result<()> {
-    let _ = Policy::load(agent, provider, prompt, compaction)?;
+pub fn check(agent: &Path, plugins: &[PathBuf], main: &Path) -> Result<()> {
+    let _ = Policy::load(agent, plugins, main)?;
     Ok(())
 }
 
-pub fn replay_smoke(agent: &Path, provider: &Path, prompt: &Path, compaction: &Path) -> Result<()> {
-    let mut policy = Policy::load(agent, provider, prompt, compaction)?;
+pub fn replay_smoke(agent: &Path, plugins: &[PathBuf], main: &Path) -> Result<()> {
+    let mut policy = Policy::load_with_state(
+        agent,
+        plugins,
+        main,
+        r#"{"context_char_budget":24000,"model":"openai/gpt-5.6-luna","reasoning":"low","service_tier":"default"}"#,
+        None,
+    )?;
     let output = policy.on_event(&Event::UserMessage {
         content: "replay fixture".into(),
     })?;
@@ -197,16 +309,27 @@ mod tests {
     use super::*;
     use phi_protocol::Effect;
 
+    fn plugins(root: &Path) -> Vec<PathBuf> {
+        vec![
+            root.join("policy/providers/openai.scm"),
+            root.join("policy/prompts/simple.scm"),
+            root.join("policy/compaction/simple.scm"),
+        ]
+    }
+
+    fn policy(root: &Path) -> Policy {
+        Policy::load(
+            &root.join("policy/agent.scm"),
+            &plugins(root),
+            &root.join("main.scm"),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn policy_maps_events_to_provider_and_finish_effects() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let mut policy = Policy::load(
-            &root.join("policy/agent.scm"),
-            &root.join("policy/providers/openai.scm"),
-            &root.join("policy/prompts/simple.scm"),
-            &root.join("policy/compaction/simple.scm"),
-        )
-        .unwrap();
+        let mut policy = policy(&root);
         let output = policy
             .on_event(&Event::UserMessage {
                 content: "hello".into(),
@@ -256,13 +379,7 @@ mod tests {
     #[test]
     fn preserves_openai_reasoning_items_and_assistant_phase() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let mut policy = Policy::load(
-            &root.join("policy/agent.scm"),
-            &root.join("policy/providers/openai.scm"),
-            &root.join("policy/prompts/simple.scm"),
-            &root.join("policy/compaction/simple.scm"),
-        )
-        .unwrap();
+        let mut policy = policy(&root);
         policy
             .on_event(&Event::UserMessage {
                 content: "first".into(),
@@ -333,14 +450,19 @@ mod tests {
                  (hash 'instructions "custom instructions"
                        'messages (list (hash 'kind "message" 'role "user"
                                              'content "custom message"))
-                       'tools '()))"#,
+                       'tools '()))
+               (register-prompt-builder! "simple" build-prompt)"#,
         )
         .unwrap();
+        let custom = vec![
+            root.join("policy/providers/openai.scm"),
+            prompt,
+            root.join("policy/compaction/simple.scm"),
+        ];
         let mut policy = Policy::load(
             &root.join("policy/agent.scm"),
-            &root.join("policy/providers/openai.scm"),
-            &prompt,
-            &root.join("policy/compaction/simple.scm"),
+            &custom,
+            &root.join("main.scm"),
         )
         .unwrap();
         let output = policy
@@ -360,13 +482,7 @@ mod tests {
     #[test]
     fn policy_continues_after_a_tool_result() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let mut policy = Policy::load(
-            &root.join("policy/agent.scm"),
-            &root.join("policy/providers/openai.scm"),
-            &root.join("policy/prompts/simple.scm"),
-            &root.join("policy/compaction/simple.scm"),
-        )
-        .unwrap();
+        let mut policy = policy(&root);
         policy
             .on_event(&Event::UserMessage {
                 content: "inspect".into(),
@@ -403,22 +519,60 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut policy = Policy::load_with_state(
             &root.join("policy/agent.scm"),
-            &root.join("policy/providers/openai.scm"),
-            &root.join("policy/prompts/simple.scm"),
-            &root.join("policy/compaction/simple.scm"),
-            r#"{"context_char_budget":4000}"#,
+            &plugins(&root),
+            &root.join("main.scm"),
+            r#"{"context_char_budget":4000,"model":"openai/gpt-5.6-luna","reasoning":"low","service_tier":"default"}"#,
             None,
         )
         .unwrap();
-        for _ in 0..10 {
-            policy
-                .on_event(&Event::UserMessage {
-                    content: "x".repeat(3_000),
-                })
-                .unwrap();
-        }
+        policy
+            .on_event(&Event::UserMessage {
+                content: "x".repeat(3_000),
+            })
+            .unwrap();
+        let output = policy
+            .on_event(&Event::HttpCompleted {
+                success: true,
+                status: 200,
+                events: vec![serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "delta": "y".repeat(3_000)
+                })],
+                error: String::new(),
+            })
+            .unwrap();
+        assert!(matches!(
+            &output.effects[0],
+            Effect::HttpRequest { body, .. }
+                if body["model"] == "gpt-5.6-luna"
+                    && body["reasoning"]["effort"] == "low"
+                    && body["tools"].as_array().unwrap().is_empty()
+                    && body["instructions"].as_str().unwrap().contains("Summarize")
+        ));
         let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
-        assert!(state["compactions"].as_f64().unwrap() > 0.0);
+        assert_eq!(state["activity"], "compacting");
+        assert_eq!(state["compactions"], 0.0);
+
+        let output = policy
+            .on_event(&Event::HttpCompleted {
+                success: true,
+                status: 200,
+                events: vec![serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "delta": "short summary"
+                })],
+                error: String::new(),
+            })
+            .unwrap();
+        assert_eq!(
+            output.effects,
+            vec![Effect::Finish {
+                content: "y".repeat(3_000)
+            }]
+        );
+        let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
+        assert_eq!(state["compactions"], 1.0);
+        assert_eq!(state["activity"], "ready");
         assert!(serde_json::to_string(&state["messages"]).unwrap().len() <= 4_000);
         assert!(state["estimated_tokens"].as_f64().unwrap() <= 1_000.0);
     }
@@ -428,10 +582,9 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut policy = Policy::load_with_state(
             &root.join("policy/agent.scm"),
-            &root.join("policy/providers/openai.scm"),
-            &root.join("policy/prompts/simple.scm"),
-            &root.join("policy/compaction/simple.scm"),
-            r#"{"context_char_budget":4000}"#,
+            &plugins(&root),
+            &root.join("main.scm"),
+            r#"{"context_char_budget":4000,"model":"openai/gpt-5.6-luna","reasoning":"low","service_tier":"default"}"#,
             None,
         )
         .unwrap();
@@ -456,33 +609,51 @@ mod tests {
                 error: String::new(),
             })
             .unwrap();
-        policy
+        let output = policy
             .on_event(&Event::ToolCompleted {
                 name: "shell".into(),
                 result: serde_json::json!({ "stdout": "x".repeat(64 * 1024) }),
             })
             .unwrap();
+        assert!(
+            matches!(&output.effects[0], Effect::HttpRequest { body, .. }
+            if body["instructions"].as_str().unwrap().contains("Summarize"))
+        );
+        let output = policy
+            .on_event(&Event::HttpCompleted {
+                success: true,
+                status: 200,
+                events: vec![serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "delta": "The shell returned a large listing."
+                })],
+                error: String::new(),
+            })
+            .unwrap();
+        assert!(
+            matches!(&output.effects[0], Effect::HttpRequest { body, .. }
+            if body["instructions"].as_str().unwrap().contains("Answer ordinary requests"))
+        );
         let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
         assert!(serde_json::to_string(&state["messages"]).unwrap().len() <= 4_000);
         let messages = state["messages"].as_array().unwrap();
-        assert_eq!(messages[messages.len() - 2]["kind"], "tool_call");
-        assert_eq!(messages[messages.len() - 1]["kind"], "tool_result");
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("large listing")
+        );
     }
 
     #[test]
     fn provider_registers_models_and_model_selection_persists() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let mut policy = Policy::load(
-            &root.join("policy/agent.scm"),
-            &root.join("policy/providers/openai.scm"),
-            &root.join("policy/prompts/simple.scm"),
-            &root.join("policy/compaction/simple.scm"),
-        )
-        .unwrap();
-        assert_eq!(policy.models().unwrap()[0].id, "gpt-5.6-luna");
+        let mut policy = policy(&root);
+        assert_eq!(policy.models().unwrap()[0].id, "openai/gpt-5.6-luna");
         let output = policy
             .on_event(&Event::ModelSelected {
-                model: "gpt-5.6-luna".into(),
+                model: "openai/gpt-5.6-luna".into(),
                 reasoning: "low".into(),
                 service_tier: "default".into(),
             })
@@ -491,7 +662,7 @@ mod tests {
             matches!(&output.effects[0], Effect::Finish { content } if content.contains("gpt-5.6-luna"))
         );
         let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
-        assert_eq!(state["model"], "gpt-5.6-luna");
+        assert_eq!(state["model"], "openai/gpt-5.6-luna");
         assert_eq!(state["reasoning"], "low");
         assert_eq!(state["service_tier"], "default");
     }
@@ -514,11 +685,15 @@ mod tests {
             ),
         )
         .unwrap();
+        let custom = vec![
+            provider,
+            root.join("policy/prompts/simple.scm"),
+            root.join("policy/compaction/simple.scm"),
+        ];
         let mut policy = Policy::load(
             &root.join("policy/agent.scm"),
-            &provider,
-            &root.join("policy/prompts/simple.scm"),
-            &root.join("policy/compaction/simple.scm"),
+            &custom,
+            &root.join("main.scm"),
         )
         .unwrap();
         assert_eq!(policy.commands().unwrap()[0].name, "echo");
@@ -528,13 +703,7 @@ mod tests {
     #[test]
     fn malformed_tool_arguments_become_a_tool_error_input() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let mut policy = Policy::load(
-            &root.join("policy/agent.scm"),
-            &root.join("policy/providers/openai.scm"),
-            &root.join("policy/prompts/simple.scm"),
-            &root.join("policy/compaction/simple.scm"),
-        )
-        .unwrap();
+        let mut policy = policy(&root);
         policy
             .on_event(&Event::UserMessage {
                 content: "inspect".into(),

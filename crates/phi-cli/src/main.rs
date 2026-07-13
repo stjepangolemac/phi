@@ -1,9 +1,4 @@
-use std::{
-    collections::HashSet,
-    env,
-    io::Write,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashSet, io::Write, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -11,10 +6,6 @@ use serde::Deserialize;
 
 #[derive(Deserialize)]
 struct Config {
-    policy: PathBuf,
-    provider: PathBuf,
-    prompt: PathBuf,
-    compaction: PathBuf,
     allowed_programs: HashSet<String>,
 }
 
@@ -29,11 +20,13 @@ struct Cli {
     #[arg(long)]
     allow_write: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    Init,
+    Doctor,
     Run {
         prompt: String,
     },
@@ -52,6 +45,10 @@ enum Command {
         #[arg(long, default_value_t = 30_000)]
         timeout_ms: u64,
     },
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
+    },
     CheckPolicy,
     PolicyCandidate {
         path: PathBuf,
@@ -59,6 +56,30 @@ enum Command {
     PolicyActivate {
         id: String,
     },
+}
+
+#[derive(Subcommand)]
+enum PluginCommand {
+    Install {
+        url: String,
+        #[arg(long)]
+        rev: String,
+        #[arg(long, default_value = ".")]
+        path: String,
+    },
+    Update {
+        name: String,
+        #[arg(long)]
+        rev: String,
+    },
+    Remove {
+        name: String,
+    },
+    List,
+    Check {
+        name: String,
+    },
+    Sync,
 }
 
 #[tokio::main]
@@ -72,30 +93,39 @@ async fn run() -> Result<()> {
         .workspace
         .canonicalize()
         .context("workspace does not exist")?;
+    let home = phi_runtime::initialize_home()?;
+    let options = || phi_runtime::RunOptions {
+        workspace: workspace.clone(),
+        config_path: home.config(),
+        session_id: None,
+        allow_shell: cli.allow_shell,
+        allow_write: cli.allow_write,
+        interactive_approvals: true,
+    };
     match cli.command {
-        Command::Run { prompt } => {
-            run_frontend(
-                &workspace,
-                prompt,
-                cli.json,
-                None,
-                cli.allow_shell,
-                cli.allow_write,
-            )
-            .await
+        None => phi_tui::launch(options(), None).await,
+        Some(Command::Init) => {
+            println!("initialized {}", home.root.display());
+            Ok(())
         }
-        Command::Resume { session, prompt } => {
-            run_frontend(
-                &workspace,
-                prompt,
-                cli.json,
-                Some(session),
-                cli.allow_shell,
-                cli.allow_write,
-            )
-            .await
+        Some(Command::Doctor) => {
+            let catalog = phi_runtime::command_catalog(&options())?;
+            println!("home: {}", home.root.display());
+            println!("models: {}", catalog.models.len());
+            println!(
+                "selected: {}",
+                catalog.selected_model.as_deref().unwrap_or("none")
+            );
+            println!("ok");
+            Ok(())
         }
-        Command::Read { path } => {
+        Some(Command::Run { prompt }) => run_frontend(options(), prompt, cli.json).await,
+        Some(Command::Resume { session, prompt }) => {
+            let mut options = options();
+            options.session_id = Some(session);
+            run_frontend(options, prompt, cli.json).await
+        }
+        Some(Command::Read { path }) => {
             let mut registry = phi_core::capability::Registry::default();
             registry.register(phi_core::capability::ReadFile);
             print_json(&registry.execute(
@@ -104,38 +134,38 @@ async fn run() -> Result<()> {
                 serde_json::json!({ "path": path }),
             )?)
         }
-        Command::Shell {
+        Some(Command::Shell {
             program,
             args,
             stdin,
             timeout_ms,
-        } => {
-            let allowed = config()?.allowed_programs;
+        }) => {
+            let config: Config = serde_json::from_slice(&std::fs::read(home.config())?)?;
             print_json(
-                &phi_core::process::run(&workspace, &allowed, &program, &args, &stdin, timeout_ms)
-                    .await?,
+                &phi_core::process::run(
+                    &workspace,
+                    &config.allowed_programs,
+                    &program,
+                    &args,
+                    &stdin,
+                    timeout_ms,
+                )
+                .await?,
             )
         }
-        Command::CheckPolicy => {
-            let config = config()?;
-            phi_steel::check(
-                &config.policy,
-                &config.provider,
-                &config.prompt,
-                &config.compaction,
-            )?;
+        Some(Command::Plugin { command }) => plugin(&home, command),
+        Some(Command::CheckPolicy) => {
+            phi_runtime::check_policy(&home, &workspace)?;
             println!("policy ok");
             Ok(())
         }
-        Command::PolicyCandidate { path } => {
-            let config = config()?;
-            phi_steel::check(&path, &config.provider, &config.prompt, &config.compaction)?;
-            phi_steel::replay_smoke(&path, &config.provider, &config.prompt, &config.compaction)?;
+        Some(Command::PolicyCandidate { path }) => {
+            phi_runtime::check_policy_candidate(&home, &workspace, &path)?;
             let id = phi_core::policy_store::submit(&workspace.join(".phi/policies"), &path)?;
             println!("{id}");
             Ok(())
         }
-        Command::PolicyActivate { id } => {
+        Some(Command::PolicyActivate { id }) => {
             phi_core::policy_store::activate(&workspace.join(".phi/policies"), &id)?;
             println!("activated {id}");
             Ok(())
@@ -143,25 +173,52 @@ async fn run() -> Result<()> {
     }
 }
 
+fn plugin(home: &phi_core::home::PhiHome, command: PluginCommand) -> Result<()> {
+    match command {
+        PluginCommand::Install { url, rev, path } => {
+            let locked = phi_core::plugin::install(home, &url, &rev, &path)?;
+            let installed = phi_core::plugin::installed(home, &locked.name)?;
+            phi_steel::check_plugin(&installed.root.join(installed.manifest.entrypoint))?;
+            println!("installed {} {}", locked.name, locked.commit);
+        }
+        PluginCommand::Update { name, rev } => {
+            let current = phi_core::plugin::installed(home, &name)?.locked;
+            let locked = phi_core::plugin::install(home, &current.url, &rev, &current.path)?;
+            println!("updated {} {}", locked.name, locked.commit);
+        }
+        PluginCommand::Remove { name } => {
+            phi_core::plugin::remove(home, &name)?;
+            println!("removed {name}");
+        }
+        PluginCommand::List => {
+            for plugin in phi_core::plugin::read_lock(home)?.plugins {
+                println!("{} {} {}", plugin.name, plugin.commit, plugin.url);
+            }
+        }
+        PluginCommand::Check { name } => {
+            let plugin = phi_core::plugin::installed(home, &name)?;
+            phi_steel::check_plugin(&plugin.root.join(plugin.manifest.entrypoint))?;
+            println!("{name} ok");
+        }
+        PluginCommand::Sync => {
+            let plugins = phi_core::plugin::read_lock(home)?.plugins;
+            for plugin in plugins {
+                if !phi_core::plugin::install_root(home, &plugin.name, &plugin.commit).is_dir() {
+                    phi_core::plugin::install(home, &plugin.url, &plugin.commit, &plugin.path)?;
+                }
+            }
+            println!("plugins synced");
+        }
+    }
+    Ok(())
+}
+
 async fn run_frontend(
-    workspace: &Path,
+    options: phi_runtime::RunOptions,
     prompt: String,
     json_output: bool,
-    session_id: Option<String>,
-    allow_shell: bool,
-    allow_write: bool,
 ) -> Result<()> {
-    let mut handle = phi_runtime::start(
-        phi_runtime::RunOptions {
-            workspace: workspace.into(),
-            config_path: repo_file("phi.json")?,
-            session_id,
-            allow_shell,
-            allow_write,
-            interactive_approvals: false,
-        },
-        prompt,
-    );
+    let mut handle = phi_runtime::start(options, prompt);
     let mut streamed = false;
     while let Some(event) = handle.events.recv().await {
         if json_output {
@@ -169,9 +226,8 @@ async fn run_frontend(
             match event {
                 phi_runtime::RuntimeEvent::Finished { .. } => return Ok(()),
                 phi_runtime::RuntimeEvent::Error { message } => bail!(message),
-                _ => {}
+                _ => continue,
             }
-            continue;
         }
         match event {
             phi_runtime::RuntimeEvent::Session { id } => eprintln!("session: {id}"),
@@ -188,39 +244,17 @@ async fn run_frontend(
             }
             phi_runtime::RuntimeEvent::Finished { content } => {
                 if streamed {
-                    println!();
+                    println!()
                 } else {
-                    println!("{content}");
+                    println!("{content}")
                 }
                 return Ok(());
             }
             phi_runtime::RuntimeEvent::Error { message } => bail!(message),
-            phi_runtime::RuntimeEvent::UserMessage { .. }
-            | phi_runtime::RuntimeEvent::ContextUpdated { .. }
-            | phi_runtime::RuntimeEvent::ApprovalRequested { .. } => {}
+            _ => {}
         }
     }
     bail!("runtime stopped without finishing")
-}
-
-fn repo_file(relative: &str) -> Result<PathBuf> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let path = root.join(relative);
-    if !path.is_file() {
-        bail!("missing {}", path.display());
-    }
-    Ok(path)
-}
-
-fn config() -> Result<Config> {
-    let path = repo_file("phi.json")?;
-    let root = path.parent().context("config has no parent")?;
-    let mut config: Config = serde_json::from_slice(&std::fs::read(&path)?)?;
-    config.policy = root.join(config.policy);
-    config.provider = root.join(config.provider);
-    config.prompt = root.join(config.prompt);
-    config.compaction = root.join(config.compaction);
-    Ok(config)
 }
 
 fn print_json(value: &impl serde::Serialize) -> Result<()> {

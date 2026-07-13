@@ -3,3 +3,5 @@
   (hash 'instructions instructions
         'messages messages
         'tools tools))
+
+(register-prompt-builder! "simple" build-prompt)

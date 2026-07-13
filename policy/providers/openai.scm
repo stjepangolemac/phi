@@ -1,6 +1,4 @@
 ;; OpenAI-specific behavior over the kernel's generic HTTP/SSE effect.
-(require-builtin steel/json)
-(require-builtin steel/hash)
 
 (define (provider-tool spec)
   (hash 'type "function"
@@ -20,12 +18,12 @@
   (list (hash 'id "default" 'description "Standard speed and usage.")
         (hash 'id "fast" 'description "1.5x speed, increased usage.")))
 
-(define (register-openai-model! id description default reasoning default-reasoning)
+(define (register-openai-model! id description reasoning default-reasoning)
   (register-model!
+    "openai"
     (hash 'id id
           'label id
           'description description
-          'default default
           'reasoning reasoning
           'default_reasoning default-reasoning
           'service_tiers service-tier-options
@@ -33,13 +31,13 @@
 
 (register-openai-model!
   "gpt-5.6-luna" "Cost-sensitive, high-volume workloads."
-  #t reasoning-options "low")
+  reasoning-options "low")
 (register-openai-model!
   "gpt-5.6-terra" "Balances intelligence and cost."
-  #f reasoning-options "medium")
+  reasoning-options "medium")
 (register-openai-model!
   "gpt-5.6-sol" "Complex reasoning and coding."
-  #f reasoning-options "medium")
+  reasoning-options "medium")
 
 (define (provider-effect prompt model reasoning service-tier)
   (define history (hash-ref prompt 'messages))
@@ -163,3 +161,7 @@
         (if (equal? (hash-ref event 'type) "response.completed")
             (hash-ref (hash-ref event 'response) 'usage)
             (provider-usage (cdr events))))))
+
+(register-provider! "openai" provider-effect provider-call provider-arguments
+                    provider-output provider-usage provider-preserved-items
+                    provider-message-phase)

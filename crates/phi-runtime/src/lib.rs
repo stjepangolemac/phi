@@ -39,6 +39,9 @@ pub enum RuntimeEvent {
         cache_write_tokens: Option<u64>,
         output_tokens: Option<u64>,
     },
+    ActivityChanged {
+        activity: String,
+    },
     ModelDelta {
         content: String,
     },
@@ -96,49 +99,221 @@ impl Handle {
 
 #[derive(Deserialize)]
 struct Config {
-    policy: PathBuf,
-    provider: PathBuf,
-    prompt: PathBuf,
-    compaction: PathBuf,
     allowed_programs: HashSet<String>,
     allowed_http_origins: HashSet<String>,
     secrets: BTreeMap<String, phi_core::http::SecretConfig>,
     context_char_budget: usize,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct UserState {
+    model: Option<ModelSelection>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ModelSelection {
+    provider: String,
+    id: String,
+    reasoning: String,
+    service_tier: String,
+}
+
+const DEFAULT_CONFIG: &str = r#"{
+  "allowed_programs": ["cargo", "find", "git", "ls", "pwd", "rg", "sed"],
+  "context_char_budget": 24000,
+  "allowed_http_origins": ["https://auth.openai.com", "https://chatgpt.com"],
+  "secrets": {
+    "openai_chatgpt": {
+      "path": "~/.codex/auth.json",
+      "bearer_pointer": "/tokens/access_token",
+      "headers": { "chatgpt-account-id": "/tokens/account_id" },
+      "refresh": {
+        "url": "https://auth.openai.com/oauth/token",
+        "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+        "refresh_pointer": "/tokens/refresh_token"
+      }
+    }
+  }
+}"#;
+
+const DEFAULT_MAIN: &str = include_str!("../../../main.scm");
+const DEFAULT_AGENT: &str = include_str!("../../../policy/agent.scm");
+const OPENAI_PLUGIN: &str = include_str!("../../../policy/providers/openai.scm");
+const PROMPT_PLUGIN: &str = include_str!("../../../policy/prompts/simple.scm");
+const COMPACTION_PLUGIN: &str = include_str!("../../../policy/compaction/simple.scm");
+
+pub fn initialize_home() -> Result<phi_core::home::PhiHome> {
+    let home = phi_core::home::PhiHome::discover()?;
+    initialize_at(&home)?;
+    Ok(home)
+}
+
+pub fn initialize_at(home: &phi_core::home::PhiHome) -> Result<()> {
+    std::fs::create_dir_all(&home.root)?;
+    write_if_missing(&home.config(), DEFAULT_CONFIG)?;
+    write_if_missing(&home.main(), DEFAULT_MAIN)?;
+    write_if_missing(
+        &home.state(),
+        r#"{
+  "model": {
+    "provider": "openai",
+    "id": "openai/gpt-5.6-luna",
+    "reasoning": "low",
+    "service_tier": "default"
+  }
+}
+"#,
+    )?;
+    write_if_missing(&home.plugin_lock(), "{\n  \"plugins\": []\n}\n")?;
+    let builtins = home.builtins();
+    write_bundled(&builtins.join("agent.scm"), DEFAULT_AGENT)?;
+    write_builtin(&builtins, "openai", OPENAI_PLUGIN)?;
+    write_builtin(&builtins, "simple-prompt", PROMPT_PLUGIN)?;
+    write_builtin(&builtins, "simple-compaction", COMPACTION_PLUGIN)?;
+    Ok(())
+}
+
+fn write_builtin(root: &Path, name: &str, source: &str) -> Result<()> {
+    let plugin = root.join("plugins").join(name);
+    write_bundled(
+        &plugin.join("plugin.json"),
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "name": name,
+            "version": env!("CARGO_PKG_VERSION"),
+            "entrypoint": "main.scm"
+        }))?,
+    )?;
+    write_bundled(&plugin.join("main.scm"), source)
+}
+
+fn write_bundled(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, content)?;
+    Ok(())
+}
+
+fn write_if_missing(path: &Path, content: &str) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, content)?;
+    Ok(())
+}
+
+fn home_for_config(path: &Path) -> Result<phi_core::home::PhiHome> {
+    Ok(phi_core::home::PhiHome {
+        root: path.parent().context("config has no parent")?.to_owned(),
+    })
+}
+
+fn resolve_sources(
+    home: &phi_core::home::PhiHome,
+    workspace: &Path,
+) -> Result<phi_core::session::ComposedSources> {
+    let main = home.main();
+    let lock = phi_core::plugin::read_lock(home)?;
+    let mut plugins = Vec::new();
+    for name in phi_steel::composition_plugins(&main)? {
+        let (root, manifest) =
+            if let Some(locked) = lock.plugins.iter().find(|item| item.name == name) {
+                let root = phi_core::plugin::install_root(home, &name, &locked.commit);
+                let manifest = phi_core::plugin::read_manifest(&root)?;
+                (root, manifest)
+            } else {
+                let root = home.builtins().join("plugins").join(&name);
+                if !root.is_dir() {
+                    bail!("plugin is not installed: {name}");
+                }
+                let manifest = phi_core::plugin::read_manifest(&root)?;
+                (root, manifest)
+            };
+        if manifest.name != name {
+            bail!("plugin manifest name does not match composition: {name}");
+        }
+        let entrypoint = root.join(&manifest.entrypoint);
+        if !entrypoint.is_file() {
+            bail!("plugin entrypoint is missing: {name}");
+        }
+        plugins.push(phi_core::session::PluginSource {
+            name,
+            root,
+            entrypoint,
+        });
+    }
+    let fallback = home.builtins().join("agent.scm");
+    let policy = phi_core::policy_store::active(&workspace.join(".phi/policies"), &fallback)?;
+    Ok(phi_core::session::ComposedSources {
+        policy,
+        main,
+        plugins,
+    })
+}
+
+fn entrypoints(sources: &phi_core::session::ComposedSources) -> Vec<PathBuf> {
+    sources
+        .plugins
+        .iter()
+        .map(|plugin| plugin.entrypoint.clone())
+        .collect()
+}
+
+pub fn check_policy(home: &phi_core::home::PhiHome, workspace: &Path) -> Result<()> {
+    let sources = resolve_sources(home, workspace)?;
+    phi_steel::check(&sources.policy, &entrypoints(&sources), &sources.main)
+}
+
+pub fn check_policy_candidate(
+    home: &phi_core::home::PhiHome,
+    workspace: &Path,
+    candidate: &Path,
+) -> Result<()> {
+    let sources = resolve_sources(home, workspace)?;
+    let plugins = entrypoints(&sources);
+    phi_steel::check(candidate, &plugins, &sources.main)?;
+    phi_steel::replay_smoke(candidate, &plugins, &sources.main)
+}
+
+fn load_user_state(home: &phi_core::home::PhiHome) -> Result<UserState> {
+    if !home.state().is_file() {
+        return Ok(UserState::default());
+    }
+    serde_json::from_slice(&std::fs::read(home.state())?).context("read user state")
+}
+
+fn save_user_state(home: &phi_core::home::PhiHome, state: &UserState) -> Result<()> {
+    std::fs::write(home.state(), serde_json::to_vec_pretty(state)?)?;
+    Ok(())
+}
+
 pub fn command_catalog(options: &RunOptions) -> Result<CommandCatalog> {
     let workspace = options.workspace.canonicalize()?;
     let config = load_config(&options.config_path)?;
+    let home = home_for_config(&options.config_path)?;
     let (sources, state) = match &options.session_id {
         Some(id) => {
             let session = phi_core::session::Session::open(&workspace.join(".phi/sessions"), id)?;
-            let sources = session.sources(&config.prompt)?;
+            let sources = session
+                .composed_sources()?
+                .context("session has no composition snapshot")?;
             (sources, Some(session.load_state()?))
         }
-        None => {
-            let active =
-                phi_core::policy_store::active(&workspace.join(".phi/policies"), &config.policy)?;
-            (
-                phi_core::session::Sources {
-                    policy: active,
-                    provider: config.provider.clone(),
-                    prompt: config.prompt.clone(),
-                    compaction: config.compaction.clone(),
-                },
-                None,
-            )
-        }
+        None => (resolve_sources(&home, &workspace)?, None),
     };
     let capabilities = capabilities(&sources);
     let mut policy = phi_steel::Policy::load_with_state(
         &sources.policy,
-        &sources.provider,
-        &sources.prompt,
-        &sources.compaction,
+        &entrypoints(&sources),
+        &sources.main,
         &policy_config(
             &config,
             &capabilities,
             options.session_id.as_deref().unwrap_or("catalog"),
+            &load_user_state(&home)?,
         ),
         state,
     )?;
@@ -151,41 +326,49 @@ pub fn execute_command(
 ) -> Result<CommandExecution> {
     let workspace = options.workspace.canonicalize()?;
     let config = load_config(&options.config_path)?;
+    let home = home_for_config(&options.config_path)?;
     let sessions = workspace.join(".phi/sessions");
     let (session, sources, saved_state) = match &options.session_id {
         Some(id) => {
             let session = phi_core::session::Session::open(&sessions, id)?;
-            let sources = session.sources(&config.prompt)?;
+            let sources = session
+                .composed_sources()?
+                .context("session has no composition snapshot")?;
             let state = session.load_state()?;
             (session, sources, Some(state))
         }
         None => {
-            let active =
-                phi_core::policy_store::active(&workspace.join(".phi/policies"), &config.policy)?;
-            let session = phi_core::session::Session::create(
+            let current = resolve_sources(&home, &workspace)?;
+            let session = phi_core::session::Session::create_composed(
                 &sessions,
-                &active,
-                &config.provider,
-                &config.prompt,
-                &config.compaction,
+                &current.policy,
+                &current.main,
+                &current.plugins,
             )?;
-            let sources = session.sources(&config.prompt)?;
+            let sources = session
+                .composed_sources()?
+                .context("missing composition snapshot")?;
             (session, sources, None)
         }
     };
     let capabilities = capabilities(&sources);
     let mut policy = phi_steel::Policy::load_with_state(
         &sources.policy,
-        &sources.provider,
-        &sources.prompt,
-        &sources.compaction,
-        &policy_config(&config, &capabilities, session.id()),
+        &entrypoints(&sources),
+        &sources.main,
+        &policy_config(
+            &config,
+            &capabilities,
+            session.id(),
+            &load_user_state(&home)?,
+        ),
         saved_state,
     )?;
     let initial_catalog = catalog(&mut policy)?;
     let content = match invocation.name.as_str() {
         "help" => help(&initial_catalog),
         "model" => model_command(
+            &home,
             &session,
             &mut policy,
             &initial_catalog,
@@ -222,7 +405,7 @@ fn catalog(policy: &mut phi_steel::Policy) -> Result<CommandCatalog> {
         },
         CommandSpec {
             name: "model".into(),
-            usage: "/model [MODEL [REASONING [SERVICE_TIER]]]".into(),
+            usage: "/model".into(),
             description: "Show or select model settings.".into(),
             source: "core".into(),
         },
@@ -239,7 +422,12 @@ fn catalog(policy: &mut phi_steel::Policy) -> Result<CommandCatalog> {
     }
     commands.sort_by(|left, right| left.name.cmp(&right.name));
 
-    let models = policy.models()?;
+    let mut models = policy.models()?;
+    for model in &mut models {
+        if model.model.is_empty() {
+            model.model = model.id.clone();
+        }
+    }
     let mut model_ids = HashSet::new();
     for model in &models {
         if !model_ids.insert(model.id.clone()) {
@@ -262,16 +450,11 @@ fn catalog(policy: &mut phi_steel::Policy) -> Result<CommandCatalog> {
             bail!("invalid default service tier for model: {}", model.id);
         }
     }
-    if !models.is_empty() && models.iter().filter(|model| model.default).count() != 1 {
-        bail!("provider must register exactly one default model");
-    }
     let state: serde_json::Value = serde_json::from_str(policy.state())?;
-    let selected_model = state["model"].as_str().map(str::to_owned).or_else(|| {
-        models
-            .iter()
-            .find(|model| model.default)
-            .map(|model| model.id.clone())
-    });
+    let selected_model = state["model"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
     let selected_spec = selected_model
         .as_deref()
         .and_then(|id| models.iter().find(|model| model.id == id));
@@ -311,6 +494,7 @@ fn help(catalog: &CommandCatalog) -> String {
 }
 
 fn model_command(
+    home: &phi_core::home::PhiHome,
     session: &phi_core::session::Session,
     policy: &mut phi_steel::Policy,
     catalog: &CommandCatalog,
@@ -319,14 +503,8 @@ fn model_command(
     let state: serde_json::Value = serde_json::from_str(policy.state())?;
     let current = state["model"]
         .as_str()
-        .or_else(|| {
-            catalog
-                .models
-                .iter()
-                .find(|model| model.default)
-                .map(|model| model.id.as_str())
-        })
-        .context("provider has no default model")?;
+        .filter(|value| !value.is_empty())
+        .context("no model selected; use /model MODEL")?;
     if requested.is_empty() {
         let available = catalog
             .models
@@ -379,6 +557,17 @@ fn model_command(
     let output = policy.on_event(&event)?;
     session.append(&output)?;
     session.save_state(policy.state())?;
+    save_user_state(
+        home,
+        &UserState {
+            model: Some(ModelSelection {
+                provider: selected.provider.clone(),
+                id: selected.id.clone(),
+                reasoning: reasoning.into(),
+                service_tier: service_tier.into(),
+            }),
+        },
+    )?;
     match output.effects.into_iter().next() {
         Some(Effect::Finish { content }) => Ok(content),
         _ => bail!("model selection did not finish locally"),
@@ -389,27 +578,32 @@ fn policy_config(
     config: &Config,
     capabilities: &phi_core::capability::Registry,
     session_id: &str,
+    user_state: &UserState,
 ) -> String {
     let mut tools = capabilities.specs();
     tools.push(phi_core::capability::shell_spec());
     tools.sort_by(|left, right| left.name.cmp(&right.name));
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "context_char_budget": config.context_char_budget,
         "session_id": session_id,
         "tools": tools,
-    })
-    .to_string()
+    });
+    if let Some(model) = &user_state.model {
+        value["model"] = model.id.clone().into();
+        value["reasoning"] = model.reasoning.clone().into();
+        value["service_tier"] = model.service_tier.clone().into();
+    }
+    value.to_string()
 }
 
-fn capabilities(sources: &phi_core::session::Sources) -> phi_core::capability::Registry {
+fn capabilities(sources: &phi_core::session::ComposedSources) -> phi_core::capability::Registry {
     let mut capabilities = phi_core::capability::Registry::default();
     capabilities.register(phi_core::capability::ReadFile);
     capabilities.register(phi_core::capability::ReplaceFile);
     capabilities.register(phi_eval::SubmitPolicyCandidate {
         active_policy: sources.policy.clone(),
-        provider: sources.provider.clone(),
-        prompt: sources.prompt.clone(),
-        compaction: sources.compaction.clone(),
+        main: sources.main.clone(),
+        plugins: entrypoints(sources),
     });
     capabilities
 }
@@ -442,25 +636,28 @@ async fn run(
 ) -> Result<()> {
     let workspace = options.workspace.canonicalize()?;
     let config = load_config(&options.config_path)?;
+    let home = home_for_config(&options.config_path)?;
     let sessions = workspace.join(".phi/sessions");
     let (session, sources, saved_state) = match options.session_id {
         Some(id) => {
             let session = phi_core::session::Session::open(&sessions, &id)?;
-            let sources = session.sources(&config.prompt)?;
+            let sources = session
+                .composed_sources()?
+                .context("session has no composition snapshot")?;
             let state = session.load_state()?;
             (session, sources, Some(state))
         }
         None => {
-            let active =
-                phi_core::policy_store::active(&workspace.join(".phi/policies"), &config.policy)?;
-            let session = phi_core::session::Session::create(
+            let current = resolve_sources(&home, &workspace)?;
+            let session = phi_core::session::Session::create_composed(
                 &sessions,
-                &active,
-                &config.provider,
-                &config.prompt,
-                &config.compaction,
+                &current.policy,
+                &current.main,
+                &current.plugins,
             )?;
-            let sources = session.sources(&config.prompt)?;
+            let sources = session
+                .composed_sources()?
+                .context("missing composition snapshot")?;
             (session, sources, None)
         }
     };
@@ -479,13 +676,18 @@ async fn run(
     )?;
     let mut policy = phi_steel::Policy::load_with_state(
         &sources.policy,
-        &sources.provider,
-        &sources.prompt,
-        &sources.compaction,
-        &policy_config(&config, &capabilities, session.id()),
+        &entrypoints(&sources),
+        &sources.main,
+        &policy_config(
+            &config,
+            &capabilities,
+            session.id(),
+            &load_user_state(&home)?,
+        ),
         saved_state,
     )?;
     let mut event = Event::UserMessage { content: prompt };
+    let mut activity = "ready".to_owned();
     let permissions = phi_core::permissions::Permissions {
         allow_shell: options.allow_shell,
         allow_write: options.allow_write,
@@ -500,6 +702,17 @@ async fn run(
         session.append(&output)?;
         session.save_state(policy.state())?;
         send_context(events, policy.state(), config.context_char_budget)?;
+        let next_activity = state_activity(policy.state())?;
+        if next_activity != activity {
+            send(
+                events,
+                RuntimeEvent::ActivityChanged {
+                    activity: next_activity.clone(),
+                },
+            )?;
+            activity = next_activity;
+        }
+        let stream_output = activity != "compacting";
         let effect = output
             .effects
             .into_iter()
@@ -590,10 +803,11 @@ async fn run(
                         timeout_ms,
                     },
                     |provider_event| {
-                        if provider_event
-                            .get("type")
-                            .and_then(serde_json::Value::as_str)
-                            == Some("response.output_text.delta")
+                        if stream_output
+                            && provider_event
+                                .get("type")
+                                .and_then(serde_json::Value::as_str)
+                                == Some("response.output_text.delta")
                             && let Some(content) = provider_event
                                 .get("delta")
                                 .and_then(serde_json::Value::as_str)
@@ -659,14 +873,16 @@ fn number_u64(value: &serde_json::Value) -> Option<u64> {
         .or_else(|| value.as_f64().map(|value| value as u64))
 }
 
+fn state_activity(state: &str) -> Result<String> {
+    let state: serde_json::Value = serde_json::from_str(state)?;
+    Ok(state["activity"]
+        .as_str()
+        .context("state has no activity")?
+        .into())
+}
+
 fn load_config(path: &Path) -> Result<Config> {
-    let root = path.parent().context("config has no parent")?;
-    let mut config: Config = serde_json::from_slice(&std::fs::read(path)?)?;
-    config.policy = root.join(config.policy);
-    config.provider = root.join(config.provider);
-    config.prompt = root.join(config.prompt);
-    config.compaction = root.join(config.compaction);
-    Ok(config)
+    serde_json::from_slice(&std::fs::read(path)?).context("read config")
 }
 
 async fn run_shell_tool(
@@ -708,26 +924,13 @@ mod tests {
 
     fn options() -> (tempfile::TempDir, RunOptions) {
         let workspace = tempfile::tempdir().unwrap();
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let config_path = workspace.path().join("phi.json");
-        std::fs::write(
-            &config_path,
-            serde_json::to_vec(&serde_json::json!({
-                "policy": root.join("policy/agent.scm"),
-                "provider": root.join("policy/providers/openai.scm"),
-                "prompt": root.join("policy/prompts/simple.scm"),
-                "compaction": root.join("policy/compaction/simple.scm"),
-                "allowed_programs": [],
-                "allowed_http_origins": [],
-                "secrets": {},
-                "context_char_budget": 24000
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+        let home = phi_core::home::PhiHome {
+            root: workspace.path().join("home"),
+        };
+        initialize_at(&home).unwrap();
         let options = RunOptions {
             workspace: workspace.path().into(),
-            config_path,
+            config_path: home.config(),
             session_id: None,
             allow_shell: false,
             allow_write: false,
@@ -746,7 +949,7 @@ mod tests {
                 .iter()
                 .any(|command| command.name == "model")
         );
-        assert_eq!(catalog.models[0].id, "gpt-5.6-luna");
+        assert_eq!(catalog.models[0].id, "openai/gpt-5.6-luna");
     }
 
     #[test]
@@ -756,7 +959,7 @@ mod tests {
             &options,
             &CommandInvocation {
                 name: "model".into(),
-                arguments: "gpt-5.6-terra high fast".into(),
+                arguments: "openai/gpt-5.6-terra high fast".into(),
             },
         )
         .unwrap();
@@ -769,9 +972,15 @@ mod tests {
         .load_state()
         .unwrap();
         let state: serde_json::Value = serde_json::from_str(&state).unwrap();
-        assert_eq!(state["model"], "gpt-5.6-terra");
+        assert_eq!(state["model"], "openai/gpt-5.6-terra");
         assert_eq!(state["reasoning"], "high");
         assert_eq!(state["service_tier"], "fast");
+        assert!(state["messages"].as_array().unwrap().is_empty());
+        let global: UserState = serde_json::from_slice(
+            &std::fs::read(home_for_config(&options.config_path).unwrap().state()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(global.model.unwrap().id, "openai/gpt-5.6-terra");
 
         let session = phi_core::session::Session::open(
             &options.workspace.join(".phi/sessions"),
@@ -779,14 +988,14 @@ mod tests {
         )
         .unwrap();
         let config = load_config(&options.config_path).unwrap();
-        let sources = session.sources(&config.prompt).unwrap();
+        let sources = session.composed_sources().unwrap().unwrap();
         let capabilities = capabilities(&sources);
+        let plugins = entrypoints(&sources);
         let mut policy = phi_steel::Policy::load_with_state(
             &sources.policy,
-            &sources.provider,
-            &sources.prompt,
-            &sources.compaction,
-            &policy_config(&config, &capabilities, session.id()),
+            &plugins,
+            &sources.main,
+            &policy_config(&config, &capabilities, session.id(), &UserState::default()),
             Some(session.load_state().unwrap()),
         )
         .unwrap();
@@ -814,5 +1023,25 @@ mod tests {
     fn reads_provider_reported_token_counts() {
         assert_eq!(number_u64(&serde_json::json!(378.0)), Some(378));
         assert_eq!(number_u64(&serde_json::Value::Null), None);
+    }
+
+    #[test]
+    fn refreshes_versioned_builtins_without_overwriting_user_config() {
+        let root = tempfile::tempdir().unwrap();
+        let home = phi_core::home::PhiHome {
+            root: root.path().join("home"),
+        };
+        initialize_at(&home).unwrap();
+        std::fs::write(home.builtins().join("agent.scm"), "stale").unwrap();
+        std::fs::write(home.main(), "user composition").unwrap();
+        initialize_at(&home).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(home.builtins().join("agent.scm")).unwrap(),
+            DEFAULT_AGENT
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.main()).unwrap(),
+            "user composition"
+        );
     }
 }

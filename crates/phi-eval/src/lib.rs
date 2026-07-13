@@ -11,9 +11,8 @@ use similar::TextDiff;
 
 pub struct SubmitPolicyCandidate {
     pub active_policy: PathBuf,
-    pub provider: PathBuf,
-    pub prompt: PathBuf,
-    pub compaction: PathBuf,
+    pub main: PathBuf,
+    pub plugins: Vec<PathBuf>,
 }
 
 impl Tool for SubmitPolicyCandidate {
@@ -29,18 +28,8 @@ impl Tool for SubmitPolicyCandidate {
         let mut candidate = tempfile::Builder::new().suffix(".scm").tempfile_in(&phi)?;
         std::io::Write::write_all(&mut candidate, content.as_bytes())?;
 
-        phi_steel::check(
-            candidate.path(),
-            &self.provider,
-            &self.prompt,
-            &self.compaction,
-        )?;
-        phi_steel::replay_smoke(
-            candidate.path(),
-            &self.provider,
-            &self.prompt,
-            &self.compaction,
-        )?;
+        phi_steel::check(candidate.path(), &self.plugins, &self.main)?;
+        phi_steel::replay_smoke(candidate.path(), &self.plugins, &self.main)?;
         gate(workspace, &["fmt", "--all", "--", "--check"])?;
         gate(workspace, &["test", "--workspace"])?;
         gate(
