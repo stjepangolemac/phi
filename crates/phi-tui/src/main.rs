@@ -148,15 +148,27 @@ impl Composer {
     }
 
     fn move_word_right(&mut self) {
+        while self.next_char().is_some_and(char::is_whitespace) {
+            self.move_right();
+        }
         while self
             .next_char()
             .is_some_and(|character| !character.is_whitespace())
         {
             self.move_right();
         }
-        while self.next_char().is_some_and(char::is_whitespace) {
-            self.move_right();
-        }
+    }
+
+    fn delete_word_left(&mut self) {
+        let end = self.cursor;
+        self.move_word_left();
+        self.text.drain(self.cursor..end);
+    }
+
+    fn delete_to_line_start(&mut self) {
+        let end = self.cursor;
+        self.move_line_start();
+        self.text.drain(self.cursor..end);
     }
 
     fn move_line_start(&mut self) {
@@ -793,6 +805,18 @@ impl App {
             KeyCode::Enter => self.submit(),
             KeyCode::Tab if !self.composer_locked() => {
                 self.complete_command();
+            }
+            KeyCode::Backspace
+                if !self.composer_locked() && key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.edit_composer();
+                self.composer.delete_word_left();
+            }
+            KeyCode::Backspace
+                if !self.composer_locked() && key.modifiers.contains(KeyModifiers::SUPER) =>
+            {
+                self.edit_composer();
+                self.composer.delete_to_line_start();
             }
             KeyCode::Backspace if !self.composer_locked() => {
                 self.edit_composer();
@@ -2090,6 +2114,29 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
         app.on_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE));
         assert_eq!(app.composer.text, "one tw!o");
+    }
+
+    #[test]
+    fn word_right_stops_at_the_current_word_end() {
+        let mut app = app();
+        app.composer.set("one two".into());
+        app.composer.cursor = 1;
+
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+
+        assert_eq!(app.composer.cursor, 3);
+    }
+
+    #[test]
+    fn modified_backspace_deletes_by_word_or_line() {
+        let mut app = app();
+        app.composer.set("one two".into());
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
+        assert_eq!(app.composer.text, "one ");
+
+        app.composer.set("one two\nthree".into());
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER));
+        assert_eq!(app.composer.text, "one two\n");
     }
 
     #[test]
