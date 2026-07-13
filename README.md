@@ -1,211 +1,105 @@
 # Phi
 
-Phi is an experimental, self-modifiable agent harness with a small Rust kernel and an agent policy written in [Steel](https://github.com/mattwparas/steel), an embeddable Scheme implemented in Rust.
+Phi is a small, configurable agent harness. Rust owns trusted mechanisms such as HTTP, secrets, filesystem/process capabilities, sessions, and the terminal UI. Sandboxed [Steel](https://github.com/mattwparas/steel) code owns providers, prompts, compaction, commands, and the agent loop.
 
-The goal is not to reimplement an async runtime, HTTP stack, terminal framework, or every provider in Rust. Rust supplies a boring, trustworthy execution substrate; Steel defines nearly all agent behavior and can propose improvements to itself.
+## Install and run
 
-## Architecture
+```sh
+cargo install --path crates/phi-cli
+phi
+```
+
+`phi` starts the TUI in the current directory. The first run initializes `~/.phi`. The bundled setup uses `gpt-5.6-luna` with low reasoning and the existing Codex login at `~/.codex/auth.json`.
+
+Useful checks:
+
+```sh
+phi init
+phi doctor
+phi check-policy
+phi run "Reply with exactly: phi works"
+phi --json run "Stream this response"
+phi --allow-shell run "List files in this directory"
+phi resume SESSION_ID "Continue"
+```
+
+Sessions and their exact policy/plugin sources are stored under `.phi/sessions/` in the working directory.
+
+## Configuration
+
+Phi keeps behavior in Scheme and data in JSON:
 
 ```text
-Steel policy and plugins
-  agent loop, prompts, providers, routing, compaction,
-  planning, delegation, retries, evaluation, improvement
-                         |
-                    effects/events
-                         |
-Stable Rust kernel
-  runtime events, Steel VM, HTTP and streaming transport, filesystem/process
-  capabilities, secrets, scheduling, cancellation, event log,
-  resource enforcement, policy versions and rollback
+~/.phi/
+  main.scm             # loads plugins and selects implementations
+  config.json          # permissions, network origins, secret handles, limits
+  state.json           # last selected model settings
+  plugins.lock.json    # Git sources and exact commits
+  plugins/             # immutable installed plugin revisions
+  builtins/<version>/  # bundled fallback plugins and agent policy
 ```
 
-Rust owns mechanisms whose failure could expose secrets, violate isolation, lose history, defeat cancellation, or prevent recovery. Everything describing agent behavior should be replaceable Steel code.
-
-## Event/effect boundary
-
-Steel is synchronous and event-driven. Rust owns async work and sends completion events back to Steel; native async support in the policy language is therefore unnecessary.
-
-The policy exports a minimal interface:
+`main.scm` is the composition root:
 
 ```scheme
-(init config)             ; -> state
-(on-event state event)    ; -> (state effects)
+(load-plugin! "openai")
+(load-plugin! "simple-prompt")
+(load-plugin! "simple-compaction")
+
+(select-prompt-builder! "simple")
+(select-compactor!
+  "simple"
+  (hash 'model "openai/gpt-5.6-luna"
+        'reasoning "low"
+        'service_tier "default"))
 ```
 
-Typical events include user messages, model stream events, tool results, job failures, and cancellations. Typical effects include:
-
-```scheme
-'(http-request ...)
-'(run-tool ...)
-'(spawn-job ...)
-'(checkpoint ...)
-'(finish ...)
-```
-
-Rust validates every effect before executing it. Steel can request a shell command or use a secret handle, but cannot grant itself permission or read the underlying secret.
+There is no default provider. Providers register qualified model identities such as `openai/gpt-5.6-luna`; the selected model determines the provider. Use `/model` in the TUI to pick the model, reasoning, and provider-supported service tier.
 
 ## Plugins
 
-Providers should be Steel plugins over generic Rust HTTP and streaming primitives. A provider plugin builds requests, interprets provider-specific stream events, normalizes messages and tool calls, and classifies errors.
+A plugin is a Git-backed directory containing `plugin.json` and a Steel entrypoint:
 
-Other Steel-level plugins can implement:
-
-- prompts and context compaction;
-- model routing, retries and failover;
-- permission and approval policy;
-- sessions, memory and retrieval;
-- planning, subagents and delegation;
-- MCP protocol behavior;
-- CLI commands, hooks and output formatting;
-- evaluation and self-improvement strategies.
-
-Rust should retain raw connection/framing reliability, capability enforcement, job scheduling, durable event logging, secret handling, and recovery.
-
-Capabilities own their provider-neutral names, descriptions, argument schemas, and execution. The runtime passes that catalog into Steel; provider plugins only translate it into their wire format.
-
-## Self-modification
-
-The active policy never overwrites itself. It observes traces, identifies a measurable weakness, and submits a candidate policy with a hypothesis. Prefer structural Scheme/AST transformations over fragile text editing.
-
-```text
-observe -> diagnose -> propose candidate -> parse/lint -> test
-        -> replay -> benchmark -> canary -> promote or rollback
+```json
+{
+  "name": "example",
+  "version": "0.1.0",
+  "entrypoint": "main.scm"
+}
 ```
 
-The Rust kernel stores immutable policy versions and evaluates candidates in isolation. Promotion is atomic and initially requires user approval. Later versions may promote automatically only within kernel-enforced thresholds. Existing sessions may remain pinned to their starting policy version.
-
-Possible learned improvements include reducing redundant file reads, adapting context compaction, routing simple work to cheaper models, choosing when to plan or parallelize, adding recovery rules, and turning repeated command sequences into typed tools.
-
-## POC scope
-
-The first useful version needs:
-
-- one Steel VM and the `init`/`on-event` contract;
-- generic HTTP plus SSE transport;
-- one provider implemented in Steel;
-- `read_file`, `apply_patch`, and bounded `shell` capabilities;
-- Tokio-owned jobs, timeouts, and cancellation;
-- append-only JSONL session events;
-- active and candidate policy versions;
-- fixtures for checking and replaying a candidate;
-- explicit approval before activation.
-
-A tentative Rust layout:
-
-```text
-src/
-  main.rs
-  protocol.rs       # events and effects
-  steel_runtime.rs  # policy loading and invocation
-  transport.rs      # HTTP, SSE and async jobs
-  capabilities.rs   # filesystem, patch and shell enforcement
-  session.rs        # append-only event log
-  policy_store.rs   # candidates, activation and rollback
-policy/
-  agent.scm
-  providers/
-tests/
-  fixtures/
-```
-
-Defer multiple providers, database, native Steel async, MCP, subagents, automatic promotion, and canary deployment until the basic loop and candidate replay work.
-
-## Why Steel?
-
-Scheme is small, interpretable, and well suited to manipulating messages, policies, and programs as data. Steel keeps the interpreter in Rust while enabling a compact agent DSL, macros, live reload, and eventually structural self-modification. Rust remains the stable constitution; Steel is the evolving policy.
-
-## Current WIP
-
-The repository is a Cargo workspace:
-
-- `phi-protocol`: provider-neutral events and effects;
-- `phi-core`: trusted filesystem, process, and JSONL session mechanisms;
-- `phi-eval`: isolated policy candidate validation;
-- `phi-runtime`: frontend-neutral agent loop and typed runtime events;
-- `phi-steel`: sandboxed Steel policy loading and invocation;
-- `phi-cli`: the thin executable;
-- `phi-tui`: a thin Ratatui frontend;
-- `policy/providers/openai.scm`: OpenAI-specific provider behavior.
-- `policy/prompts/simple.scm`: provider-neutral prompt assembly.
-- `policy/compaction/simple.scm`: replaceable context compaction policy.
-
-The OpenAI plugin calls the Responses endpoint directly using the existing ChatGPT login. Rust owns generic HTTP/SSE transport and injects configured secret handles without exposing tokens to Steel. `phi.json` selects the agent, prompt, compaction, and provider plugins along with the network allowlist and secret mapping.
+Install from a tag or commit, optionally selecting a plugin within a larger repository:
 
 ```sh
-cargo build
+phi plugin install https://github.com/example/phi-plugins --rev v0.1.0 --path plugins/example
+phi plugin list
+phi plugin check example
+phi plugin update example --rev NEW_TAG_OR_COMMIT
+phi plugin sync
+phi plugin remove example
+```
+
+Installation records the resolved commit but does not activate the plugin. Add `(load-plugin! "example")` to `~/.phi/main.scm` and compose its registered behavior there.
+
+Plugins have no package-level type. Their entrypoints may register providers and models, prompt builders, compactors, or slash commands. The registration functions enforce the contract of each extension point.
+
+## Workspace
+
+```text
+crates/phi-cli       installed `phi` binary
+crates/phi-core      trusted capabilities, sessions, plugins, and home layout
+crates/phi-eval      candidate policy validation
+crates/phi-protocol  provider-neutral events and effects
+crates/phi-runtime   frontend-neutral agent loop
+crates/phi-steel     Scheme composition and policy VM
+crates/phi-tui       Ratatui frontend library
+policy/              bundled Scheme sources
+```
+
+Validate changes with:
+
+```sh
+cargo fmt --all
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-
-cargo run -p phi-cli -- check-policy
-cargo run -p phi-cli -- read README.md
-cargo run -p phi-cli -- shell pwd
-cargo run -p phi-cli -- run "Reply with exactly: phi works"
-cargo run -p phi-cli -- --json run "Stream this response"
-cargo run -p phi-tui
 ```
-
-Human output streams text deltas. `--json` emits JSONL lifecycle events and deltas. Each run prints a session ID and writes state plus events under `.phi/sessions/<id>/`; continue it with:
-
-```sh
-cargo run -p phi-cli -- resume SESSION_ID "Continue the conversation"
-```
-
-Model tools cross the policy boundary as a name plus JSON arguments. The kernel currently provides confined `read_file`, revision-checked atomic `replace_file`, bounded direct-program `shell`, and candidate submission. Shell and general writes require explicit approval flags:
-
-```sh
-cargo run -p phi-cli -- --allow-shell run "Run cargo test"
-cargo run -p phi-cli -- --allow-write run "Update the requested file"
-```
-
-Steel stores provider-neutral message, tool-call, and tool-result history. It tracks estimated and provider-reported usage and invokes the configured compaction plugin before requests when context exceeds its budget.
-
-The agent passes compacted history, instructions, and the capability catalog to `build-prompt`. The prompt plugin returns a provider-neutral prompt; the provider plugin only encodes it for its API. New sessions pin the selected prompt plugin with the other policy sources, while sessions created before prompt plugins use the configured prompt.
-
-The OpenAI provider keeps requests stateless with `store: false`. It sends the stable tool and instruction prefix before conversation history and assigns a session cache key for automatic prompt caching. Provider-reported input, cache-read, cache-write, and output tokens are exposed in runtime events and the TUI. Opaque OpenAI reasoning and compaction items are retained for the next stateless request.
-
-The TUI streams the same runtime events as the CLI. Enter sends, Ctrl-Enter inserts a newline, Esc cancels active work, and Ctrl-C exits when idle. Shell and write requests show a one-shot approval prompt unless pre-approved with `--allow-shell` or `--allow-write`. Resume a session with:
-
-```sh
-cargo run -p phi-tui -- --session SESSION_ID
-```
-
-Inputs beginning with `/` are runtime commands and are never sent to the model. Type `/` to see completions and Tab to accept the first match. Core owns reserved commands such as `/help` and `/model`; providers register their available models, and other Steel plugins may register local commands:
-
-```scheme
-(register-model!
-  (hash 'id "gpt-5.6-luna" 'label "Luna"
-        'description "Cost-sensitive, high-volume workloads."
-        'default #t
-        'reasoning
-        (list (hash 'id "low" 'description "Fast responses with lighter reasoning.")
-              (hash 'id "medium" 'description "Balances speed and reasoning depth."))
-        'default_reasoning "low"
-        'service_tiers
-        (list (hash 'id "default" 'description "Standard speed and usage.")
-              (hash 'id "fast" 'description "1.5x speed, increased usage."))
-        'default_service_tier "default"))
-
-(register-command!
-  (hash 'name "example" 'usage "/example ARG"
-        'description "Example command." 'source "plugin-name")
-  (lambda (state arguments)
-    (hash 'state state 'content arguments)))
-```
-
-In the TUI, `/model` opens provider-declared model, reasoning, and optional service-tier pickers. Up/Down moves, Enter selects, and Esc cancels. The direct form `/model MODEL_ID [REASONING] [SERVICE_TIER]` remains available. Core command names and duplicate plugin registrations are rejected.
-
-Candidate policies are parsed before storage and require explicit activation:
-
-```sh
-cargo run -p phi-cli -- policy-candidate policy/agent.scm
-cargo run -p phi-cli -- policy-activate CANDIDATE_ID
-```
-
-Phi can perform a constrained policy-improvement pass:
-
-```sh
-cargo run -p phi-cli -- run \
-  "Inspect policy/agent.scm, propose one small measurable improvement, submit it as a candidate, and stop for approval."
-```
-
-Policy submission checks Steel loading, a replay fixture, formatting, tests, and Clippy, then returns a diff. Activation remains a separate manual command.
