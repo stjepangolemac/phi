@@ -60,6 +60,7 @@ impl tui_markdown::StyleSheet for PhiMarkdown {
 #[derive(Default)]
 struct Composer {
     text: String,
+    cursor: usize,
 }
 
 #[derive(Clone)]
@@ -90,8 +91,150 @@ impl Composer {
     }
 
     fn take(&mut self) -> String {
+        self.cursor = 0;
         std::mem::take(&mut self.text)
     }
+
+    fn set(&mut self, text: String) {
+        self.cursor = text.len();
+        self.text = text;
+    }
+
+    fn insert(&mut self, character: char) {
+        self.text.insert(self.cursor, character);
+        self.cursor += character.len_utf8();
+    }
+
+    fn backspace(&mut self) {
+        if let Some(previous) = self.text[..self.cursor]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+        {
+            self.text.drain(previous..self.cursor);
+            self.cursor = previous;
+        }
+    }
+
+    fn delete(&mut self) {
+        if let Some(character) = self.text[self.cursor..].chars().next() {
+            self.text
+                .drain(self.cursor..self.cursor + character.len_utf8());
+        }
+    }
+
+    fn move_left(&mut self) {
+        if let Some((index, _)) = self.text[..self.cursor].char_indices().next_back() {
+            self.cursor = index;
+        }
+    }
+
+    fn move_right(&mut self) {
+        if let Some(character) = self.text[self.cursor..].chars().next() {
+            self.cursor += character.len_utf8();
+        }
+    }
+
+    fn move_word_left(&mut self) {
+        while self.previous_char().is_some_and(char::is_whitespace) {
+            self.move_left();
+        }
+        while self
+            .previous_char()
+            .is_some_and(|character| !character.is_whitespace())
+        {
+            self.move_left();
+        }
+    }
+
+    fn move_word_right(&mut self) {
+        while self
+            .next_char()
+            .is_some_and(|character| !character.is_whitespace())
+        {
+            self.move_right();
+        }
+        while self.next_char().is_some_and(char::is_whitespace) {
+            self.move_right();
+        }
+    }
+
+    fn move_line_start(&mut self) {
+        self.cursor = self.line_start();
+    }
+
+    fn move_line_end(&mut self) {
+        self.cursor = self.line_end();
+    }
+
+    fn move_start(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn move_end(&mut self) {
+        self.cursor = self.text.len();
+    }
+
+    fn move_up(&mut self) {
+        let start = self.line_start();
+        if start == 0 {
+            return;
+        }
+        let column = self.text[start..self.cursor].chars().count();
+        let previous_end = start - 1;
+        let previous_start = self.text[..previous_end]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        self.cursor = byte_at_column(&self.text, previous_start, previous_end, column);
+    }
+
+    fn move_down(&mut self) {
+        let end = self.line_end();
+        if end == self.text.len() {
+            return;
+        }
+        let column = self.text[self.line_start()..self.cursor].chars().count();
+        let next_start = end + 1;
+        let next_end = self.text[next_start..]
+            .find('\n')
+            .map_or(self.text.len(), |index| next_start + index);
+        self.cursor = byte_at_column(&self.text, next_start, next_end, column);
+    }
+
+    fn on_first_line(&self) -> bool {
+        self.line_start() == 0
+    }
+
+    fn on_last_line(&self) -> bool {
+        self.line_end() == self.text.len()
+    }
+
+    fn line_start(&self) -> usize {
+        self.text[..self.cursor]
+            .rfind('\n')
+            .map_or(0, |index| index + 1)
+    }
+
+    fn line_end(&self) -> usize {
+        self.text[self.cursor..]
+            .find('\n')
+            .map_or(self.text.len(), |index| self.cursor + index)
+    }
+
+    fn previous_char(&self) -> Option<char> {
+        self.text[..self.cursor].chars().next_back()
+    }
+
+    fn next_char(&self) -> Option<char> {
+        self.text[self.cursor..].chars().next()
+    }
+}
+
+fn byte_at_column(text: &str, start: usize, end: usize, column: usize) -> usize {
+    text[start..end]
+        .char_indices()
+        .nth(column)
+        .map_or(end, |(index, _)| start + index)
 }
 
 struct App {
@@ -119,6 +262,9 @@ struct App {
     final_response_rendered: bool,
     command_filter: Option<String>,
     command_selected: usize,
+    message_history: Vec<String>,
+    history_index: Option<usize>,
+    history_draft: String,
     scroll: u16,
     follow: bool,
     quit: bool,
@@ -162,6 +308,9 @@ impl App {
             final_response_rendered: false,
             command_filter: None,
             command_selected: 0,
+            message_history: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
             scroll: 0,
             follow: true,
             quit: false,
@@ -191,6 +340,9 @@ impl App {
             return;
         }
         self.transcript.push(("you".into(), prompt.clone()));
+        self.message_history.push(prompt.clone());
+        self.history_index = None;
+        self.history_draft.clear();
         self.handle = Some(phi_runtime::start(self.options.clone(), prompt));
         self.turn_started = Some(Instant::now());
         self.final_response_rendered = false;
@@ -540,7 +692,7 @@ impl App {
             .get(self.command_selected)
             .map(|command| command.name.clone())
         {
-            self.composer.text = format!("/{name}");
+            self.composer.set(format!("/{name}"));
         }
         true
     }
@@ -553,10 +705,47 @@ impl App {
         else {
             return false;
         };
-        self.composer.text = format!("/{name} ");
+        self.composer.set(format!("/{name} "));
         self.command_filter = None;
         self.command_selected = 0;
         true
+    }
+
+    fn previous_message(&mut self) -> bool {
+        if self.message_history.is_empty() {
+            return false;
+        }
+        let index = match self.history_index {
+            Some(index) => index.saturating_sub(1),
+            None => {
+                self.history_draft.clone_from(&self.composer.text);
+                self.message_history.len() - 1
+            }
+        };
+        self.history_index = Some(index);
+        self.composer.set(self.message_history[index].clone());
+        true
+    }
+
+    fn next_message(&mut self) -> bool {
+        let Some(index) = self.history_index else {
+            return false;
+        };
+        if index + 1 < self.message_history.len() {
+            self.history_index = Some(index + 1);
+            self.composer.set(self.message_history[index + 1].clone());
+        } else {
+            self.history_index = None;
+            self.composer.set(std::mem::take(&mut self.history_draft));
+        }
+        true
+    }
+
+    fn edit_composer(&mut self) {
+        self.command_filter = None;
+        self.command_selected = 0;
+        self.history_index = None;
+        self.history_draft.clear();
     }
 
     fn on_key(&mut self, key: KeyEvent) {
@@ -598,29 +787,94 @@ impl App {
             KeyCode::Enter
                 if key.modifiers.contains(KeyModifiers::CONTROL) && !self.composer_locked() =>
             {
-                self.composer.text.push('\n');
+                self.edit_composer();
+                self.composer.insert('\n');
             }
             KeyCode::Enter => self.submit(),
             KeyCode::Tab if !self.composer_locked() => {
                 self.complete_command();
             }
             KeyCode::Backspace if !self.composer_locked() => {
-                self.command_filter = None;
-                self.command_selected = 0;
-                self.composer.text.pop();
+                self.edit_composer();
+                self.composer.backspace();
+            }
+            KeyCode::Delete if !self.composer_locked() => {
+                self.edit_composer();
+                self.composer.delete();
+            }
+            KeyCode::Char('b')
+                if !self.composer_locked() && key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.composer.move_word_left();
+            }
+            KeyCode::Char('f')
+                if !self.composer_locked() && key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.composer.move_word_right();
+            }
+            KeyCode::Char('a')
+                if !self.composer_locked() && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.composer.move_line_start();
+            }
+            KeyCode::Char('e')
+                if !self.composer_locked() && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.composer.move_line_end();
             }
             KeyCode::Char(character) if !self.composer_locked() => {
-                self.command_filter = None;
-                self.command_selected = 0;
-                self.composer.text.push(character);
+                self.edit_composer();
+                self.composer.insert(character);
             }
             KeyCode::Up if self.navigate_commands(false) => {}
             KeyCode::Down if self.navigate_commands(true) => {}
-            KeyCode::PageUp | KeyCode::Up => {
+            KeyCode::Left
+                if !self.composer_locked() && key.modifiers.intersects(KeyModifiers::ALT) =>
+            {
+                self.composer.move_word_left();
+            }
+            KeyCode::Right
+                if !self.composer_locked() && key.modifiers.intersects(KeyModifiers::ALT) =>
+            {
+                self.composer.move_word_right();
+            }
+            KeyCode::Left
+                if !self.composer_locked() && key.modifiers.intersects(KeyModifiers::SUPER) =>
+            {
+                self.composer.move_line_start();
+            }
+            KeyCode::Right
+                if !self.composer_locked() && key.modifiers.intersects(KeyModifiers::SUPER) =>
+            {
+                self.composer.move_line_end();
+            }
+            KeyCode::Up
+                if !self.composer_locked() && key.modifiers.intersects(KeyModifiers::SUPER) =>
+            {
+                self.composer.move_start();
+            }
+            KeyCode::Down
+                if !self.composer_locked() && key.modifiers.intersects(KeyModifiers::SUPER) =>
+            {
+                self.composer.move_end();
+            }
+            KeyCode::Home if !self.composer_locked() => self.composer.move_line_start(),
+            KeyCode::End if !self.composer_locked() => self.composer.move_line_end(),
+            KeyCode::Left if !self.composer_locked() => self.composer.move_left(),
+            KeyCode::Right if !self.composer_locked() => self.composer.move_right(),
+            KeyCode::Up if !self.composer_locked() && self.composer.on_first_line() => {
+                self.previous_message();
+            }
+            KeyCode::Down if !self.composer_locked() && self.next_message() => {}
+            KeyCode::Up if !self.composer_locked() => self.composer.move_up(),
+            KeyCode::Down if !self.composer_locked() && !self.composer.on_last_line() => {
+                self.composer.move_down();
+            }
+            KeyCode::PageUp => {
                 self.scroll = self.scroll.saturating_sub(1);
                 self.follow = false;
             }
-            KeyCode::PageDown | KeyCode::Down => {
+            KeyCode::PageDown => {
                 self.scroll = self.scroll.saturating_add(1);
                 self.follow = false;
             }
@@ -633,7 +887,7 @@ pub async fn launch(options: RunOptions, prompt: Option<String>) -> Result<()> {
     let catalog = phi_runtime::command_catalog(&options)?;
     let mut app = App::new(options, catalog);
     if let Some(prompt) = prompt {
-        app.composer.text = prompt;
+        app.composer.set(prompt);
         app.submit();
     }
 
@@ -771,13 +1025,14 @@ fn draw(frame: &mut Frame, app: &mut App) {
         );
     }
     if !app.composer_locked() && app.approval.is_none() {
-        let last_line = app.composer.text.rsplit('\n').next().unwrap_or("");
+        let before_cursor = &app.composer.text[..app.composer.cursor];
+        let last_line = before_cursor.rsplit('\n').next().unwrap_or("");
         let x = areas[1].x
             + 2
             + (last_line.chars().count() as u16).min(areas[1].width.saturating_sub(5));
         let y = areas[1].y
             + 1
-            + (app.composer.text.lines().count().saturating_sub(1) as u16)
+            + (before_cursor.lines().count().saturating_sub(1) as u16)
                 .min(areas[1].height.saturating_sub(3));
         frame.set_cursor_position((x, y));
     }
@@ -792,24 +1047,25 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let output = app
         .output_tokens
         .map_or_else(|| "output —".into(), |tokens| format!("output {tokens}"));
-    let model = app
-        .catalog
-        .selected_model
-        .as_deref()
-        .and_then(|selected| app.catalog.models.iter().find(|model| model.id == selected))
-        .map_or("model —", |model| model.model.as_str());
+    let model = app.catalog.selected_model.as_deref().unwrap_or("model —");
     let reasoning = app.catalog.selected_reasoning.as_deref().unwrap_or("—");
     let tier = app.catalog.selected_service_tier.as_deref();
     let selection = tier.map_or_else(
         || format!("{model} · {reasoning}"),
         |tier| format!("{model} · {reasoning} · {tier}"),
     );
+    let mut status = vec![selection];
+    if app.status != "ready" {
+        status.push(app.status.clone());
+    }
+    status.extend([
+        context,
+        cache,
+        output,
+        format!("{} compactions", app.compactions),
+    ]);
     frame.render_widget(
-        Paragraph::new(format!(
-            "{selection} · {} · {context} · {cache} · {output} · {} compactions",
-            app.status, app.compactions,
-        ))
-        .style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(status.join(" · ")).style(Style::default().fg(Color::DarkGray)),
         areas[2],
     );
 
@@ -834,7 +1090,7 @@ fn picker_options(picker: &Picker, catalog: &CommandCatalog) -> Vec<PickerItem> 
             .models
             .iter()
             .map(|model| PickerItem {
-                label: model.model.clone(),
+                label: model.id.clone(),
                 description: model.description.clone(),
                 value: model.id.clone(),
             })
@@ -1355,8 +1611,8 @@ mod tests {
                 ],
                 models: vec![phi_runtime::ModelSpec {
                     provider: "test".into(),
-                    id: "test".into(),
-                    model: "test".into(),
+                    id: "test/model".into(),
+                    model: "model".into(),
                     label: "Test".into(),
                     description: "Test model.".into(),
                     function_tools: true,
@@ -1384,7 +1640,7 @@ mod tests {
                     ],
                     default_service_tier: "default".into(),
                 }],
-                selected_model: Some("test".into()),
+                selected_model: Some("test/model".into()),
                 selected_reasoning: Some("low".into()),
                 selected_service_tier: Some("default".into()),
             },
@@ -1804,6 +2060,65 @@ mod tests {
         assert_eq!(app.composer.text, "/help");
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.composer.text, "/help ");
+    }
+
+    #[test]
+    fn model_picker_and_status_use_qualified_model_id() {
+        let app = app();
+        let options = picker_options(&Picker::Model { selected: 0 }, &app.catalog);
+        assert_eq!(options[0].label, "test/model");
+
+        let mut app = app;
+        let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let content = terminal.backend().to_string();
+        assert!(content.contains("test/model · low · default"));
+        assert!(!content.contains(" · ready · "));
+    }
+
+    #[test]
+    fn composer_moves_by_character_word_and_line() {
+        let mut app = app();
+        app.composer.set("one two".into());
+
+        app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+        assert_eq!(app.composer.cursor, 4);
+        app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SUPER));
+        assert_eq!(app.composer.cursor, 0);
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::SUPER));
+        assert_eq!(app.composer.cursor, 7);
+        app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE));
+        assert_eq!(app.composer.text, "one tw!o");
+    }
+
+    #[test]
+    fn up_and_down_browse_user_message_history() {
+        let mut app = app();
+        app.message_history = vec!["first".into(), "second".into()];
+        app.composer.set("draft".into());
+
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.composer.text, "second");
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.composer.text, "first");
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.composer.text, "second");
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.composer.text, "draft");
+    }
+
+    #[test]
+    fn up_moves_within_multiline_input_before_history() {
+        let mut app = app();
+        app.message_history.push("previous".into());
+        app.composer.set("top\nbottom".into());
+
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.composer.text, "top\nbottom");
+        assert!(app.composer.on_first_line());
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.composer.text, "previous");
     }
 
     #[test]
