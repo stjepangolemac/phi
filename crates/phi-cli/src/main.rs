@@ -13,6 +13,7 @@ use serde::Deserialize;
 struct Config {
     policy: PathBuf,
     provider: PathBuf,
+    prompt: PathBuf,
     compaction: PathBuf,
     allowed_programs: HashSet<String>,
 }
@@ -117,15 +118,19 @@ async fn run() -> Result<()> {
         }
         Command::CheckPolicy => {
             let config = config()?;
-            phi_steel::check(&config.policy, &config.provider, &config.compaction)?;
+            phi_steel::check(
+                &config.policy,
+                &config.provider,
+                &config.prompt,
+                &config.compaction,
+            )?;
             println!("policy ok");
             Ok(())
         }
         Command::PolicyCandidate { path } => {
-            let provider = config()?.provider;
-            let compaction = config()?.compaction;
-            phi_steel::check(&path, &provider, &compaction)?;
-            phi_steel::replay_smoke(&path, &provider, &compaction)?;
+            let config = config()?;
+            phi_steel::check(&path, &config.provider, &config.prompt, &config.compaction)?;
+            phi_steel::replay_smoke(&path, &config.provider, &config.prompt, &config.compaction)?;
             let id = phi_core::policy_store::submit(&workspace.join(".phi/policies"), &path)?;
             println!("{id}");
             Ok(())
@@ -213,6 +218,7 @@ fn config() -> Result<Config> {
     let mut config: Config = serde_json::from_slice(&std::fs::read(&path)?)?;
     config.policy = root.join(config.policy);
     config.provider = root.join(config.provider);
+    config.prompt = root.join(config.prompt);
     config.compaction = root.join(config.compaction);
     Ok(config)
 }

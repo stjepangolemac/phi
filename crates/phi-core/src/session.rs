@@ -17,16 +17,24 @@ pub struct Session {
 pub struct Sources {
     pub policy: PathBuf,
     pub provider: PathBuf,
+    pub prompt: PathBuf,
     pub compaction: PathBuf,
 }
 
 impl Session {
-    pub fn create(root: &Path, policy: &Path, provider: &Path, compaction: &Path) -> Result<Self> {
+    pub fn create(
+        root: &Path,
+        policy: &Path,
+        provider: &Path,
+        prompt: &Path,
+        compaction: &Path,
+    ) -> Result<Self> {
         let id = Uuid::new_v4().to_string();
         let session = Self::at(root, &id)?;
         fs::create_dir_all(&session.dir)?;
         fs::copy(policy, session.dir.join("policy.scm"))?;
         fs::copy(provider, session.dir.join("provider.scm"))?;
+        fs::copy(prompt, session.dir.join("prompt.scm"))?;
         fs::copy(compaction, session.dir.join("compaction.scm"))?;
         write_atomic(
             &session.dir.join("meta.json"),
@@ -35,6 +43,7 @@ impl Session {
                 "created_at": SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
                 "policy": policy.display().to_string(),
                 "provider": provider.display().to_string(),
+                "prompt": prompt.display().to_string(),
                 "compaction": compaction.display().to_string(),
             }))?,
         )?;
@@ -65,10 +74,16 @@ impl Session {
         fs::read_to_string(self.dir.join("state.json")).context("session has no saved state")
     }
 
-    pub fn sources(&self) -> Result<Sources> {
+    pub fn sources(&self, prompt_fallback: &Path) -> Result<Sources> {
+        let pinned_prompt = self.dir.join("prompt.scm");
         let sources = Sources {
             policy: self.dir.join("policy.scm"),
             provider: self.dir.join("provider.scm"),
+            prompt: if pinned_prompt.is_file() {
+                pinned_prompt
+            } else {
+                prompt_fallback.to_owned()
+            },
             compaction: self.dir.join("compaction.scm"),
         };
         if !sources.policy.is_file() || !sources.provider.is_file() || !sources.compaction.is_file()
@@ -116,11 +131,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join("agent.scm"), "agent").unwrap();
         fs::write(root.path().join("provider.scm"), "provider").unwrap();
+        fs::write(root.path().join("prompt.scm"), "prompt").unwrap();
         fs::write(root.path().join("compaction.scm"), "compaction").unwrap();
         let session = Session::create(
             root.path(),
             &root.path().join("agent.scm"),
             &root.path().join("provider.scm"),
+            &root.path().join("prompt.scm"),
             &root.path().join("compaction.scm"),
         )
         .unwrap();
@@ -128,8 +145,19 @@ mod tests {
         let resumed = Session::open(root.path(), session.id()).unwrap();
         assert_eq!(resumed.load_state().unwrap(), "{\"input\":[]}");
         assert_eq!(
-            fs::read_to_string(resumed.sources().unwrap().policy).unwrap(),
+            fs::read_to_string(
+                resumed
+                    .sources(&root.path().join("prompt.scm"))
+                    .unwrap()
+                    .policy,
+            )
+            .unwrap(),
             "agent"
         );
+
+        fs::remove_file(resumed.dir.join("prompt.scm")).unwrap();
+        let fallback = root.path().join("prompt-fallback.scm");
+        fs::write(&fallback, "fallback").unwrap();
+        assert_eq!(resumed.sources(&fallback).unwrap().prompt, fallback);
     }
 }

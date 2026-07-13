@@ -1,21 +1,22 @@
 use std::{collections::BTreeMap, fs, path::Path};
 
 use anyhow::{Context, Result, bail};
+pub use phi_protocol::ToolSpec;
 use serde_json::{Value, json};
 
 pub trait Tool {
-    fn name(&self) -> &'static str;
+    fn spec(&self) -> ToolSpec;
     fn execute(&self, workspace: &Path, arguments: Value) -> Result<Value>;
 }
 
 #[derive(Default)]
 pub struct Registry {
-    tools: BTreeMap<&'static str, Box<dyn Tool>>,
+    tools: BTreeMap<String, Box<dyn Tool>>,
 }
 
 impl Registry {
     pub fn register(&mut self, tool: impl Tool + 'static) {
-        self.tools.insert(tool.name(), Box::new(tool));
+        self.tools.insert(tool.spec().name, Box::new(tool));
     }
 
     pub fn execute(&self, workspace: &Path, name: &str, arguments: Value) -> Result<Value> {
@@ -24,13 +25,17 @@ impl Registry {
             .with_context(|| format!("unknown tool: {name}"))?
             .execute(workspace, arguments)
     }
+
+    pub fn specs(&self) -> Vec<ToolSpec> {
+        self.tools.values().map(|tool| tool.spec()).collect()
+    }
 }
 
 pub struct ReadFile;
 
 impl Tool for ReadFile {
-    fn name(&self) -> &'static str {
-        "read_file"
+    fn spec(&self) -> ToolSpec {
+        Self::spec()
     }
 
     fn execute(&self, workspace: &Path, arguments: Value) -> Result<Value> {
@@ -54,8 +59,8 @@ impl Tool for ReadFile {
 pub struct ReplaceFile;
 
 impl Tool for ReplaceFile {
-    fn name(&self) -> &'static str {
-        "replace_file"
+    fn spec(&self) -> ToolSpec {
+        Self::spec()
     }
 
     fn execute(&self, workspace: &Path, arguments: Value) -> Result<Value> {
@@ -90,6 +95,58 @@ impl Tool for ReplaceFile {
             "path": path.strip_prefix(&root)?.display().to_string(),
             "revision": blake3::hash(content.as_bytes()).to_hex().to_string(),
         }))
+    }
+}
+
+impl ReadFile {
+    pub fn spec() -> ToolSpec {
+        ToolSpec {
+            name: "read_file".into(),
+            description: "Read a UTF-8 file inside the workspace.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        }
+    }
+}
+
+impl ReplaceFile {
+    pub fn spec() -> ToolSpec {
+        ToolSpec {
+            name: "replace_file".into(),
+            description: "Atomically replace an existing UTF-8 workspace file using the revision returned by read_file.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "revision": { "type": "string" },
+                    "content": { "type": "string" }
+                },
+                "required": ["path", "revision", "content"],
+                "additionalProperties": false
+            }),
+        }
+    }
+}
+
+pub fn shell_spec() -> ToolSpec {
+    ToolSpec {
+        name: "shell".into(),
+        description: "Run one allowlisted program in the workspace without shell expansion.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "program": { "type": "string" },
+                "args": { "type": "array", "items": { "type": "string" } },
+                "stdin": { "type": "string" },
+                "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 60000 }
+            },
+            "required": ["program", "args", "stdin", "timeout_ms"],
+            "additionalProperties": false
+        }),
     }
 }
 

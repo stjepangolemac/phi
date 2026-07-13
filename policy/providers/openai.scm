@@ -2,75 +2,73 @@
 (require-builtin steel/json)
 (require-builtin steel/hash)
 
-(define tools
-  (list
-    (hash 'type "function"
-          'name "read_file"
-          'description "Read a UTF-8 file inside the workspace."
-          'strict #t
-          'parameters (hash 'type "object"
-                            'properties (hash 'path (hash 'type "string"))
-                            'required (list "path")
-                            'additionalProperties #f))
-    (hash 'type "function"
-          'name "replace_file"
-          'description "Atomically replace an existing UTF-8 workspace file using the revision returned by read_file."
-          'strict #t
-          'parameters (hash 'type "object"
-                            'properties
-                            (hash 'path (hash 'type "string")
-                                  'revision (hash 'type "string")
-                                  'content (hash 'type "string"))
-                            'required (list "path" "revision" "content")
-                            'additionalProperties #f))
-    (hash 'type "function"
-          'name "shell"
-          'description "Run one allowlisted program in the workspace without shell expansion."
-          'strict #t
-          'parameters (hash 'type "object"
-                            'properties
-                            (hash 'program (hash 'type "string")
-                                  'args (hash 'type "array" 'items (hash 'type "string"))
-                                  'stdin (hash 'type "string")
-                                  'timeout_ms (hash 'type "integer" 'minimum 1 'maximum 60000))
-                            'required (list "program" "args" "stdin" "timeout_ms")
-                            'additionalProperties #f))
-    (hash 'type "function"
-          'name "submit_policy_candidate"
-          'description "Validate and store a complete replacement for policy/agent.scm. Never activates it."
-          'strict #t
-          'parameters (hash 'type "object"
-                            'properties
-                            (hash 'content (hash 'type "string")
-                                  'hypothesis (hash 'type "string"))
-                            'required (list "content" "hypothesis")
-                            'additionalProperties #f))))
+(define (provider-tool spec)
+  (hash 'type "function"
+        'name (hash-ref spec 'name)
+        'description (hash-ref spec 'description)
+        'strict #t
+        'parameters (hash-ref spec 'parameters)))
 
-(define instructions
-  "Answer ordinary requests directly and concisely. You can read and revision-safely replace workspace files, and run allowlisted programs. Inspect before editing and verify changes. Only when the user explicitly asks you to improve Phi's policy: inspect the active policy, make one small measurable improvement, submit the complete replacement with a concise hypothesis, and report the candidate id, validation, and diff for human approval. Never claim activation.")
+(define reasoning-options
+  (list (hash 'id "low" 'description "Fast responses with lighter reasoning.")
+        (hash 'id "medium" 'description "Balances speed and reasoning depth for everyday tasks.")
+        (hash 'id "high" 'description "Greater reasoning depth for complex problems.")
+        (hash 'id "xhigh" 'description "Extra high reasoning depth for complex problems.")
+        (hash 'id "max" 'description "Maximum reasoning depth for the hardest problems.")))
 
-(define (provider-effect history)
+(define service-tier-options
+  (list (hash 'id "default" 'description "Standard speed and usage.")
+        (hash 'id "fast" 'description "1.5x speed, increased usage.")))
+
+(define (register-openai-model! id description default reasoning default-reasoning)
+  (register-model!
+    (hash 'id id
+          'label id
+          'description description
+          'default default
+          'reasoning reasoning
+          'default_reasoning default-reasoning
+          'service_tiers service-tier-options
+          'default_service_tier "default")))
+
+(register-openai-model!
+  "gpt-5.6-luna" "Cost-sensitive, high-volume workloads."
+  #t reasoning-options "low")
+(register-openai-model!
+  "gpt-5.6-terra" "Balances intelligence and cost."
+  #f reasoning-options "medium")
+(register-openai-model!
+  "gpt-5.6-sol" "Complex reasoning and coding."
+  #f reasoning-options "medium")
+
+(define (provider-effect prompt model reasoning service-tier)
+  (define history (hash-ref prompt 'messages))
+  (define body
+    (hash 'model model
+          'instructions (hash-ref prompt 'instructions)
+          'input (map provider-message->item history)
+          'tools (map provider-tool (hash-ref prompt 'tools))
+          'prompt_cache_key (runtime-session-id)
+          'tool_choice "auto"
+          'parallel_tool_calls #f
+          'reasoning (hash 'effort reasoning 'context "all_turns")
+          'service_tier service-tier
+          'store #f
+          'stream #t
+          'include (list "reasoning.encrypted_content")))
   (hash 'type "http_request"
         'url "https://chatgpt.com/backend-api/codex/responses"
         'secret "openai_chatgpt"
         'headers (hash 'originator "codex_cli_rs"
                        'user-agent "codex_cli_rs/0.144.1"
+                       'session_id (runtime-session-id)
                        'x-openai-internal-codex-responses-lite "true")
         'timeout_ms 120000
-        'body
-        (hash 'model "gpt-5.6-luna"
-              'instructions ""
-              'input (append
-                       (list (hash 'type "additional_tools" 'role "developer" 'tools tools)
-                             (hash 'type "message" 'role "developer"
-                                   'content (list (hash 'type "input_text" 'text instructions))))
-                       (map provider-message->item history))
-              'tool_choice "auto"
-              'parallel_tool_calls #f
-              'reasoning (hash 'effort "low" 'context "all_turns")
-              'store #f
-              'stream #t
-              'include (list "reasoning.encrypted_content"))))
+        'body (cond [(equal? service-tier "default")
+                     (hash-remove body 'service_tier)]
+                    [(equal? service-tier "fast")
+                     (hash-insert body 'service_tier "priority")]
+                    [else body])))
 
 (define (provider-call events)
   (if (null? events)
@@ -87,13 +85,16 @@
   (define kind (hash-ref message 'kind))
   (cond
     [(equal? kind "message")
-     (hash 'type "message"
-           'role (hash-ref message 'role)
-           'content
-           (list (hash 'type (if (equal? (hash-ref message 'role) "assistant")
-                                  "output_text"
-                                  "input_text")
-                       'text (hash-ref message 'content))))]
+     (define item
+       (hash 'type "message"
+             'role (hash-ref message 'role)
+             'content
+             (list (hash 'type (if (equal? (hash-ref message 'role) "assistant")
+                                    "output_text"
+                                    "input_text")
+                         'text (hash-ref message 'content)))))
+     (define phase (hash-try-get message 'phase))
+     (if phase (hash-insert item 'phase phase) item)]
     [(equal? kind "tool_call")
      (hash 'type "function_call"
            'call_id (hash-ref message 'call_id)
@@ -103,7 +104,36 @@
      (hash 'type "function_call_output"
            'call_id (hash-ref message 'call_id)
            'output (hash-ref message 'content))]
+    [(equal? kind "provider_item")
+     (if (equal? (hash-ref message 'provider) "openai")
+         (hash-ref message 'item)
+         (error! "provider item belongs to another provider"))]
     [else (error! "unsupported normalized message")]))
+
+(define (provider-preserved-items events)
+  (if (null? events)
+      '()
+      (let* ([event (car events)]
+             [item (hash-try-get event 'item)]
+             [type (if item (hash-ref item 'type) "")]
+             [rest (provider-preserved-items (cdr events))])
+        (if (and (equal? (hash-ref event 'type) "response.output_item.done")
+                 (or (equal? type "reasoning")
+                     (equal? type "compaction")))
+            (cons (hash 'kind "provider_item" 'provider "openai" 'item item)
+                  rest)
+            rest))))
+
+(define (provider-message-phase events)
+  (if (null? events)
+      #f
+      (let* ([event (car events)]
+             [item (hash-try-get event 'item)])
+        (if (and (equal? (hash-ref event 'type) "response.output_item.done")
+                 item
+                 (equal? (hash-ref item 'type) "message"))
+            (hash-try-get item 'phase)
+            (provider-message-phase (cdr events))))))
 
 (define (provider-normalize-call item)
   (hash 'kind "tool_call"

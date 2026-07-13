@@ -5,19 +5,20 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use phi_core::capability::Tool;
+use phi_core::capability::{Tool, ToolSpec};
 use serde_json::{Value, json};
 use similar::TextDiff;
 
 pub struct SubmitPolicyCandidate {
     pub active_policy: PathBuf,
     pub provider: PathBuf,
+    pub prompt: PathBuf,
     pub compaction: PathBuf,
 }
 
 impl Tool for SubmitPolicyCandidate {
-    fn name(&self) -> &'static str {
-        "submit_policy_candidate"
+    fn spec(&self) -> ToolSpec {
+        Self::spec()
     }
 
     fn execute(&self, workspace: &Path, arguments: Value) -> Result<Value> {
@@ -28,8 +29,18 @@ impl Tool for SubmitPolicyCandidate {
         let mut candidate = tempfile::Builder::new().suffix(".scm").tempfile_in(&phi)?;
         std::io::Write::write_all(&mut candidate, content.as_bytes())?;
 
-        phi_steel::check(candidate.path(), &self.provider, &self.compaction)?;
-        phi_steel::replay_smoke(candidate.path(), &self.provider, &self.compaction)?;
+        phi_steel::check(
+            candidate.path(),
+            &self.provider,
+            &self.prompt,
+            &self.compaction,
+        )?;
+        phi_steel::replay_smoke(
+            candidate.path(),
+            &self.provider,
+            &self.prompt,
+            &self.compaction,
+        )?;
         gate(workspace, &["fmt", "--all", "--", "--check"])?;
         gate(workspace, &["test", "--workspace"])?;
         gate(
@@ -57,6 +68,24 @@ impl Tool for SubmitPolicyCandidate {
             "validation": "Steel load, replay fixture, cargo fmt, cargo test, and cargo clippy passed",
             "activation": "manual approval required"
         }))
+    }
+}
+
+impl SubmitPolicyCandidate {
+    pub fn spec() -> ToolSpec {
+        ToolSpec {
+            name: "submit_policy_candidate".into(),
+            description: "Validate and store a complete replacement for policy/agent.scm. Never activates it.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "content": { "type": "string" },
+                    "hypothesis": { "type": "string" }
+                },
+                "required": ["content", "hypothesis"],
+                "additionalProperties": false
+            }),
+        }
     }
 }
 

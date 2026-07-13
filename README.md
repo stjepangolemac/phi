@@ -8,7 +8,7 @@ The goal is not to reimplement an async runtime, HTTP stack, terminal framework,
 
 ```text
 Steel policy and plugins
-  agent loop, prompts, providers, tools, routing, compaction,
+  agent loop, prompts, providers, routing, compaction,
   planning, delegation, retries, evaluation, improvement
                          |
                     effects/events
@@ -50,7 +50,6 @@ Providers should be Steel plugins over generic Rust HTTP and streaming primitive
 
 Other Steel-level plugins can implement:
 
-- tools and argument schemas;
 - prompts and context compaction;
 - model routing, retries and failover;
 - permission and approval policy;
@@ -61,6 +60,8 @@ Other Steel-level plugins can implement:
 - evaluation and self-improvement strategies.
 
 Rust should retain raw connection/framing reliability, capability enforcement, job scheduling, durable event logging, secret handling, and recovery.
+
+Capabilities own their provider-neutral names, descriptions, argument schemas, and execution. The runtime passes that catalog into Steel; provider plugins only translate it into their wire format.
 
 ## Self-modification
 
@@ -125,9 +126,10 @@ The repository is a Cargo workspace:
 - `phi-cli`: the thin executable;
 - `phi-tui`: a thin Ratatui frontend;
 - `policy/providers/openai.scm`: OpenAI-specific provider behavior.
+- `policy/prompts/simple.scm`: provider-neutral prompt assembly.
 - `policy/compaction/simple.scm`: replaceable context compaction policy.
 
-The OpenAI plugin calls the Responses endpoint directly using the existing ChatGPT login. Rust owns generic HTTP/SSE transport and injects configured secret handles without exposing tokens to Steel. `phi.json` selects the policy, provider plugin, network allowlist, and secret mapping.
+The OpenAI plugin calls the Responses endpoint directly using the existing ChatGPT login. Rust owns generic HTTP/SSE transport and injects configured secret handles without exposing tokens to Steel. `phi.json` selects the agent, prompt, compaction, and provider plugins along with the network allowlist and secret mapping.
 
 ```sh
 cargo build
@@ -157,11 +159,40 @@ cargo run -p phi-cli -- --allow-write run "Update the requested file"
 
 Steel stores provider-neutral message, tool-call, and tool-result history. It tracks estimated and provider-reported usage and invokes the configured compaction plugin before requests when context exceeds its budget.
 
+The agent passes compacted history, instructions, and the capability catalog to `build-prompt`. The prompt plugin returns a provider-neutral prompt; the provider plugin only encodes it for its API. New sessions pin the selected prompt plugin with the other policy sources, while sessions created before prompt plugins use the configured prompt.
+
+The OpenAI provider keeps requests stateless with `store: false`. It sends the stable tool and instruction prefix before conversation history and assigns a session cache key for automatic prompt caching. Provider-reported input, cache-read, cache-write, and output tokens are exposed in runtime events and the TUI. Opaque OpenAI reasoning and compaction items are retained for the next stateless request.
+
 The TUI streams the same runtime events as the CLI. Enter sends, Ctrl-Enter inserts a newline, Esc cancels active work, and Ctrl-C exits when idle. Shell and write requests show a one-shot approval prompt unless pre-approved with `--allow-shell` or `--allow-write`. Resume a session with:
 
 ```sh
 cargo run -p phi-tui -- --session SESSION_ID
 ```
+
+Inputs beginning with `/` are runtime commands and are never sent to the model. Type `/` to see completions and Tab to accept the first match. Core owns reserved commands such as `/help` and `/model`; providers register their available models, and other Steel plugins may register local commands:
+
+```scheme
+(register-model!
+  (hash 'id "gpt-5.6-luna" 'label "Luna"
+        'description "Cost-sensitive, high-volume workloads."
+        'default #t
+        'reasoning
+        (list (hash 'id "low" 'description "Fast responses with lighter reasoning.")
+              (hash 'id "medium" 'description "Balances speed and reasoning depth."))
+        'default_reasoning "low"
+        'service_tiers
+        (list (hash 'id "default" 'description "Standard speed and usage.")
+              (hash 'id "fast" 'description "1.5x speed, increased usage."))
+        'default_service_tier "default"))
+
+(register-command!
+  (hash 'name "example" 'usage "/example ARG"
+        'description "Example command." 'source "plugin-name")
+  (lambda (state arguments)
+    (hash 'state state 'content arguments)))
+```
+
+In the TUI, `/model` opens provider-declared model, reasoning, and optional service-tier pickers. Up/Down moves, Enter selects, and Esc cancels. The direct form `/model MODEL_ID [REASONING] [SERVICE_TIER]` remains available. Core command names and duplicate plugin registrations are rejected.
 
 Candidate policies are parsed before storage and require explicit activation:
 

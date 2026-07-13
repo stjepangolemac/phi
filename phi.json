@@ -1,6 +1,7 @@
 {
   "policy": "policy/agent.scm",
   "provider": "policy/providers/openai.scm",
+  "prompt": "policy/prompts/simple.scm",
   "compaction": "policy/compaction/simple.scm",
   "allowed_programs": ["cargo", "find", "git", "ls", "pwd", "rg", "sed"],
   "context_char_budget": 24000,
