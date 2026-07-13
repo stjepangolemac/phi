@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use phi_protocol::{Effect, Event};
+use phi_protocol::{Effect, Event, StreamRule};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -712,7 +712,12 @@ async fn run(
         saved_state,
     )?;
     let selected_model = state_string(policy.state(), "model")?;
-    for route in policy.resolved_tool_routes(&selected_model)? {
+    let tool_routes = policy.resolved_tool_routes(&selected_model)?;
+    let tool_capabilities = tool_routes
+        .iter()
+        .map(|route| (route.implementation.clone(), route.capability.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for route in tool_routes {
         send(
             events,
             RuntimeEvent::ToolRouteSelected {
@@ -723,6 +728,7 @@ async fn run(
     }
     let mut event = Event::UserMessage { content: prompt };
     let mut activity = "ready".to_owned();
+    let mut callable_tool = None;
     let permissions = phi_core::permissions::Permissions {
         allow_shell: options.allow_shell,
         allow_write: options.allow_write,
@@ -739,6 +745,32 @@ async fn run(
         send_context(events, policy.state(), config.context_char_budget)?;
         let next_activity = state_activity(policy.state())?;
         if next_activity != activity {
+            if activity == "searching"
+                && let Some(name) = callable_tool.take()
+            {
+                send(
+                    events,
+                    RuntimeEvent::ToolCompleted {
+                        name,
+                        result: serde_json::json!({}),
+                    },
+                )?;
+            }
+            if next_activity == "searching" {
+                let implementation = state_string(policy.state(), "pending_tool")?;
+                let name = tool_capabilities
+                    .get(&implementation)
+                    .cloned()
+                    .unwrap_or(implementation);
+                send(
+                    events,
+                    RuntimeEvent::ToolStarted {
+                        name: name.clone(),
+                        arguments: serde_json::json!({}),
+                    },
+                )?;
+                callable_tool = Some(name);
+            }
             send(
                 events,
                 RuntimeEvent::ActivityChanged {
@@ -826,6 +858,7 @@ async fn run(
                 headers,
                 body,
                 timeout_ms,
+                stream,
             } => {
                 let request = phi_core::http::post_sse(
                     phi_core::http::SseRequest {
@@ -838,18 +871,8 @@ async fn run(
                         timeout_ms,
                     },
                     |provider_event| {
-                        if stream_output
-                            && provider_event
-                                .get("type")
-                                .and_then(serde_json::Value::as_str)
-                                == Some("response.output_text.delta")
-                            && let Some(content) = provider_event
-                                .get("delta")
-                                .and_then(serde_json::Value::as_str)
-                        {
-                            let _ = events.send(RuntimeEvent::ModelDelta {
-                                content: content.into(),
-                            });
+                        if stream_output {
+                            emit_stream_events(events, provider_event, &stream);
                         }
                     },
                 );
@@ -862,6 +885,43 @@ async fn run(
         }
     }
     bail!("effect limit reached")
+}
+
+fn emit_stream_events(
+    events: &mpsc::UnboundedSender<RuntimeEvent>,
+    provider_event: &serde_json::Value,
+    rules: &[StreamRule],
+) {
+    for rule in rules {
+        if !rule
+            .matches
+            .iter()
+            .all(|(pointer, expected)| provider_event.pointer(pointer) == Some(expected))
+        {
+            continue;
+        }
+        let value = provider_event
+            .pointer(&rule.value)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let event = match rule.emit.as_str() {
+            "model_delta" => value.as_str().map(|content| RuntimeEvent::ModelDelta {
+                content: content.into(),
+            }),
+            "tool_started" => Some(RuntimeEvent::ToolStarted {
+                name: rule.name.clone(),
+                arguments: value,
+            }),
+            "tool_completed" => Some(RuntimeEvent::ToolCompleted {
+                name: rule.name.clone(),
+                result: value,
+            }),
+            _ => None,
+        };
+        if let Some(event) = event {
+            let _ = events.send(event);
+        }
+    }
 }
 
 async fn cancellable<T>(
@@ -989,6 +1049,52 @@ mod tests {
                 .any(|command| command.name == "model")
         );
         assert_eq!(catalog.models[0].id, "openai/gpt-5.6-luna");
+    }
+
+    #[test]
+    fn provider_stream_rules_emit_generic_tool_events() {
+        let rules: Vec<StreamRule> = serde_json::from_value(serde_json::json!([
+            {
+                "match": { "/type": "response.output_item.added", "/item/type": "web_search_call" },
+                "emit": "tool_started",
+                "name": "web_search",
+                "value": "/item"
+            },
+            {
+                "match": { "/type": "response.output_item.done", "/item/type": "web_search_call" },
+                "emit": "tool_completed",
+                "name": "web_search",
+                "value": "/item"
+            }
+        ]))
+        .unwrap();
+        let (events, mut received) = mpsc::unbounded_channel();
+
+        emit_stream_events(
+            &events,
+            &serde_json::json!({
+                "type": "response.output_item.added",
+                "item": { "type": "web_search_call" }
+            }),
+            &rules,
+        );
+        emit_stream_events(
+            &events,
+            &serde_json::json!({
+                "type": "response.output_item.done",
+                "item": { "type": "web_search_call", "action": { "sources": [] } }
+            }),
+            &rules,
+        );
+
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            RuntimeEvent::ToolStarted { name, .. } if name == "web_search"
+        ));
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            RuntimeEvent::ToolCompleted { name, .. } if name == "web_search"
+        ));
     }
 
     #[test]

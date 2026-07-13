@@ -1,5 +1,16 @@
 ;; Shared normalization for providers exposing the Responses protocol.
 
+(define responses-stream-rules
+  (list
+    (hash 'match (hash "/type" "response.output_text.delta")
+          'emit "model_delta" 'value "/delta")
+    (hash 'match (hash "/type" "response.output_item.added"
+                       "/item/type" "web_search_call")
+          'emit "tool_started" 'name "web_search" 'value "/item")
+    (hash 'match (hash "/type" "response.output_item.done"
+                       "/item/type" "web_search_call")
+          'emit "tool_completed" 'name "web_search" 'value "/item")))
+
 (define (responses-tool spec)
   (if (equal? (or (hash-try-get spec 'kind) "") "hosted_tool")
       (hash-ref spec 'wire)

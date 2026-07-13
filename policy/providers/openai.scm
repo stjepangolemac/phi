@@ -58,6 +58,7 @@
                        'user-agent "codex_cli_rs/0.144.1"
                        'session_id (runtime-session-id))
         'timeout_ms 120000
+        'stream responses-stream-rules
         'body (cond [(equal? service-tier "default")
                      (hash-remove body 'service_tier)]
                     [(equal? service-tier "fast")

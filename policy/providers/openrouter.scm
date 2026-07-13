@@ -29,6 +29,7 @@
         'secret "openrouter"
         'headers (hash 'x-title "Phi")
         'timeout_ms 120000
+        'stream responses-stream-rules
         'body
         (hash 'model model
               'instructions (hash-ref prompt 'instructions)

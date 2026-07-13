@@ -115,6 +115,7 @@ struct App {
     compactions: u64,
     turn_started: Option<Instant>,
     compaction_started: Option<Instant>,
+    tool_started: Option<(String, Instant)>,
     final_response_rendered: bool,
     command_filter: Option<String>,
     command_selected: usize,
@@ -157,6 +158,7 @@ impl App {
             compactions: 0,
             turn_started: None,
             compaction_started: None,
+            tool_started: None,
             final_response_rendered: false,
             command_filter: None,
             command_selected: 0,
@@ -400,26 +402,48 @@ impl App {
             RuntimeEvent::ModelDelta { content } => self.current_model.push_str(&content),
             RuntimeEvent::ToolStarted { name, arguments } => {
                 self.flush_model();
+                self.tool_started = Some((name.clone(), Instant::now()));
+                if name == "web_search" {
+                    self.status = "searching".into();
+                }
                 self.transcript.push((
                     "tool".into(),
-                    if name == "shell" {
-                        format!("Ran `{}`", display_command(&arguments))
-                    } else {
-                        format!("Ran `{name}`")
+                    match name.as_str() {
+                        "shell" => format!("Ran `{}`", display_command(&arguments)),
+                        "web_search" => "Searching the web".into(),
+                        _ => format!("Ran `{name}`"),
                     },
                 ));
             }
-            RuntimeEvent::ToolCompleted { result, .. } => {
+            RuntimeEvent::ToolCompleted { name, result } => {
+                let elapsed = self
+                    .tool_started
+                    .take()
+                    .filter(|(started_name, _)| started_name == &name)
+                    .map_or(Duration::ZERO, |(_, started)| started.elapsed());
                 if let Some((_, content)) = self
                     .transcript
                     .iter_mut()
                     .rev()
                     .find(|(role, _)| role == "tool")
                 {
-                    let result = tool_result(&result);
-                    if !result.is_empty() {
-                        content.push_str("\n\n");
-                        content.push_str(&result);
+                    if name == "web_search" {
+                        let sources = result
+                            .pointer("/action/sources")
+                            .and_then(serde_json::Value::as_array)
+                            .map(Vec::len)
+                            .unwrap_or_default();
+                        *content = format!("Searched the web · {}", human_duration(elapsed));
+                        if sources > 0 {
+                            content.push_str(&format!("\n\n{sources} sources"));
+                        }
+                        self.status = "working".into();
+                    } else {
+                        let result = tool_result(&result);
+                        if !result.is_empty() {
+                            content.push_str("\n\n");
+                            content.push_str(&result);
+                        }
                     }
                 }
             }
@@ -442,6 +466,7 @@ impl App {
                 ));
                 self.handle = None;
                 self.compaction_started = None;
+                self.tool_started = None;
                 self.final_response_rendered = false;
                 self.status = "ready".into();
             }
@@ -452,6 +477,7 @@ impl App {
                 self.approval = None;
                 self.turn_started = None;
                 self.compaction_started = None;
+                self.tool_started = None;
                 self.final_response_rendered = false;
                 self.status = "ready".into();
             }
@@ -939,7 +965,13 @@ fn transcript_text(app: &App, width: usize) -> Text<'static> {
         }
         let (activity, started) = match app.status.as_str() {
             "compacting" => ("Compacting", app.compaction_started.unwrap_or(turn_started)),
-            "searching" => ("Searching", turn_started),
+            "searching" => (
+                "Searching",
+                app.tool_started
+                    .as_ref()
+                    .map(|(_, started)| *started)
+                    .unwrap_or(turn_started),
+            ),
             _ => ("Working", turn_started),
         };
         push_message(
@@ -1351,6 +1383,27 @@ mod tests {
         });
         assert_eq!(app.transcript[0], ("phi".into(), "hi".into()));
         assert_eq!(app.transcript[1].1, "Ran `read_file`");
+    }
+
+    #[test]
+    fn shows_search_while_running_and_retains_completion() {
+        let mut app = app();
+        app.turn_started = Some(Instant::now());
+        app.on_runtime(RuntimeEvent::ToolStarted {
+            name: "web_search".into(),
+            arguments: serde_json::json!({}),
+        });
+        assert_eq!(app.status, "searching");
+        assert_eq!(app.transcript[0].1, "Searching the web");
+        app.tool_started = Some(("web_search".into(), Instant::now() - Duration::from_secs(3)));
+
+        app.on_runtime(RuntimeEvent::ToolCompleted {
+            name: "web_search".into(),
+            result: serde_json::json!({ "action": { "sources": [{}, {}] } }),
+        });
+
+        assert_eq!(app.status, "working");
+        assert_eq!(app.transcript[0].1, "Searched the web · 3s\n\n2 sources");
     }
 
     #[test]

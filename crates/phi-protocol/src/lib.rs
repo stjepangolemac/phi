@@ -50,10 +50,23 @@ pub enum Effect {
         headers: std::collections::BTreeMap<String, String>,
         body: serde_json::Value,
         timeout_ms: u64,
+        #[serde(default)]
+        stream: Vec<StreamRule>,
     },
     Finish {
         content: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StreamRule {
+    #[serde(rename = "match")]
+    pub matches: std::collections::BTreeMap<String, serde_json::Value>,
+    pub emit: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub value: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
