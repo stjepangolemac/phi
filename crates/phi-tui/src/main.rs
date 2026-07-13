@@ -389,9 +389,14 @@ impl App {
                     self.compaction_started = Some(Instant::now());
                     self.status = activity;
                 }
+                "searching" => {
+                    self.flush_model();
+                    self.status = activity;
+                }
                 "working" => self.status = activity,
                 _ => {}
             },
+            RuntimeEvent::ToolRouteSelected { .. } => {}
             RuntimeEvent::ModelDelta { content } => self.current_model.push_str(&content),
             RuntimeEvent::ToolStarted { name, arguments } => {
                 self.flush_model();
@@ -932,10 +937,10 @@ fn transcript_text(app: &App, width: usize) -> Text<'static> {
         if lines.last().is_some_and(|line| line.style.bg.is_some()) {
             lines.push(Line::raw(" ".repeat(width)));
         }
-        let (activity, started) = if app.status == "compacting" {
-            ("Compacting", app.compaction_started.unwrap_or(turn_started))
-        } else {
-            ("Working", turn_started)
+        let (activity, started) = match app.status.as_str() {
+            "compacting" => ("Compacting", app.compaction_started.unwrap_or(turn_started)),
+            "searching" => ("Searching", turn_started),
+            _ => ("Working", turn_started),
         };
         push_message(
             &mut lines,
@@ -1302,6 +1307,8 @@ mod tests {
                     model: "test".into(),
                     label: "Test".into(),
                     description: "Test model.".into(),
+                    function_tools: true,
+                    hosted_tools: Vec::new(),
                     reasoning: vec![
                         phi_runtime::PickerOptionSpec::Detailed {
                             id: "low".into(),

@@ -86,6 +86,10 @@ pub struct ModelSpec {
     #[serde(default)]
     pub description: String,
     #[serde(default)]
+    pub function_tools: bool,
+    #[serde(default)]
+    pub hosted_tools: Vec<String>,
+    #[serde(default)]
     pub reasoning: Vec<PickerOptionSpec>,
     #[serde(default)]
     pub default_reasoning: String,

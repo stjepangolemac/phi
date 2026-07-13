@@ -19,6 +19,9 @@ const PLUGIN_PRELUDE: &str = r#"
 (define command-registry '())
 (define model-registry '())
 (define tool-registry '())
+(define tool-implementation-registry '())
+(define tool-selection-registry '())
+(define tool-config-registry '())
 (define provider-registry '())
 (define prompt-builder-registry '())
 (define compactor-registry '())
@@ -56,6 +59,27 @@ const PLUGIN_PRELUDE: &str = r#"
                           (hash-insert spec 'provider provider)
                           'model model)
                         'id (string-append provider "/" model))))))
+
+(define (register-hosted-tool! name capability provider build)
+  (set! tool-implementation-registry
+        (append tool-implementation-registry
+                (list (hash 'name name 'capability capability 'mode "hosted"
+                            'provider provider 'build build)))))
+
+(define (register-callable-tool! name capability spec start complete)
+  (set! tool-implementation-registry
+        (append tool-implementation-registry
+                (list (hash 'name name 'capability capability 'mode "callable"
+                            'spec spec 'start start 'complete complete)))))
+
+(define (configure-tool! name config)
+  (set! tool-config-registry
+        (append tool-config-registry (list (hash 'name name 'config config)))))
+
+(define (select-tool! capability preferences)
+  (set! tool-selection-registry
+        (append tool-selection-registry
+                (list (hash 'name capability 'preferences preferences)))))
 
 (define (register-prompt-builder! name builder)
   (set! prompt-builder-registry
@@ -95,6 +119,120 @@ const PLUGIN_PRELUDE: &str = r#"
 (define (model-provider id)
   (find-named provider-registry (hash-ref (model-spec id) 'provider)))
 
+(define (string-member? value values)
+  (cond [(null? values) #f]
+        [(equal? value (car values)) #t]
+        [else (string-member? value (cdr values))]))
+
+(define (tool-config name)
+  (define (find entries)
+    (cond [(null? entries) (hash)]
+          [(equal? name (hash-ref (car entries) 'name))
+           (hash-ref (car entries) 'config)]
+          [else (find (cdr entries))]))
+  (find tool-config-registry))
+
+(define (tool-compatible? implementation model)
+  (define spec (model-spec model))
+  (cond
+    [(equal? (hash-ref implementation 'mode) "hosted")
+     (and (equal? (hash-ref implementation 'provider)
+                  (hash-ref spec 'provider))
+          (string-member?
+            (hash-ref implementation 'name)
+            (or (hash-try-get spec 'hosted_tools) '())))]
+    [(equal? (hash-ref implementation 'mode) "callable")
+     (or (hash-try-get spec 'function_tools) #f)]
+    [else #f]))
+
+(define (find-compatible-hosted capability model implementations)
+  (cond
+    [(null? implementations) #f]
+    [(and (equal? capability (hash-ref (car implementations) 'capability))
+          (equal? (hash-ref (car implementations) 'mode) "hosted")
+          (tool-compatible? (car implementations) model))
+     (car implementations)]
+    [else (find-compatible-hosted capability model (cdr implementations))]))
+
+(define (resolve-tool-preference capability model preference)
+  (define preferred (hash-try-get preference 'prefer))
+  (define selected (hash-try-get preference 'use))
+  (cond
+    [(and preferred (equal? preferred "same-route-hosted"))
+     (find-compatible-hosted capability model tool-implementation-registry)]
+    [selected
+     (define implementation
+       (find-named tool-implementation-registry selected))
+     (if (and (equal? capability (hash-ref implementation 'capability))
+              (tool-compatible? implementation model))
+         implementation
+         #f)]
+    [else (error! "invalid tool preference")]))
+
+(define (resolve-tool-selection selection model)
+  (define capability (hash-ref selection 'name))
+  (define (resolve preferences)
+    (cond
+      [(null? preferences) #f]
+      [else
+       (define implementation
+         (resolve-tool-preference capability model (car preferences)))
+       (if implementation implementation (resolve (cdr preferences)))]))
+  (resolve (hash-ref selection 'preferences)))
+
+(define (resolved-tool-implementations model)
+  (define (resolve selections)
+    (cond
+      [(null? selections) '()]
+      [else
+       (define implementation (resolve-tool-selection (car selections) model))
+       (if implementation
+           (cons implementation (resolve (cdr selections)))
+           (resolve (cdr selections)))]))
+  (resolve tool-selection-registry))
+
+(define (resolved-tool-names model)
+  (map (lambda (implementation) (hash-ref implementation 'name))
+       (resolved-tool-implementations model)))
+
+(define (resolved-tool-routes model)
+  (map (lambda (implementation)
+         (hash 'capability (hash-ref implementation 'capability)
+               'implementation (hash-ref implementation 'name)))
+       (resolved-tool-implementations model)))
+
+(define (resolved-tool-spec implementation)
+  (if (equal? (hash-ref implementation 'mode) "hosted")
+      (hash 'kind "hosted_tool"
+            'provider (hash-ref implementation 'provider)
+            'implementation (hash-ref implementation 'name)
+            'wire ((hash-ref implementation 'build)
+                   (tool-config (hash-ref implementation 'name))))
+      (hash-ref implementation 'spec)))
+
+(define (tools-for-model model)
+  (append tool-registry
+          (map resolved-tool-spec (resolved-tool-implementations model))))
+
+(define (callable-tool-for model name)
+  (define (find implementations)
+    (cond
+      [(null? implementations) #f]
+      [(and (equal? (hash-ref (car implementations) 'mode) "callable")
+            (equal? (hash-ref (hash-ref (car implementations) 'spec) 'name)
+                    name))
+       (car implementations)]
+      [else (find (cdr implementations))]))
+  (find (resolved-tool-implementations model)))
+
+(define (start-callable-tool implementation arguments)
+  ((hash-ref implementation 'start)
+   arguments (tool-config (hash-ref implementation 'name))))
+
+(define (complete-callable-tool implementation events)
+  ((hash-ref implementation 'complete)
+   events (tool-config (hash-ref implementation 'name))))
+
 (define (provider-request prompt model reasoning service-tier)
   ((hash-ref (model-provider model) 'effect)
    prompt (hash-ref (model-spec model) 'model) reasoning service-tier))
@@ -127,11 +265,25 @@ const PLUGIN_PRELUDE: &str = r#"
   ((hash-ref (find-named compactor-registry selected-compactor) 'complete)
    messages max-chars events selected-compactor-config))
 
+(define (validate-tool-preference preference)
+  (define preferred (hash-try-get preference 'prefer))
+  (define selected (hash-try-get preference 'use))
+  (cond
+    [(and preferred (equal? preferred "same-route-hosted")) #t]
+    [selected (find-named tool-implementation-registry selected) #t]
+    [else (error! "invalid tool preference")]))
+
 (define (validate-composition!)
   (if (equal? selected-prompt-builder "") (error! "no prompt builder selected"))
   (if (equal? selected-compactor "") (error! "no compactor selected"))
   (find-named prompt-builder-registry selected-prompt-builder)
   (find-named compactor-registry selected-compactor)
+  (map (lambda (entry)
+         (find-named tool-implementation-registry (hash-ref entry 'name)))
+       tool-config-registry)
+  (map (lambda (selection)
+         (map validate-tool-preference (hash-ref selection 'preferences)))
+       tool-selection-registry)
   #t)
 
 (define (dispatch-command name state arguments)
@@ -219,6 +371,28 @@ impl Policy {
         serde_json::from_str(&encoded).context("decode provider models")
     }
 
+    pub fn resolved_tools(&mut self, model: &str) -> Result<Vec<String>> {
+        let encoded = eval_string(
+            &mut self.vm,
+            &format!(
+                "(value->jsexpr-string (resolved-tool-names {}))",
+                scheme_string(model)
+            ),
+        )?;
+        serde_json::from_str(&encoded).context("decode resolved tools")
+    }
+
+    pub fn resolved_tool_routes(&mut self, model: &str) -> Result<Vec<ToolRoute>> {
+        let encoded = eval_string(
+            &mut self.vm,
+            &format!(
+                "(value->jsexpr-string (resolved-tool-routes {}))",
+                scheme_string(model)
+            ),
+        )?;
+        serde_json::from_str(&encoded).context("decode resolved tool routes")
+    }
+
     pub fn run_command(&mut self, name: &str, arguments: &str) -> Result<String> {
         let expression = format!(
             "(value->jsexpr-string (dispatch-command {} (string->jsexpr {}) {}))",
@@ -243,6 +417,8 @@ pub fn composition_plugins(main: &Path) -> Result<Vec<String>> {
               (set! discovered-plugins (append discovered-plugins (list name))))
             (define (select-prompt-builder! _) #t)
             (define (select-compactor! _ __) #t)
+            (define (configure-tool! _ __) #t)
+            (define (select-tool! _ __) #t)
             {}
         "#,
         fs::read_to_string(main)?
@@ -268,6 +444,12 @@ pub fn check_plugin(entrypoint: &Path) -> Result<()> {
 struct PluginCommandOutput {
     state: serde_json::Value,
     content: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ToolRoute {
+    pub capability: String,
+    pub implementation: String,
 }
 
 fn eval_string(vm: &mut Engine, expression: &str) -> Result<String> {
@@ -311,7 +493,11 @@ mod tests {
 
     fn plugins(root: &Path) -> Vec<PathBuf> {
         vec![
+            root.join("policy/providers/responses.scm"),
             root.join("policy/providers/openai.scm"),
+            root.join("policy/providers/openrouter.scm"),
+            root.join("policy/tools/openai-web-search.scm"),
+            root.join("policy/tools/openrouter-web-search.scm"),
             root.join("policy/prompts/simple.scm"),
             root.join("policy/compaction/simple.scm"),
         ]
@@ -342,6 +528,8 @@ mod tests {
                     && body["model"] == "gpt-5.6-luna"
                     && body["reasoning"]["effort"] == "low"
                     && body["prompt_cache_key"] == ""
+                    && body["tools"].as_array().unwrap().iter()
+                        .any(|tool| tool["type"] == "web_search")
                     && body.get("service_tier").is_none()
         ));
 
@@ -455,7 +643,11 @@ mod tests {
         )
         .unwrap();
         let custom = vec![
+            root.join("policy/providers/responses.scm"),
             root.join("policy/providers/openai.scm"),
+            root.join("policy/providers/openrouter.scm"),
+            root.join("policy/tools/openai-web-search.scm"),
+            root.join("policy/tools/openrouter-web-search.scm"),
             prompt,
             root.join("policy/compaction/simple.scm"),
         ];
@@ -668,6 +860,133 @@ mod tests {
     }
 
     #[test]
+    fn search_routing_prefers_the_selected_provider() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let temp = tempfile::tempdir().unwrap();
+        let fallback = temp.path().join("fallback.scm");
+        fs::write(
+            &fallback,
+            r#"(register-model!
+                 "other"
+                 (hash 'id "model" 'label "model" 'description ""
+                       'function_tools #t 'hosted_tools '()
+                       'reasoning '() 'default_reasoning ""
+                       'service_tiers '() 'default_service_tier ""))"#,
+        )
+        .unwrap();
+        let mut sources = plugins(&root);
+        sources.push(fallback);
+        let mut policy = Policy::load(
+            &root.join("policy/agent.scm"),
+            &sources,
+            &root.join("main.scm"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.resolved_tools("openai/gpt-5.6-sol").unwrap(),
+            vec!["openai/hosted-web-search"]
+        );
+        assert_eq!(
+            policy.resolved_tools("openrouter/x-ai/grok-4.5").unwrap(),
+            vec!["openrouter/hosted-web-search"]
+        );
+        assert_eq!(
+            policy.resolved_tools("other/model").unwrap(),
+            vec!["openai/callable-web-search"]
+        );
+    }
+
+    #[test]
+    fn callable_search_runs_as_a_hidden_subrequest() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let temp = tempfile::tempdir().unwrap();
+        let fallback = temp.path().join("fallback.scm");
+        fs::write(
+            &fallback,
+            r#"(register-provider!
+                 "other" provider-effect responses-call responses-arguments
+                 responses-output responses-usage
+                 (lambda (events) (responses-preserved-items "openai" events))
+                 responses-message-phase)
+               (register-model!
+                 "other"
+                 (hash 'id "gpt-5.6-luna" 'label "other" 'description ""
+                       'function_tools #t 'hosted_tools '()
+                       'reasoning (list (hash 'id "low" 'description ""))
+                       'default_reasoning "low"
+                       'service_tiers
+                         (list (hash 'id "default" 'description ""))
+                       'default_service_tier "default"))"#,
+        )
+        .unwrap();
+        let mut sources = plugins(&root);
+        sources.push(fallback);
+        let mut policy = Policy::load(
+            &root.join("policy/agent.scm"),
+            &sources,
+            &root.join("main.scm"),
+        )
+        .unwrap();
+        policy
+            .on_event(&Event::ModelSelected {
+                model: "other/gpt-5.6-luna".into(),
+                reasoning: "low".into(),
+                service_tier: "default".into(),
+            })
+            .unwrap();
+        policy
+            .on_event(&Event::UserMessage {
+                content: "search".into(),
+            })
+            .unwrap();
+
+        let output = policy
+            .on_event(&Event::HttpCompleted {
+                success: true,
+                status: 200,
+                events: vec![serde_json::json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "search-1",
+                        "name": "web_search",
+                        "arguments": "{\"query\":\"current Rust release\"}"
+                    }
+                })],
+                error: String::new(),
+            })
+            .unwrap();
+        assert!(matches!(
+            &output.effects[0],
+            Effect::HttpRequest { body, .. }
+                if body["model"] == "gpt-5.6-luna"
+                    && body["tools"][0]["type"] == "web_search"
+        ));
+        let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
+        assert_eq!(state["activity"], "searching");
+
+        let output = policy
+            .on_event(&Event::HttpCompleted {
+                success: true,
+                status: 200,
+                events: vec![serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "delta": "Rust 1.97.0 (https://rust-lang.org)"
+                })],
+                error: String::new(),
+            })
+            .unwrap();
+        assert!(matches!(
+            &output.effects[0],
+            Effect::HttpRequest { body, .. }
+                if body["input"].as_array().unwrap().iter().any(|item|
+                    item["type"] == "function_call_output"
+                        && item["output"].as_str().unwrap().contains("Rust 1.97.0"))
+        ));
+    }
+
+    #[test]
     fn plugin_can_register_and_run_command() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let temp = tempfile::tempdir().unwrap();
@@ -686,7 +1005,11 @@ mod tests {
         )
         .unwrap();
         let custom = vec![
+            root.join("policy/providers/responses.scm"),
             provider,
+            root.join("policy/providers/openrouter.scm"),
+            root.join("policy/tools/openai-web-search.scm"),
+            root.join("policy/tools/openrouter-web-search.scm"),
             root.join("policy/prompts/simple.scm"),
             root.join("policy/compaction/simple.scm"),
         ];

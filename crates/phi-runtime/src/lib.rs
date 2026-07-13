@@ -42,6 +42,10 @@ pub enum RuntimeEvent {
     ActivityChanged {
         activity: String,
     },
+    ToolRouteSelected {
+        capability: String,
+        implementation: String,
+    },
     ModelDelta {
         content: String,
     },
@@ -121,7 +125,11 @@ struct ModelSelection {
 const DEFAULT_CONFIG: &str = r#"{
   "allowed_programs": ["cargo", "find", "git", "ls", "pwd", "rg", "sed"],
   "context_char_budget": 24000,
-  "allowed_http_origins": ["https://auth.openai.com", "https://chatgpt.com"],
+  "allowed_http_origins": [
+    "https://auth.openai.com",
+    "https://chatgpt.com",
+    "https://openrouter.ai"
+  ],
   "secrets": {
     "openai_chatgpt": {
       "path": "~/.codex/auth.json",
@@ -132,13 +140,22 @@ const DEFAULT_CONFIG: &str = r#"{
         "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
         "refresh_pointer": "/tokens/refresh_token"
       }
+    },
+    "openrouter": {
+      "path": "~/.phi/secrets/openrouter.json",
+      "bearer_pointer": "/api_key"
     }
   }
 }"#;
 
 const DEFAULT_MAIN: &str = include_str!("../../../main.scm");
 const DEFAULT_AGENT: &str = include_str!("../../../policy/agent.scm");
+const RESPONSES_PLUGIN: &str = include_str!("../../../policy/providers/responses.scm");
 const OPENAI_PLUGIN: &str = include_str!("../../../policy/providers/openai.scm");
+const OPENROUTER_PLUGIN: &str = include_str!("../../../policy/providers/openrouter.scm");
+const OPENAI_WEB_SEARCH_PLUGIN: &str = include_str!("../../../policy/tools/openai-web-search.scm");
+const OPENROUTER_WEB_SEARCH_PLUGIN: &str =
+    include_str!("../../../policy/tools/openrouter-web-search.scm");
 const PROMPT_PLUGIN: &str = include_str!("../../../policy/prompts/simple.scm");
 const COMPACTION_PLUGIN: &str = include_str!("../../../policy/compaction/simple.scm");
 
@@ -167,7 +184,15 @@ pub fn initialize_at(home: &phi_core::home::PhiHome) -> Result<()> {
     write_if_missing(&home.plugin_lock(), "{\n  \"plugins\": []\n}\n")?;
     let builtins = home.builtins();
     write_bundled(&builtins.join("agent.scm"), DEFAULT_AGENT)?;
+    write_builtin(&builtins, "responses", RESPONSES_PLUGIN)?;
     write_builtin(&builtins, "openai", OPENAI_PLUGIN)?;
+    write_builtin(&builtins, "openrouter", OPENROUTER_PLUGIN)?;
+    write_builtin(&builtins, "openai-web-search", OPENAI_WEB_SEARCH_PLUGIN)?;
+    write_builtin(
+        &builtins,
+        "openrouter-web-search",
+        OPENROUTER_WEB_SEARCH_PLUGIN,
+    )?;
     write_builtin(&builtins, "simple-prompt", PROMPT_PLUGIN)?;
     write_builtin(&builtins, "simple-compaction", COMPACTION_PLUGIN)?;
     Ok(())
@@ -686,6 +711,16 @@ async fn run(
         ),
         saved_state,
     )?;
+    let selected_model = state_string(policy.state(), "model")?;
+    for route in policy.resolved_tool_routes(&selected_model)? {
+        send(
+            events,
+            RuntimeEvent::ToolRouteSelected {
+                capability: route.capability,
+                implementation: route.implementation,
+            },
+        )?;
+    }
     let mut event = Event::UserMessage { content: prompt };
     let mut activity = "ready".to_owned();
     let permissions = phi_core::permissions::Permissions {
@@ -712,7 +747,7 @@ async fn run(
             )?;
             activity = next_activity;
         }
-        let stream_output = activity != "compacting";
+        let stream_output = activity == "working";
         let effect = output
             .effects
             .into_iter()
@@ -874,10 +909,14 @@ fn number_u64(value: &serde_json::Value) -> Option<u64> {
 }
 
 fn state_activity(state: &str) -> Result<String> {
+    state_string(state, "activity")
+}
+
+fn state_string(state: &str, key: &str) -> Result<String> {
     let state: serde_json::Value = serde_json::from_str(state)?;
-    Ok(state["activity"]
+    Ok(state[key]
         .as_str()
-        .context("state has no activity")?
+        .with_context(|| format!("state has no {key}"))?
         .into())
 }
 
@@ -1012,8 +1051,10 @@ mod tests {
                     && body["service_tier"] == "priority"
                     && body["prompt_cache_key"] == execution.session_id
                     && headers["session_id"] == execution.session_id
-                    && body["tools"].as_array().unwrap().len() == 4
+                    && body["tools"].as_array().unwrap().len() == 5
                     && body["tools"][0]["name"] == "read_file"
+                    && body["tools"].as_array().unwrap().iter()
+                        .any(|tool| tool["type"] == "web_search")
                     && body["instructions"]
                         .as_str().unwrap().contains("Answer ordinary requests")
         ));

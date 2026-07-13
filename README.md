@@ -42,11 +42,29 @@ Phi keeps behavior in Scheme and data in JSON:
 `main.scm` is the composition root:
 
 ```scheme
+(load-plugin! "responses")
 (load-plugin! "openai")
+(load-plugin! "openrouter")
+(load-plugin! "openai-web-search")
+(load-plugin! "openrouter-web-search")
 (load-plugin! "simple-prompt")
 (load-plugin! "simple-compaction")
 
 (select-prompt-builder! "simple")
+(configure-tool! "openai/hosted-web-search" (hash))
+(configure-tool!
+  "openai/callable-web-search"
+  (hash 'model "openai/gpt-5.6-luna"
+        'reasoning "low"
+        'service_tier "default"
+        'search (hash)))
+(configure-tool!
+  "openrouter/hosted-web-search"
+  (hash 'engine "native"))
+(select-tool!
+  "web_search"
+  (list (hash 'prefer "same-route-hosted")
+        (hash 'use "openai/callable-web-search")))
 (select-compactor!
   "simple"
   (hash 'model "openai/gpt-5.6-luna"
@@ -55,6 +73,8 @@ Phi keeps behavior in Scheme and data in JSON:
 ```
 
 There is no default provider. Providers register qualified model identities such as `openai/gpt-5.6-luna`; the selected model determines the provider. Use `/model` in the TUI to pick the model, reasoning, and provider-supported service tier.
+
+Tool implementations declare model compatibility. The configuration above prefers search hosted by the selected model's provider route, then explicitly falls back to a separate OpenAI search request. Put an OpenRouter key in `~/.phi/secrets/openrouter.json` as `{"api_key":"..."}` before selecting an `openrouter/...` model.
 
 ## Plugins
 
