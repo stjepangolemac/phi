@@ -19,6 +19,7 @@ const PLUGIN_PRELUDE: &str = r#"
 (define command-registry '())
 (define model-registry '())
 (define tool-registry '())
+(define plugin-tool-registry '())
 (define tool-implementation-registry '())
 (define tool-selection-registry '())
 (define tool-config-registry '())
@@ -30,9 +31,11 @@ const PLUGIN_PRELUDE: &str = r#"
 (define selected-compactor-config (hash))
 (define agent-instructions "")
 (define session-id "")
+(define runtime-config (hash))
 
 (define (configure-runtime! encoded-config)
   (define config (string->jsexpr encoded-config))
+  (set! runtime-config config)
   (set! tool-registry (or (hash-try-get config 'tools) '()))
   (set! session-id (or (hash-try-get config 'session_id) "")))
 
@@ -42,6 +45,9 @@ const PLUGIN_PRELUDE: &str = r#"
 (define (register-command! spec handler)
   (set! command-registry
         (append command-registry (list (hash 'spec spec 'handler handler)))))
+
+(define (register-tool! builder)
+  (set! plugin-tool-registry (append plugin-tool-registry (list builder))))
 
 (define (register-provider! name effect call arguments output usage preserved phase)
   (set! provider-registry
@@ -101,7 +107,19 @@ const PLUGIN_PRELUDE: &str = r#"
   (map (lambda (entry) (hash-ref entry 'spec)) command-registry))
 
 (define (registered-models) model-registry)
-(define (registered-tools) tool-registry)
+(define (runtime-config-value name fallback)
+  (or (hash-try-get runtime-config name) fallback))
+
+(define (built-plugin-tools builders)
+  (cond [(null? builders) '()]
+        [else
+         (define tool ((car builders)))
+         (if tool
+             (cons tool (built-plugin-tools (cdr builders)))
+             (built-plugin-tools (cdr builders)))]))
+
+(define (registered-tools)
+  (append tool-registry (built-plugin-tools plugin-tool-registry)))
 (define (runtime-session-id) session-id)
 
 (define (find-named entries name)
@@ -211,7 +229,7 @@ const PLUGIN_PRELUDE: &str = r#"
       (hash-ref implementation 'spec)))
 
 (define (tools-for-model model)
-  (append tool-registry
+  (append (registered-tools)
           (map resolved-tool-spec (resolved-tool-implementations model))))
 
 (define (callable-tool-for model name)
@@ -514,6 +532,7 @@ mod tests {
             root.join("policy/providers/openrouter.scm"),
             root.join("policy/tools/openai-web-search.scm"),
             root.join("policy/tools/openrouter-web-search.scm"),
+            root.join("policy/tools/skills.scm"),
             root.join("policy/prompts/simple.scm"),
             root.join("policy/compaction/simple.scm"),
         ]
@@ -934,6 +953,41 @@ mod tests {
         assert_eq!(state["model"], "openai/gpt-5.6-luna");
         assert_eq!(state["reasoning"], "low");
         assert_eq!(state["service_tier"], "default");
+    }
+
+    #[test]
+    fn skills_plugin_exposes_only_discovered_skills() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let config = serde_json::json!({
+            "model": "openai/gpt-5.6-luna",
+            "reasoning": "low",
+            "service_tier": "default",
+            "skills": [{ "name": "review", "description": "Review code." }]
+        });
+        let mut policy = Policy::load_with_state(
+            &root.join("policy/agent.scm"),
+            &plugins(&root),
+            &root.join("main.scm"),
+            &config.to_string(),
+            None,
+        )
+        .unwrap();
+        let output = policy
+            .on_event(&Event::UserMessage {
+                content: "$review this".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            &output.effects[0],
+            Effect::HttpRequest { body, .. }
+                if body["tools"].as_array().unwrap().iter().any(|tool|
+                    tool["name"] == "load_skill"
+                        && tool["description"].as_str().unwrap().contains("review"))
+        ));
+        assert_eq!(
+            policy.run_command("skills", "").unwrap(),
+            "- review: Review code."
+        );
     }
 
     #[test]

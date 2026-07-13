@@ -577,6 +577,10 @@ impl App {
                     match name.as_str() {
                         "shell" => format!("Ran `{}`", display_command(&arguments)),
                         "web_search" => "Searching the web".into(),
+                        "load_skill" => format!(
+                            "Loading skill `{}`",
+                            arguments["name"].as_str().unwrap_or("unknown")
+                        ),
                         _ => format!("Ran `{name}`"),
                     },
                 ));
@@ -616,6 +620,16 @@ impl App {
                             content.push_str(&format!("\n\n{sources} sources"));
                         }
                         self.status = "working".into();
+                    } else if name == "load_skill" {
+                        if let Some(error) = result["error"].as_str() {
+                            *content = format!("Failed to load skill\n\n{error}");
+                        } else {
+                            *content = format!(
+                                "Loaded skill `{}` · {}",
+                                result["name"].as_str().unwrap_or("unknown"),
+                                human_duration(elapsed)
+                            );
+                        }
                     } else {
                         let result = tool_result(&result);
                         if !result.is_empty() {
@@ -1740,6 +1754,26 @@ mod tests {
 
         assert_eq!(app.status, "working");
         assert_eq!(app.transcript[0].1, "Searched the web · 3s\n\n2 sources");
+    }
+
+    #[test]
+    fn shows_skill_loading_without_echoing_instructions() {
+        let mut app = app();
+        app.on_runtime(RuntimeEvent::ToolStarted {
+            name: "load_skill".into(),
+            arguments: serde_json::json!({ "name": "review", "path": "SKILL.md" }),
+        });
+        assert_eq!(app.transcript[0].1, "Loading skill `review`");
+        app.on_runtime(RuntimeEvent::ToolCompleted {
+            name: "load_skill".into(),
+            result: serde_json::json!({
+                "name": "review",
+                "path": "SKILL.md",
+                "content": "secret instructions"
+            }),
+        });
+        assert_eq!(app.transcript[0].1, "Loaded skill `review` · 0s");
+        assert!(!app.transcript[0].1.contains("secret instructions"));
     }
 
     #[test]

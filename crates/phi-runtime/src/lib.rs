@@ -154,6 +154,7 @@ const OPENROUTER_PLUGIN: &str = include_str!("../../../policy/providers/openrout
 const OPENAI_WEB_SEARCH_PLUGIN: &str = include_str!("../../../policy/tools/openai-web-search.scm");
 const OPENROUTER_WEB_SEARCH_PLUGIN: &str =
     include_str!("../../../policy/tools/openrouter-web-search.scm");
+const SKILLS_PLUGIN: &str = include_str!("../../../policy/tools/skills.scm");
 const PROMPT_PLUGIN: &str = include_str!("../../../policy/prompts/simple.scm");
 const COMPACTION_PLUGIN: &str = include_str!("../../../policy/compaction/simple.scm");
 
@@ -165,6 +166,7 @@ pub fn initialize_home() -> Result<phi_core::home::PhiHome> {
 
 pub fn initialize_at(home: &phi_core::home::PhiHome) -> Result<()> {
     std::fs::create_dir_all(&home.root)?;
+    std::fs::create_dir_all(home.skills())?;
     write_if_missing(&home.config(), DEFAULT_CONFIG)?;
     write_if_missing(&home.main(), DEFAULT_MAIN)?;
     write_if_missing(
@@ -191,6 +193,7 @@ pub fn initialize_at(home: &phi_core::home::PhiHome) -> Result<()> {
         "openrouter-web-search",
         OPENROUTER_WEB_SEARCH_PLUGIN,
     )?;
+    write_builtin(&builtins, "skills", SKILLS_PLUGIN)?;
     write_builtin(&builtins, "simple-prompt", PROMPT_PLUGIN)?;
     write_builtin(&builtins, "simple-compaction", COMPACTION_PLUGIN)?;
     Ok(())
@@ -315,7 +318,7 @@ fn save_user_state(home: &phi_core::home::PhiHome, state: &UserState) -> Result<
 
 pub fn command_catalog(options: &RunOptions) -> Result<CommandCatalog> {
     let workspace = options.workspace.canonicalize()?;
-    let config = load_config(&options.config_path)?;
+    let _config = load_config(&options.config_path)?;
     let home = home_for_config(&options.config_path)?;
     let (sources, state) = match &options.session_id {
         Some(id) => {
@@ -327,16 +330,17 @@ pub fn command_catalog(options: &RunOptions) -> Result<CommandCatalog> {
         }
         None => (resolve_sources(&home, &workspace)?, None),
     };
-    let capabilities = capabilities(&sources);
+    let capabilities = capabilities(&sources, &home);
+    let skills = phi_core::skill::discover(&home.skills(), &workspace)?;
     let mut policy = phi_steel::Policy::load_with_state(
         &sources.policy,
         &entrypoints(&sources),
         &sources.main,
         &policy_config(
-            &config,
             &capabilities,
             options.session_id.as_deref().unwrap_or("catalog"),
             &load_user_state(&home)?,
+            &skills,
         ),
         state,
     )?;
@@ -348,7 +352,7 @@ pub fn execute_command(
     invocation: &CommandInvocation,
 ) -> Result<CommandExecution> {
     let workspace = options.workspace.canonicalize()?;
-    let config = load_config(&options.config_path)?;
+    let _config = load_config(&options.config_path)?;
     let home = home_for_config(&options.config_path)?;
     let sessions = workspace.join(".phi/sessions");
     let (session, sources, saved_state) = match &options.session_id {
@@ -374,16 +378,17 @@ pub fn execute_command(
             (session, sources, None)
         }
     };
-    let capabilities = capabilities(&sources);
+    let capabilities = capabilities(&sources, &home);
+    let skills = phi_core::skill::discover(&home.skills(), &workspace)?;
     let mut policy = phi_steel::Policy::load_with_state(
         &sources.policy,
         &entrypoints(&sources),
         &sources.main,
         &policy_config(
-            &config,
             &capabilities,
             session.id(),
             &load_user_state(&home)?,
+            &skills,
         ),
         saved_state,
     )?;
@@ -598,16 +603,17 @@ fn model_command(
 }
 
 fn policy_config(
-    _config: &Config,
     capabilities: &phi_core::capability::Registry,
     session_id: &str,
     user_state: &UserState,
+    skills: &[phi_core::skill::SkillSpec],
 ) -> String {
     let mut tools = capabilities.specs();
     tools.push(phi_core::capability::shell_spec());
     tools.sort_by(|left, right| left.name.cmp(&right.name));
     let mut value = serde_json::json!({
         "session_id": session_id,
+        "skills": skills,
         "tools": tools,
     });
     if let Some(model) = &user_state.model {
@@ -618,10 +624,16 @@ fn policy_config(
     value.to_string()
 }
 
-fn capabilities(sources: &phi_core::session::ComposedSources) -> phi_core::capability::Registry {
+fn capabilities(
+    sources: &phi_core::session::ComposedSources,
+    home: &phi_core::home::PhiHome,
+) -> phi_core::capability::Registry {
     let mut capabilities = phi_core::capability::Registry::default();
     capabilities.register(phi_core::capability::ReadFile);
     capabilities.register(phi_core::capability::ReplaceFile);
+    capabilities.register_hidden(phi_core::skill::LoadSkill {
+        personal_root: home.skills(),
+    });
     capabilities.register(phi_eval::SubmitPolicyCandidate {
         active_policy: sources.policy.clone(),
         main: sources.main.clone(),
@@ -683,7 +695,8 @@ async fn run(
             (session, sources, None)
         }
     };
-    let capabilities = capabilities(&sources);
+    let capabilities = capabilities(&sources, &home);
+    let skills = phi_core::skill::discover(&home.skills(), &workspace)?;
     send(
         events,
         RuntimeEvent::Session {
@@ -701,10 +714,10 @@ async fn run(
         &entrypoints(&sources),
         &sources.main,
         &policy_config(
-            &config,
             &capabilities,
             session.id(),
             &load_user_state(&home)?,
+            &skills,
         ),
         saved_state,
     )?;
@@ -1045,6 +1058,36 @@ mod tests {
     }
 
     #[test]
+    fn discovers_manually_copied_skills() {
+        let (_workspace, options) = options();
+        let home = home_for_config(&options.config_path).unwrap();
+        let skill = home.skills().join("review");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: review\ndescription: Review code.\n---\n\nBe precise.",
+        )
+        .unwrap();
+
+        let catalog = command_catalog(&options).unwrap();
+        assert!(
+            catalog
+                .commands
+                .iter()
+                .any(|command| command.name == "skills")
+        );
+        let execution = execute_command(
+            &options,
+            &CommandInvocation {
+                name: "skills".into(),
+                arguments: String::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(execution.content, "- review: Review code.");
+    }
+
+    #[test]
     fn provider_stream_rules_emit_generic_tool_events() {
         let rules: Vec<StreamRule> = serde_json::from_value(serde_json::json!([
             {
@@ -1125,15 +1168,16 @@ mod tests {
             &execution.session_id,
         )
         .unwrap();
-        let config = load_config(&options.config_path).unwrap();
+        let home = home_for_config(&options.config_path).unwrap();
         let sources = session.composed_sources().unwrap().unwrap();
-        let capabilities = capabilities(&sources);
+        let capabilities = capabilities(&sources, &home);
+        let skills = phi_core::skill::discover(&home.skills(), &options.workspace).unwrap();
         let plugins = entrypoints(&sources);
         let mut policy = phi_steel::Policy::load_with_state(
             &sources.policy,
             &plugins,
             &sources.main,
-            &policy_config(&config, &capabilities, session.id(), &UserState::default()),
+            &policy_config(&capabilities, session.id(), &UserState::default(), &skills),
             Some(session.load_state().unwrap()),
         )
         .unwrap();

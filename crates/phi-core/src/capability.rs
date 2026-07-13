@@ -11,23 +11,47 @@ pub trait Tool {
 
 #[derive(Default)]
 pub struct Registry {
-    tools: BTreeMap<String, Box<dyn Tool>>,
+    tools: BTreeMap<String, RegisteredTool>,
+}
+
+struct RegisteredTool {
+    tool: Box<dyn Tool>,
+    exposed: bool,
 }
 
 impl Registry {
     pub fn register(&mut self, tool: impl Tool + 'static) {
-        self.tools.insert(tool.spec().name, Box::new(tool));
+        self.insert(tool, true);
+    }
+
+    pub fn register_hidden(&mut self, tool: impl Tool + 'static) {
+        self.insert(tool, false);
+    }
+
+    fn insert(&mut self, tool: impl Tool + 'static, exposed: bool) {
+        self.tools.insert(
+            tool.spec().name,
+            RegisteredTool {
+                tool: Box::new(tool),
+                exposed,
+            },
+        );
     }
 
     pub fn execute(&self, workspace: &Path, name: &str, arguments: Value) -> Result<Value> {
         self.tools
             .get(name)
             .with_context(|| format!("unknown tool: {name}"))?
+            .tool
             .execute(workspace, arguments)
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.tools.values().map(|tool| tool.spec()).collect()
+        self.tools
+            .values()
+            .filter(|entry| entry.exposed)
+            .map(|entry| entry.tool.spec())
+            .collect()
     }
 }
 

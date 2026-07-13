@@ -3,6 +3,7 @@
 (load-plugin! "openrouter")
 (load-plugin! "openai-web-search")
 (load-plugin! "openrouter-web-search")
+(load-plugin! "skills")
 (load-plugin! "simple-prompt")
 (load-plugin! "simple-compaction")
 

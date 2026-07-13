@@ -1,6 +1,6 @@
 # Phi
 
-Phi is a small, configurable agent harness. Rust owns trusted mechanisms such as HTTP, secrets, filesystem/process capabilities, sessions, and the terminal UI. Sandboxed [Steel](https://github.com/mattwparas/steel) code owns providers, prompts, compaction, commands, and the agent loop.
+Phi is a small, configurable agent harness. Rust owns trusted mechanisms such as HTTP, secrets, filesystem/process capabilities, sessions, and the terminal UI. Sandboxed [Steel](https://github.com/mattwparas/steel) code owns providers, prompts, skills, compaction, commands, and the agent loop.
 
 ## Install and run
 
@@ -32,10 +32,11 @@ Phi keeps behavior in Scheme and data in JSON:
 ```text
 ~/.phi/
   main.scm             # loads plugins and selects implementations
-  config.json          # permissions, network origins, secret handles, limits
+  config.json          # permissions, network origins, and secret handles
   state.json           # last selected model settings
   plugins.lock.json    # Git sources and exact commits
   plugins/             # immutable installed plugin revisions
+  skills/              # manually copied personal skills
   builtins/<version>/  # bundled fallback plugins and agent policy
 ```
 
@@ -47,6 +48,7 @@ Phi keeps behavior in Scheme and data in JSON:
 (load-plugin! "openrouter")
 (load-plugin! "openai-web-search")
 (load-plugin! "openrouter-web-search")
+(load-plugin! "skills")
 (load-plugin! "simple-prompt")
 (load-plugin! "simple-compaction")
 
@@ -75,6 +77,18 @@ Phi keeps behavior in Scheme and data in JSON:
 There is no default provider. Providers register qualified model identities such as `openai/gpt-5.6-luna`; the selected model determines the provider. Use `/model` in the TUI to pick the model, reasoning, and provider-supported service tier.
 
 Tool implementations declare model compatibility. The configuration above prefers search hosted by the selected model's provider route, then explicitly falls back to a separate OpenAI search request. Put an OpenRouter key in `~/.phi/secrets/openrouter.json` as `{"api_key":"..."}` before selecting an `openrouter/...` model.
+
+## Skills
+
+Copy standard `SKILL.md` directories into `~/.phi/skills/` for personal use or `.phi/skills/` for one workspace:
+
+```text
+~/.phi/skills/review/
+  SKILL.md
+  references/
+```
+
+Workspace skills override personal skills with the same frontmatter name. Phi initially exposes only names and descriptions; the bundled `skills` plugin loads `SKILL.md` or a referenced file when needed. Use `/skills` to list discovered skills or mention `$skill-name` to request one explicitly.
 
 ## Plugins
 

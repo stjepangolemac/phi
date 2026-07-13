@@ -6,3 +6,4 @@ pub mod plugin;
 pub mod policy_store;
 pub mod process;
 pub mod session;
+pub mod skill;
