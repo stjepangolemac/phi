@@ -428,12 +428,24 @@ impl App {
                     .find(|(role, _)| role == "tool")
                 {
                     if name == "web_search" {
+                        let action = &result["action"];
                         let sources = result
                             .pointer("/action/sources")
                             .and_then(serde_json::Value::as_array)
                             .map(Vec::len)
                             .unwrap_or_default();
-                        *content = format!("Searched the web · {}", human_duration(elapsed));
+                        let completed = match action["type"].as_str() {
+                            Some("open_page") => action["url"]
+                                .as_str()
+                                .map(url_host)
+                                .filter(|host| !host.is_empty())
+                                .map_or_else(
+                                    || "Opened a page".into(),
+                                    |host| format!("Opened {host}"),
+                                ),
+                            _ => "Searched the web".into(),
+                        };
+                        *content = format!("{completed} · {}", human_duration(elapsed));
                         if sources > 0 {
                             content.push_str(&format!("\n\n{sources} sources"));
                         }
@@ -942,6 +954,14 @@ fn compact_path(path: &std::path::Path) -> String {
     }
 }
 
+fn url_host(url: &str) -> &str {
+    url.split_once("://")
+        .map_or(url, |(_, remainder)| remainder)
+        .split('/')
+        .next()
+        .unwrap_or("")
+}
+
 fn picker_area(composer: Rect, height: u16) -> Rect {
     Rect {
         x: composer.x,
@@ -1399,11 +1419,33 @@ mod tests {
 
         app.on_runtime(RuntimeEvent::ToolCompleted {
             name: "web_search".into(),
-            result: serde_json::json!({ "action": { "sources": [{}, {}] } }),
+            result: serde_json::json!({
+                "action": { "type": "search", "sources": [{}, {}] }
+            }),
         });
 
         assert_eq!(app.status, "working");
         assert_eq!(app.transcript[0].1, "Searched the web · 3s\n\n2 sources");
+    }
+
+    #[test]
+    fn labels_opened_web_pages_separately() {
+        let mut app = app();
+        app.on_runtime(RuntimeEvent::ToolStarted {
+            name: "web_search".into(),
+            arguments: serde_json::json!({}),
+        });
+        app.on_runtime(RuntimeEvent::ToolCompleted {
+            name: "web_search".into(),
+            result: serde_json::json!({
+                "action": {
+                    "type": "open_page",
+                    "url": "https://rusecure.fifa.com/fifa-world-ranking/men"
+                }
+            }),
+        });
+
+        assert_eq!(app.transcript[0].1, "Opened rusecure.fifa.com · 0s");
     }
 
     #[test]
