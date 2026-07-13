@@ -38,6 +38,7 @@ pub enum RuntimeEvent {
     },
     ToolStarted {
         name: String,
+        arguments: serde_json::Value,
     },
     ToolCompleted {
         name: String,
@@ -192,7 +193,13 @@ async fn run(
                 .await??;
             }
             Effect::RunTool { name, arguments } => {
-                send(events, RuntimeEvent::ToolStarted { name: name.clone() })?;
+                send(
+                    events,
+                    RuntimeEvent::ToolStarted {
+                        name: name.clone(),
+                        arguments: arguments.clone(),
+                    },
+                )?;
                 let approved = match permissions.authorize_tool(&name) {
                     Ok(()) => true,
                     Err(_) if options.interactive_approvals => {

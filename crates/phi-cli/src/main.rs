@@ -175,7 +175,7 @@ async fn run_frontend(
                 print!("{content}");
                 std::io::stdout().flush()?;
             }
-            phi_runtime::RuntimeEvent::ToolStarted { name } => {
+            phi_runtime::RuntimeEvent::ToolStarted { name, .. } => {
                 eprintln!("running tool: {name}")
             }
             phi_runtime::RuntimeEvent::ToolCompleted { name, .. } => {

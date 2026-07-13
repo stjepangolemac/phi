@@ -1,4 +1,8 @@
-use std::{env, path::PathBuf};
+use std::{
+    env,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -54,6 +58,7 @@ struct App {
     estimated_tokens: Option<u64>,
     token_budget: Option<u64>,
     compactions: u64,
+    turn_started: Option<Instant>,
     scroll: u16,
     follow: bool,
     quit: bool,
@@ -73,6 +78,7 @@ impl App {
             estimated_tokens: None,
             token_budget: None,
             compactions: 0,
+            turn_started: None,
             scroll: 0,
             follow: true,
             quit: false,
@@ -87,6 +93,7 @@ impl App {
         self.transcript.push(("you".into(), prompt.clone()));
         self.options.session_id = self.session_id.clone();
         self.handle = Some(phi_runtime::start(self.options.clone(), prompt));
+        self.turn_started = Some(Instant::now());
         self.status = "working".into();
         self.follow = true;
     }
@@ -105,19 +112,29 @@ impl App {
                 self.compactions = compactions;
             }
             RuntimeEvent::ModelDelta { content } => self.current_model.push_str(&content),
-            RuntimeEvent::ToolStarted { name } => {
+            RuntimeEvent::ToolStarted { name, arguments } => {
                 self.flush_model();
-                self.transcript
-                    .push(("tool".into(), format!("{name} · running")));
+                self.transcript.push((
+                    "tool".into(),
+                    if name == "shell" {
+                        format!("Ran {}", display_command(&arguments))
+                    } else {
+                        format!("Ran {name}")
+                    },
+                ));
             }
-            RuntimeEvent::ToolCompleted { name, result } => {
-                if let Some((_, line)) = self
+            RuntimeEvent::ToolCompleted { result, .. } => {
+                if let Some((_, content)) = self
                     .transcript
                     .iter_mut()
                     .rev()
-                    .find(|(role, line)| role == "tool" && line.starts_with(&name))
+                    .find(|(role, _)| role == "tool")
                 {
-                    *line = format!("{name} · {}", compact_result(&result));
+                    let result = tool_result(&result);
+                    if !result.is_empty() {
+                        content.push('\n');
+                        content.push_str(&result);
+                    }
                 }
             }
             RuntimeEvent::ApprovalRequested { name } => self.approval = Some(name),
@@ -126,6 +143,14 @@ impl App {
                     self.current_model = content;
                 }
                 self.flush_model();
+                let elapsed = self
+                    .turn_started
+                    .take()
+                    .map_or(Duration::ZERO, |time| time.elapsed());
+                self.transcript.push((
+                    "turn_end".into(),
+                    format!("Worked for {}", human_duration(elapsed)),
+                ));
                 self.handle = None;
                 self.status = "ready".into();
             }
@@ -134,6 +159,7 @@ impl App {
                 self.transcript.push(("error".into(), message));
                 self.handle = None;
                 self.approval = None;
+                self.turn_started = None;
                 self.status = "ready".into();
             }
         }
@@ -343,24 +369,69 @@ fn transcript_text(app: &App, width: usize) -> Text<'static> {
 }
 
 fn push_message(lines: &mut Vec<Line<'static>>, role: &str, content: &str, width: usize) {
+    if role == "turn_end" {
+        lines.push(Line::raw(turn_divider(content, width)));
+        return;
+    }
+    if role == "tool" {
+        push_tool(lines, content, width);
+        return;
+    }
     let style = match role {
         "you" => Style::default().bg(Color::Rgb(38, 40, 45)),
         "error" => Style::default().fg(Color::Red),
-        "tool" => Style::default().fg(Color::Yellow),
         _ => Style::default(),
     };
     lines.push(Line::styled(" ".repeat(width), style));
-    let content_width = width.saturating_sub(4).max(1);
+    let content_width = width.saturating_sub(2).max(1);
+    let mut first = true;
     for content_line in content.split('\n') {
         for wrapped in wrap_line(content_line, content_width) {
             let used = UnicodeWidthStr::width(wrapped.as_str()).min(content_width);
+            let marker = if first { "• " } else { "  " };
             lines.push(Line::styled(
-                format!("  {wrapped}{}", " ".repeat(width.saturating_sub(2 + used))),
+                format!(
+                    "{marker}{wrapped}{}",
+                    " ".repeat(width.saturating_sub(2 + used))
+                ),
                 style,
             ));
+            first = false;
         }
     }
     lines.push(Line::styled(" ".repeat(width), style));
+}
+
+fn push_tool(lines: &mut Vec<Line<'static>>, content: &str, width: usize) {
+    let content_width = width.saturating_sub(2).max(1);
+    let wrapped = content
+        .split('\n')
+        .flat_map(|line| wrap_line(line, content_width))
+        .collect::<Vec<_>>();
+    for (index, content) in wrapped.iter().enumerate() {
+        let marker = if index + 1 == wrapped.len() {
+            '└'
+        } else {
+            '│'
+        };
+        lines.push(Line::styled(
+            format!("{marker} {content}"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+}
+
+fn turn_divider(label: &str, width: usize) -> String {
+    if width <= label.len() + 2 {
+        return label.chars().take(width).collect();
+    }
+    let remaining = width - label.len() - 2;
+    let left = remaining / 2;
+    format!(
+        "{} {label} {}",
+        "-".repeat(left),
+        "-".repeat(remaining - left)
+    )
 }
 
 fn wrap_line(line: &str, width: usize) -> Vec<String> {
@@ -383,14 +454,83 @@ fn wrap_line(line: &str, width: usize) -> Vec<String> {
     lines
 }
 
-fn compact_result(value: &serde_json::Value) -> String {
-    let text = value.to_string();
-    let mut characters = text.chars();
-    let compact: String = characters.by_ref().take(120).collect();
-    if characters.next().is_some() {
-        format!("{compact}…")
+fn display_command(arguments: &serde_json::Value) -> String {
+    let mut command = vec![
+        arguments
+            .get("program")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("shell")
+            .to_owned(),
+    ];
+    command.extend(
+        arguments
+            .get("args")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(quote_argument),
+    );
+    command.join(" ")
+}
+
+fn quote_argument(argument: &str) -> String {
+    if argument
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || "-_=./:".contains(character))
+    {
+        argument.into()
     } else {
-        compact
+        format!("{:?}", argument)
+    }
+}
+
+fn tool_result(result: &serde_json::Value) -> String {
+    if let Some(error) = result.get("error").and_then(serde_json::Value::as_str) {
+        return truncate_display(error, 2_000);
+    }
+    let mut output = String::new();
+    for field in ["stdout", "stderr"] {
+        if let Some(value) = result.get(field).and_then(serde_json::Value::as_str)
+            && !value.trim().is_empty()
+        {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str(value.trim_end());
+        }
+    }
+    if output.is_empty()
+        && let Some(code) = result.get("exit_code").and_then(serde_json::Value::as_i64)
+    {
+        output = format!("Exited with code {code}");
+    }
+    truncate_display(&output, 2_000)
+}
+
+fn truncate_display(value: &str, max_chars: usize) -> String {
+    let mut characters = value.chars();
+    let value: String = characters.by_ref().take(max_chars).collect();
+    if characters.next().is_some() {
+        format!("{value}\n… output truncated")
+    } else {
+        value
+    }
+}
+
+fn human_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds >= 3_600 {
+        format!(
+            "{}h {}m {}s",
+            seconds / 3_600,
+            seconds % 3_600 / 60,
+            seconds % 60
+        )
+    } else if seconds >= 60 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
     }
 }
 
@@ -428,9 +568,10 @@ mod tests {
         });
         app.on_runtime(RuntimeEvent::ToolStarted {
             name: "read_file".into(),
+            arguments: serde_json::json!({}),
         });
         assert_eq!(app.transcript[0], ("phi".into(), "hi".into()));
-        assert!(app.transcript[1].1.contains("running"));
+        assert_eq!(app.transcript[1].1, "Ran read_file");
     }
 
     #[test]
@@ -450,7 +591,7 @@ mod tests {
         app.current_model = "Question?\n\nAnswer.".into();
         let text = transcript_text(&app, 20);
         assert_eq!(text.lines.len(), 5);
-        assert_eq!(text.lines[1].to_string().trim(), "Question?");
+        assert_eq!(text.lines[1].to_string().trim(), "• Question?");
         assert_eq!(text.lines[2].to_string().trim(), "");
         assert_eq!(text.lines[3].to_string().trim(), "Answer.");
     }
@@ -461,7 +602,11 @@ mod tests {
         app.transcript.push(("you".into(), "hello".into()));
         let text = transcript_text(&app, 20);
         assert_eq!(text.lines.len(), 3);
-        assert!(text.lines.iter().all(|line| line.to_string().len() == 20));
+        assert!(
+            text.lines
+                .iter()
+                .all(|line| { UnicodeWidthStr::width(line.to_string().as_str()) == 20 })
+        );
         assert!(
             text.lines
                 .iter()
@@ -478,6 +623,28 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         assert_eq!(app.scroll, 0);
+    }
+
+    #[test]
+    fn formats_shell_command_and_output_as_a_tree() {
+        let command = display_command(&serde_json::json!({
+            "program": "rg",
+            "args": ["hello world", "src"]
+        }));
+        assert_eq!(command, "rg \"hello world\" src");
+        let mut lines = Vec::new();
+        push_tool(&mut lines, &format!("Ran {command}\nmatch"), 40);
+        assert!(lines[0].to_string().starts_with("│ Ran rg"));
+        assert_eq!(lines[1].to_string(), "└ match");
+    }
+
+    #[test]
+    fn formats_turn_duration_and_divider() {
+        assert_eq!(human_duration(Duration::from_secs(152)), "2m 32s");
+        let divider = turn_divider("Worked for 2m 32s", 40);
+        assert_eq!(divider.len(), 40);
+        assert!(divider.starts_with('-'));
+        assert!(divider.ends_with('-'));
     }
 
     #[tokio::test]
