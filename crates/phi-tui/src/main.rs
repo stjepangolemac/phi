@@ -1,11 +1,9 @@
 use std::{
-    env,
     path::PathBuf,
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
-use clap::Parser;
+use anyhow::Result;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use futures_util::{FutureExt, StreamExt, future::pending};
 use phi_runtime::{
@@ -15,23 +13,48 @@ use phi_runtime::{
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Clear, Padding, Paragraph, Wrap},
 };
+use tui_markdown::StyleSheet;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-#[derive(Parser)]
-struct Cli {
-    #[arg(long, default_value = ".")]
-    workspace: PathBuf,
-    #[arg(long)]
-    session: Option<String>,
-    #[arg(long)]
-    allow_shell: bool,
-    #[arg(long)]
-    allow_write: bool,
-    prompt: Option<String>,
+#[derive(Clone)]
+struct PhiMarkdown;
+
+impl tui_markdown::StyleSheet for PhiMarkdown {
+    fn heading(&self, _level: u8) -> Style {
+        Style::default()
+            .fg(Color::Rgb(225, 225, 220))
+            .add_modifier(Modifier::BOLD)
+    }
+
+    fn code(&self) -> Style {
+        Style::default()
+            .fg(Color::Rgb(200, 200, 195))
+            .bg(Color::Rgb(27, 28, 31))
+    }
+
+    fn link(&self) -> Style {
+        Style::default()
+            .fg(Color::LightBlue)
+            .add_modifier(Modifier::UNDERLINED)
+    }
+
+    fn blockquote(&self) -> Style {
+        Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::ITALIC)
+    }
+
+    fn heading_meta(&self) -> Style {
+        Style::default().fg(Color::DarkGray)
+    }
+
+    fn metadata_block(&self) -> Style {
+        Style::default().fg(Color::DarkGray)
+    }
 }
 
 #[derive(Default)]
@@ -91,6 +114,10 @@ struct App {
     output_tokens: Option<u64>,
     compactions: u64,
     turn_started: Option<Instant>,
+    compaction_started: Option<Instant>,
+    final_response_rendered: bool,
+    command_filter: Option<String>,
+    command_selected: usize,
     scroll: u16,
     follow: bool,
     quit: bool,
@@ -98,11 +125,22 @@ struct App {
 
 impl App {
     fn new(options: RunOptions, catalog: CommandCatalog) -> Self {
+        let transcript = if options.session_id.is_none() {
+            vec![(
+                "note".into(),
+                format!(
+                    "Ready in {}\n\nType / for commands.",
+                    compact_path(&options.workspace)
+                ),
+            )]
+        } else {
+            Vec::new()
+        };
         Self {
             session_id: options.session_id.clone(),
             options,
             catalog,
-            transcript: Vec::new(),
+            transcript,
             current_model: String::new(),
             composer: Composer::default(),
             handle: None,
@@ -118,6 +156,10 @@ impl App {
             output_tokens: None,
             compactions: 0,
             turn_started: None,
+            compaction_started: None,
+            final_response_rendered: false,
+            command_filter: None,
+            command_selected: 0,
             scroll: 0,
             follow: true,
             quit: false,
@@ -125,16 +167,20 @@ impl App {
     }
 
     fn submit(&mut self) {
-        let prompt = self.composer.take();
-        if prompt.trim().is_empty() || self.busy() {
+        if self.busy() {
             return;
         }
-        self.transcript.push(("you".into(), prompt.clone()));
+        self.command_filter = None;
+        self.command_selected = 0;
+        let prompt = self.composer.take();
+        if prompt.trim().is_empty() {
+            return;
+        }
         self.options.session_id = self.session_id.clone();
         if let Some(invocation) = CommandInvocation::parse(&prompt) {
             match invocation.name.as_str() {
                 "help" if invocation.arguments.is_empty() => {
-                    self.transcript.push(("phi".into(), self.help()));
+                    self.transcript.push(("note".into(), self.help()));
                 }
                 "model" if invocation.arguments.is_empty() => self.open_model_picker(),
                 _ => self.start_command(invocation),
@@ -142,14 +188,20 @@ impl App {
             self.follow = true;
             return;
         }
+        self.transcript.push(("you".into(), prompt.clone()));
         self.handle = Some(phi_runtime::start(self.options.clone(), prompt));
         self.turn_started = Some(Instant::now());
+        self.final_response_rendered = false;
         self.status = "working".into();
         self.follow = true;
     }
 
     fn busy(&self) -> bool {
         self.handle.is_some() || self.command_task.is_some() || self.picker.is_some()
+    }
+
+    fn composer_locked(&self) -> bool {
+        self.command_task.is_some() || self.picker.is_some()
     }
 
     fn help(&self) -> String {
@@ -175,12 +227,11 @@ impl App {
                 self.session_id = Some(execution.session_id);
                 self.options.session_id = self.session_id.clone();
                 self.catalog = execution.catalog;
-                self.transcript.push(("phi".into(), execution.content));
+                self.transcript.push(("note".into(), execution.content));
             }
             Err(error) => self.transcript.push(("error".into(), error.to_string())),
         }
         self.status = "ready".into();
-        self.follow = true;
     }
 
     fn open_model_picker(&mut self) {
@@ -215,7 +266,7 @@ impl App {
             }
             KeyCode::Esc => {
                 self.transcript
-                    .push(("phi".into(), "Model selection cancelled.".into()));
+                    .push(("note".into(), "Model selection cancelled.".into()));
                 self.follow = true;
                 return;
             }
@@ -307,6 +358,22 @@ impl App {
                 cache_write_tokens,
                 output_tokens,
             } => {
+                if compactions > self.compactions {
+                    let before = self.estimated_tokens.unwrap_or_default();
+                    let elapsed = self
+                        .compaction_started
+                        .take()
+                        .map_or(Duration::ZERO, |time| time.elapsed());
+                    self.transcript.push((
+                        "compaction_end".into(),
+                        format!(
+                            "Compacted in {} · context {} → {} tokens",
+                            human_duration(elapsed),
+                            before,
+                            estimated_tokens
+                        ),
+                    ));
+                }
                 self.estimated_tokens = Some(estimated_tokens);
                 self.token_budget = Some(token_budget);
                 self.input_tokens = input_tokens;
@@ -315,6 +382,16 @@ impl App {
                 self.output_tokens = output_tokens;
                 self.compactions = compactions;
             }
+            RuntimeEvent::ActivityChanged { activity } => match activity.as_str() {
+                "compacting" => {
+                    self.final_response_rendered = !self.current_model.is_empty();
+                    self.flush_model();
+                    self.compaction_started = Some(Instant::now());
+                    self.status = activity;
+                }
+                "working" => self.status = activity,
+                _ => {}
+            },
             RuntimeEvent::ModelDelta { content } => self.current_model.push_str(&content),
             RuntimeEvent::ToolStarted { name, arguments } => {
                 self.flush_model();
@@ -343,7 +420,10 @@ impl App {
             }
             RuntimeEvent::ApprovalRequested { name } => self.approval = Some(name),
             RuntimeEvent::Finished { content } => {
-                if self.current_model.is_empty() && !content.is_empty() {
+                if !self.final_response_rendered
+                    && self.current_model.is_empty()
+                    && !content.is_empty()
+                {
                     self.current_model = content;
                 }
                 self.flush_model();
@@ -356,6 +436,8 @@ impl App {
                     format!("Worked for {}", human_duration(elapsed)),
                 ));
                 self.handle = None;
+                self.compaction_started = None;
+                self.final_response_rendered = false;
                 self.status = "ready".into();
             }
             RuntimeEvent::Error { message } => {
@@ -364,10 +446,11 @@ impl App {
                 self.handle = None;
                 self.approval = None;
                 self.turn_started = None;
+                self.compaction_started = None;
+                self.final_response_rendered = false;
                 self.status = "ready".into();
             }
         }
-        self.follow = true;
     }
 
     fn flush_model(&mut self) {
@@ -378,7 +461,11 @@ impl App {
     }
 
     fn command_suggestions(&self) -> Vec<&phi_runtime::CommandSpec> {
-        let Some(prefix) = self.composer.text.strip_prefix('/') else {
+        let input = self
+            .command_filter
+            .as_deref()
+            .unwrap_or(&self.composer.text);
+        let Some(prefix) = input.strip_prefix('/') else {
             return Vec::new();
         };
         if prefix.chars().any(char::is_whitespace) {
@@ -390,6 +477,43 @@ impl App {
             .filter(|command| command.name.starts_with(prefix))
             .take(5)
             .collect()
+    }
+
+    fn navigate_commands(&mut self, down: bool) -> bool {
+        if self.busy() || self.command_suggestions().is_empty() {
+            return false;
+        }
+        if self.command_filter.is_none() {
+            self.command_filter = Some(self.composer.text.clone());
+        }
+        let count = self.command_suggestions().len();
+        self.command_selected = if down {
+            (self.command_selected + 1).min(count.saturating_sub(1))
+        } else {
+            self.command_selected.saturating_sub(1)
+        };
+        if let Some(name) = self
+            .command_suggestions()
+            .get(self.command_selected)
+            .map(|command| command.name.clone())
+        {
+            self.composer.text = format!("/{name}");
+        }
+        true
+    }
+
+    fn complete_command(&mut self) -> bool {
+        let Some(name) = self
+            .command_suggestions()
+            .get(self.command_selected)
+            .map(|command| command.name.clone())
+        else {
+            return false;
+        };
+        self.composer.text = format!("/{name} ");
+        self.command_filter = None;
+        self.command_selected = 0;
+        true
     }
 
     fn on_key(&mut self, key: KeyEvent) {
@@ -428,21 +552,27 @@ impl App {
                 }
                 self.status = "cancelling".into();
             }
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Enter
+                if key.modifiers.contains(KeyModifiers::CONTROL) && !self.composer_locked() =>
+            {
                 self.composer.text.push('\n');
             }
             KeyCode::Enter => self.submit(),
-            KeyCode::Tab if !self.busy() => {
-                if let Some(command) = self.command_suggestions().first() {
-                    self.composer.text = format!("/{} ", command.name);
-                }
+            KeyCode::Tab if !self.composer_locked() => {
+                self.complete_command();
             }
-            KeyCode::Backspace if !self.busy() => {
+            KeyCode::Backspace if !self.composer_locked() => {
+                self.command_filter = None;
+                self.command_selected = 0;
                 self.composer.text.pop();
             }
-            KeyCode::Char(character) if !self.busy() => {
+            KeyCode::Char(character) if !self.composer_locked() => {
+                self.command_filter = None;
+                self.command_selected = 0;
                 self.composer.text.push(character);
             }
+            KeyCode::Up if self.navigate_commands(false) => {}
+            KeyCode::Down if self.navigate_commands(true) => {}
             KeyCode::PageUp | KeyCode::Up => {
                 self.scroll = self.scroll.saturating_sub(1);
                 self.follow = false;
@@ -456,29 +586,10 @@ impl App {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tokio::task::LocalSet::new().run_until(run()).await
-}
-
-async fn run() -> Result<()> {
-    let cli = Cli::parse();
-    let workspace = cli
-        .workspace
-        .canonicalize()
-        .context("workspace does not exist")?;
-    let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../phi.json");
-    let options = RunOptions {
-        workspace,
-        config_path,
-        session_id: cli.session,
-        allow_shell: cli.allow_shell,
-        allow_write: cli.allow_write,
-        interactive_approvals: true,
-    };
+pub async fn launch(options: RunOptions, prompt: Option<String>) -> Result<()> {
     let catalog = phi_runtime::command_catalog(&options)?;
     let mut app = App::new(options, catalog);
-    if let Some(prompt) = cli.prompt {
+    if let Some(prompt) = prompt {
         app.composer.text = prompt;
         app.submit();
     }
@@ -491,9 +602,11 @@ async fn run() -> Result<()> {
 
 async fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
     let mut input = EventStream::new();
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
     while !app.quit {
         terminal.draw(|frame| draw(frame, app))?;
         tokio::select! {
+            _ = tick.tick(), if app.turn_started.is_some() => {}
             event = input.next().fuse() => {
                 match event.transpose()? {
                     Some(Event::Key(key)) if key.is_press() => app.on_key(key),
@@ -551,14 +664,23 @@ fn draw(frame: &mut Frame, app: &mut App) {
         ])
         .split(frame.area());
 
-    let transcript = transcript_text(app, areas[0].width as usize);
+    let mut transcript = transcript_text(app, areas[0].width as usize);
     let height = areas[0].height;
+    let padding = height.saturating_sub(transcript.lines.len() as u16) as usize;
+    if padding > 0 {
+        let mut lines = vec![Line::raw(String::new()); padding];
+        lines.extend(transcript.lines);
+        transcript = Text::from(lines);
+    }
     let line_count = transcript.lines.len() as u16;
     let max_scroll = line_count.saturating_sub(height);
     if app.follow {
         app.scroll = max_scroll;
     } else {
         app.scroll = app.scroll.min(max_scroll);
+        if app.scroll == max_scroll {
+            app.follow = true;
+        }
     }
     frame.render_widget(Paragraph::new(transcript).scroll((app.scroll, 0)), areas[0]);
     frame.render_widget(
@@ -586,16 +708,26 @@ fn draw(frame: &mut Frame, app: &mut App) {
         };
         let content = suggestions
             .iter()
-            .map(|command| format!("{}  {}", command.usage, command.description))
-            .collect::<Vec<_>>()
-            .join("\n");
+            .enumerate()
+            .map(|(index, command)| {
+                let marker = if index == app.command_selected {
+                    "› "
+                } else {
+                    "  "
+                };
+                Line::raw(truncate_width(
+                    &format!("{marker}{}  {}", command.usage, command.description),
+                    area.width as usize,
+                ))
+            })
+            .collect::<Vec<_>>();
         frame.render_widget(Clear, area);
         frame.render_widget(
             Paragraph::new(content).style(Style::default().bg(Color::Rgb(30, 30, 34))),
             area,
         );
     }
-    if !app.busy() && app.approval.is_none() {
+    if !app.composer_locked() && app.approval.is_none() {
         let last_line = app.composer.text.rsplit('\n').next().unwrap_or("");
         let x = areas[1].x
             + 2
@@ -617,7 +749,12 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let output = app
         .output_tokens
         .map_or_else(|| "output —".into(), |tokens| format!("output {tokens}"));
-    let model = app.catalog.selected_model.as_deref().unwrap_or("model —");
+    let model = app
+        .catalog
+        .selected_model
+        .as_deref()
+        .and_then(|selected| app.catalog.models.iter().find(|model| model.id == selected))
+        .map_or("model —", |model| model.model.as_str());
     let reasoning = app.catalog.selected_reasoning.as_deref().unwrap_or("—");
     let tier = app.catalog.selected_service_tier.as_deref();
     let selection = tier.map_or_else(
@@ -654,7 +791,7 @@ fn picker_options(picker: &Picker, catalog: &CommandCatalog) -> Vec<PickerItem> 
             .models
             .iter()
             .map(|model| PickerItem {
-                label: model.id.clone(),
+                label: model.model.clone(),
                 description: model.description.clone(),
                 value: model.id.clone(),
             })
@@ -763,6 +900,17 @@ fn truncate_width(value: &str, width: usize) -> String {
     output
 }
 
+fn compact_path(path: &std::path::Path) -> String {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return path.display().to_string();
+    };
+    match path.strip_prefix(&home) {
+        Ok(relative) if relative.as_os_str().is_empty() => "~".into(),
+        Ok(relative) => format!("~/{}", relative.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
 fn picker_area(composer: Rect, height: u16) -> Rect {
     Rect {
         x: composer.x,
@@ -780,6 +928,22 @@ fn transcript_text(app: &App, width: usize) -> Text<'static> {
     if !app.current_model.is_empty() {
         push_message(&mut lines, "phi", &app.current_model, width);
     }
+    if let Some(turn_started) = app.turn_started {
+        if lines.last().is_some_and(|line| line.style.bg.is_some()) {
+            lines.push(Line::raw(" ".repeat(width)));
+        }
+        let (activity, started) = if app.status == "compacting" {
+            ("Compacting", app.compaction_started.unwrap_or(turn_started))
+        } else {
+            ("Working", turn_started)
+        };
+        push_message(
+            &mut lines,
+            "turn_working",
+            &format!("{activity} for {}", human_duration(started.elapsed())),
+            width,
+        );
+    }
     if lines
         .last()
         .is_some_and(|line| !line.to_string().trim().is_empty() || line.style.bg.is_some())
@@ -790,7 +954,7 @@ fn transcript_text(app: &App, width: usize) -> Text<'static> {
 }
 
 fn push_message(lines: &mut Vec<Line<'static>>, role: &str, content: &str, width: usize) {
-    if role == "turn_end" {
+    if role == "turn_end" || role == "turn_working" || role == "compaction_end" {
         lines.push(Line::raw(turn_divider(content, width)));
         lines.push(Line::raw(" ".repeat(width)));
         return;
@@ -799,8 +963,12 @@ fn push_message(lines: &mut Vec<Line<'static>>, role: &str, content: &str, width
         push_tool(lines, content, width);
         return;
     }
+    if role == "you" || role == "phi" {
+        push_markdown(lines, role, content, width);
+        return;
+    }
     let style = match role {
-        "you" => Style::default().bg(Color::Rgb(38, 40, 45)),
+        "note" => Style::default().fg(Color::DarkGray),
         "error" => Style::default().fg(Color::Red),
         _ => Style::default(),
     };
@@ -810,7 +978,13 @@ fn push_message(lines: &mut Vec<Line<'static>>, role: &str, content: &str, width
     for content_line in content.split('\n') {
         for wrapped in wrap_line(content_line, content_width) {
             let used = UnicodeWidthStr::width(wrapped.as_str()).min(content_width);
-            let marker = if first { "• " } else { "  " };
+            let marker = if first && role == "you" {
+                "‣ "
+            } else if first {
+                "• "
+            } else {
+                "  "
+            };
             lines.push(Line::styled(
                 format!(
                     "{marker}{wrapped}{}",
@@ -822,6 +996,122 @@ fn push_message(lines: &mut Vec<Line<'static>>, role: &str, content: &str, width
         }
     }
     lines.push(Line::styled(" ".repeat(width), style));
+}
+
+fn push_markdown(lines: &mut Vec<Line<'static>>, role: &str, content: &str, width: usize) {
+    let normal = Color::Rgb(190, 190, 185);
+    let strong = Color::Rgb(235, 235, 230);
+    let block_style = if role == "you" {
+        Style::default().bg(Color::Rgb(38, 40, 45))
+    } else {
+        Style::default()
+    };
+    let code_style = PhiMarkdown.code();
+    let code_background = Style::default().bg(code_style.bg.unwrap());
+    let marker = if role == "you" { "‣ " } else { "• " };
+    lines.push(Line::styled(" ".repeat(width), block_style));
+
+    let options = tui_markdown::Options::new(PhiMarkdown);
+    let markdown = tui_markdown::from_str_with_options(content, &options);
+    let content_width = width.saturating_sub(2).max(1);
+    let mut marked = false;
+    let mut in_code = false;
+    for line in markdown.lines {
+        let plain = line.to_string();
+        if plain.trim_start().starts_with("```") {
+            if in_code {
+                lines.push(Line::styled(
+                    " ".repeat(width),
+                    block_style.patch(code_style),
+                ));
+                in_code = false;
+            } else {
+                in_code = true;
+                lines.push(Line::styled(
+                    " ".repeat(width),
+                    block_style.patch(code_style),
+                ));
+            }
+            continue;
+        }
+        for wrapped in wrap_styled_line(&line, content_width) {
+            let has_content = !wrapped.to_string().trim().is_empty();
+            let prefix = if !marked && has_content {
+                marked = true;
+                marker
+            } else {
+                "  "
+            };
+            let extra_style = if in_code {
+                code_background
+            } else {
+                Style::default()
+            };
+            let inherited = wrapped.style.fg.unwrap_or(if in_code {
+                code_style.fg.unwrap()
+            } else {
+                normal
+            });
+            let style = Style::default()
+                .fg(inherited)
+                .patch(block_style)
+                .patch(wrapped.style)
+                .patch(extra_style);
+            let mut spans = vec![Span::styled(prefix.to_owned(), style)];
+            spans.extend(wrapped.spans.into_iter().map(|span| {
+                let mut span_style = Style::default()
+                    .fg(inherited)
+                    .patch(block_style)
+                    .patch(span.style)
+                    .patch(extra_style);
+                if span_style.add_modifier.contains(Modifier::BOLD) {
+                    span_style = span_style.fg(strong);
+                }
+                Span::styled(span.content.into_owned(), span_style)
+            }));
+            let used = spans
+                .iter()
+                .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                .sum::<usize>();
+            spans.push(Span::styled(" ".repeat(width.saturating_sub(used)), style));
+            lines.push(Line::from(spans).style(style));
+        }
+    }
+    if !marked && !content.is_empty() {
+        lines.push(Line::styled(
+            format!("{marker}{}", " ".repeat(width.saturating_sub(2))),
+            block_style,
+        ));
+    }
+    lines.push(Line::styled(" ".repeat(width), block_style));
+}
+
+fn wrap_styled_line(line: &Line<'_>, width: usize) -> Vec<Line<'static>> {
+    let mut output = Vec::new();
+    let mut spans = Vec::new();
+    let mut used = 0;
+    for span in &line.spans {
+        let mut segment = String::new();
+        for character in span.content.chars() {
+            let character_width = character.width().unwrap_or_default();
+            if used + character_width > width && used > 0 {
+                if !segment.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut segment), span.style));
+                }
+                output.push(Line::from(std::mem::take(&mut spans)).style(line.style));
+                used = 0;
+            }
+            segment.push(character);
+            used += character_width;
+        }
+        if !segment.is_empty() {
+            spans.push(Span::styled(segment, span.style));
+        }
+    }
+    if !spans.is_empty() || output.is_empty() {
+        output.push(Line::from(spans).style(line.style));
+    }
+    output
 }
 
 fn push_tool(lines: &mut Vec<Line<'static>>, content: &str, width: usize) {
@@ -986,23 +1276,32 @@ mod tests {
             RunOptions {
                 workspace: ".".into(),
                 config_path: "phi.json".into(),
-                session_id: None,
+                session_id: Some("00000000-0000-4000-8000-000000000000".into()),
                 allow_shell: false,
                 allow_write: false,
                 interactive_approvals: true,
             },
             CommandCatalog {
-                commands: vec![phi_runtime::CommandSpec {
-                    name: "model".into(),
-                    usage: "/model [MODEL]".into(),
-                    description: "Select model.".into(),
-                    source: "core".into(),
-                }],
+                commands: vec![
+                    phi_runtime::CommandSpec {
+                        name: "help".into(),
+                        usage: "/help".into(),
+                        description: "List commands.".into(),
+                        source: "core".into(),
+                    },
+                    phi_runtime::CommandSpec {
+                        name: "model".into(),
+                        usage: "/model".into(),
+                        description: "Select model.".into(),
+                        source: "core".into(),
+                    },
+                ],
                 models: vec![phi_runtime::ModelSpec {
+                    provider: "test".into(),
                     id: "test".into(),
+                    model: "test".into(),
                     label: "Test".into(),
                     description: "Test model.".into(),
-                    default: true,
                     reasoning: vec![
                         phi_runtime::PickerOptionSpec::Detailed {
                             id: "low".into(),
@@ -1059,6 +1358,18 @@ mod tests {
     }
 
     #[test]
+    fn short_history_is_anchored_above_input() {
+        let mut app = app();
+        app.transcript.push(("phi".into(), "hello".into()));
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer.cell((2, 4)).unwrap().symbol(), "h");
+        assert_eq!(buffer.cell((0, 5)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell((0, 6)).unwrap().bg, Color::Rgb(30, 30, 34));
+    }
+
+    #[test]
     fn shows_provider_usage_and_cache_counts() {
         let mut app = app();
         app.on_runtime(RuntimeEvent::ContextUpdated {
@@ -1076,6 +1387,68 @@ mod tests {
         assert!(content.contains("context 1500/6000 tokens"));
         assert!(content.contains("cache 1024 read/128 write"));
         assert!(content.contains("output 50"));
+    }
+
+    #[test]
+    fn shows_async_compaction_and_keeps_a_completion_marker() {
+        let mut app = app();
+        app.turn_started = Some(Instant::now());
+        app.current_model = "answer".into();
+        app.on_runtime(RuntimeEvent::ContextUpdated {
+            estimated_tokens: 1_500,
+            token_budget: 2_000,
+            compactions: 0,
+            input_tokens: None,
+            cached_tokens: None,
+            cache_write_tokens: None,
+            output_tokens: None,
+        });
+        app.on_runtime(RuntimeEvent::ActivityChanged {
+            activity: "compacting".into(),
+        });
+        assert_eq!(
+            app.transcript.last().unwrap(),
+            &("phi".into(), "answer".into())
+        );
+        assert!(app.current_model.is_empty());
+        assert!(
+            transcript_text(&app, 80)
+                .lines
+                .iter()
+                .any(|line| line.to_string().contains("Compacting for"))
+        );
+
+        app.on_runtime(RuntimeEvent::ContextUpdated {
+            estimated_tokens: 200,
+            token_budget: 2_000,
+            compactions: 1,
+            input_tokens: None,
+            cached_tokens: None,
+            cache_write_tokens: None,
+            output_tokens: None,
+        });
+        assert_eq!(app.transcript.last().unwrap().0, "compaction_end");
+        assert!(
+            app.transcript
+                .last()
+                .unwrap()
+                .1
+                .contains("context 1500 → 200 tokens")
+        );
+
+        app.on_runtime(RuntimeEvent::Finished {
+            content: "answer".into(),
+        });
+        assert_eq!(
+            app.transcript
+                .iter()
+                .filter(|(role, content)| role == "phi" && content == "answer")
+                .count(),
+            1
+        );
+        assert_eq!(app.transcript[0], ("phi".into(), "answer".into()));
+        assert_eq!(app.transcript[1].0, "compaction_end");
+        assert_eq!(app.transcript[2].0, "turn_end");
     }
 
     #[test]
@@ -1105,7 +1478,84 @@ mod tests {
                 .iter()
                 .all(|line| line.style.bg == Some(Color::Rgb(38, 40, 45)))
         );
+        assert!(text.lines[1].to_string().starts_with("‣ hello"));
         assert_eq!(text.lines[3].style.bg, None);
+    }
+
+    #[test]
+    fn renders_markdown_styles_and_highlighted_code() {
+        let mut lines = Vec::new();
+        push_message(
+            &mut lines,
+            "phi",
+            "plain **bold** *italic* ~~gone~~ `inline` [link](https://example.com)\n\n```rust\nfn main() {}\n```",
+            80,
+        );
+        let spans = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .collect::<Vec<_>>();
+        assert!(spans.iter().any(|span| {
+            span.content == "bold"
+                && span.style.add_modifier.contains(Modifier::BOLD)
+                && span.style.fg == Some(Color::Rgb(235, 235, 230))
+        }));
+        assert!(spans.iter().any(|span| {
+            span.content == "plain " && span.style.fg == Some(Color::Rgb(190, 190, 185))
+        }));
+        assert!(spans.iter().any(|span| {
+            span.content == "italic" && span.style.add_modifier.contains(Modifier::ITALIC)
+        }));
+        assert!(spans.iter().any(|span| {
+            span.content == "gone" && span.style.add_modifier.contains(Modifier::CROSSED_OUT)
+        }));
+        assert!(spans.iter().any(|span| {
+            span.content.contains("https://example.com")
+                && span.style.add_modifier.contains(Modifier::UNDERLINED)
+        }));
+        assert!(spans.iter().any(|span| {
+            span.content == "inline" && span.style.bg == Some(Color::Rgb(27, 28, 31))
+        }));
+        assert!(!lines.iter().any(|line| line.to_string().contains("```")));
+        let code = lines
+            .iter()
+            .find(|line| line.to_string().contains("fn main"))
+            .unwrap();
+        assert_eq!(code.style.bg, Some(Color::Rgb(27, 28, 31)));
+        assert!(code.spans.iter().any(|span| span.style.fg.is_some()));
+        let code_index = lines
+            .iter()
+            .position(|line| line.to_string().contains("fn main"))
+            .unwrap();
+        assert_eq!(lines[code_index - 1].style.bg, Some(Color::Rgb(27, 28, 31)));
+        assert_eq!(lines[code_index + 1].style.bg, Some(Color::Rgb(27, 28, 31)));
+    }
+
+    #[test]
+    fn streaming_does_not_override_manual_scroll() {
+        let mut app = app();
+        app.follow = false;
+        app.on_runtime(RuntimeEvent::ModelDelta {
+            content: "partial".into(),
+        });
+        assert!(!app.follow);
+    }
+
+    #[tokio::test]
+    async fn accepts_queued_input_but_not_submission_during_a_turn() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut app = app();
+                app.handle = Some(phi_runtime::start(app.options.clone(), "work".into()));
+                for character in "next".chars() {
+                    app.on_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+                }
+                app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                assert_eq!(app.composer.text, "next");
+                assert!(app.handle.is_some());
+                app.handle.as_ref().unwrap().cancel();
+            })
+            .await;
     }
 
     #[test]
@@ -1117,6 +1567,27 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         assert_eq!(app.scroll, 0);
+        assert!(app.follow);
+    }
+
+    #[test]
+    fn reaching_bottom_resumes_following_streamed_output() {
+        let mut app = app();
+        app.transcript.push((
+            "phi".into(),
+            (0..30).map(|n| format!("line {n}\n")).collect(),
+        ));
+        app.follow = false;
+        app.scroll = u16::MAX;
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(app.follow);
+
+        app.on_runtime(RuntimeEvent::ModelDelta {
+            content: "more ".repeat(100),
+        });
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(app.follow);
     }
 
     #[test]
@@ -1148,6 +1619,36 @@ mod tests {
         push_message(&mut lines, "turn_end", "Worked for 2m 32s", 40);
         assert_eq!(lines.len(), 2);
         assert!(lines[1].to_string().trim().is_empty());
+    }
+
+    #[test]
+    fn shows_live_working_divider_at_end_of_history() {
+        let mut app = app();
+        app.current_model = "partial response".into();
+        app.turn_started = Some(Instant::now() - Duration::from_secs(133));
+        let text = transcript_text(&app, 40);
+        assert!(
+            text.lines[text.lines.len() - 2]
+                .to_string()
+                .starts_with("─ Working for 2m ")
+        );
+        assert!(text.lines.last().unwrap().to_string().trim().is_empty());
+    }
+
+    #[test]
+    fn working_divider_has_a_gap_after_user_block() {
+        let mut app = app();
+        app.transcript.push(("you".into(), "hello".into()));
+        app.turn_started = Some(Instant::now());
+        let text = transcript_text(&app, 40);
+        let gap = &text.lines[text.lines.len() - 3];
+        assert!(gap.to_string().trim().is_empty());
+        assert_eq!(gap.style.bg, None);
+        assert!(
+            text.lines[text.lines.len() - 2]
+                .to_string()
+                .starts_with("─ Working for ")
+        );
     }
 
     #[tokio::test]
@@ -1184,8 +1685,36 @@ mod tests {
         assert!(app.command_task.is_none());
         assert_eq!(
             app.transcript.last().unwrap().1,
-            "/model [MODEL] — Select model."
+            "/help — List commands.\n/model — Select model."
         );
+        assert_eq!(app.transcript.last().unwrap().0, "note");
+        assert!(!app.transcript.iter().any(|(role, _)| role == "you"));
+    }
+
+    #[test]
+    fn arrows_select_and_prefill_command_suggestions() {
+        let mut app = app();
+        app.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert_eq!(app.command_suggestions().len(), 2);
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.composer.text, "/model");
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.composer.text, "/help");
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.composer.text, "/help ");
+    }
+
+    #[test]
+    fn welcome_is_local_to_new_threads() {
+        let resumed = app();
+        let mut options = resumed.options.clone();
+        options.session_id = None;
+        let fresh = App::new(options, resumed.catalog.clone());
+        assert_eq!(fresh.transcript.len(), 1);
+        assert_eq!(fresh.transcript[0].0, "note");
+        assert!(fresh.transcript[0].1.starts_with("Ready in "));
+        assert!(fresh.transcript[0].1.ends_with("Type / for commands."));
+        assert!(resumed.transcript.is_empty());
     }
 
     #[test]

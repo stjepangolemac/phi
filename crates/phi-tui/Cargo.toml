@@ -2,18 +2,18 @@
 name = "phi-tui"
 version.workspace = true
 edition.workspace = true
+autobins = false
 
-[[bin]]
-name = "phi-tui"
+[lib]
 path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-clap.workspace = true
 crossterm.workspace = true
 futures-util.workspace = true
 phi-runtime = { path = "../phi-runtime" }
 ratatui.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tui-markdown = "0.3.8"
 unicode-width.workspace = true
