@@ -4,7 +4,7 @@
 (define (init encoded-config)
   (define config (string->jsexpr encoded-config))
   (value->jsexpr-string
-    (make-state '() "" "" 0 (hash) (hash-ref config 'context_char_budget)
+    (make-state '() "" "" 0 (hash) (hash-ref config 'context_token_budget)
                 (or (hash-try-get config 'model) "")
                 (or (hash-try-get config 'reasoning) "")
                 (or (hash-try-get config 'service_tier) "")
@@ -19,7 +19,7 @@
   (define pending-tool (hash-ref state 'pending_tool))
   (define compactions (hash-ref state 'compactions))
   (define last-usage (hash-ref state 'last_usage))
-  (define context-budget (hash-ref state 'context_char_budget))
+  (define context-budget (hash-ref state 'context_token_budget))
   (define model (hash-ref state 'model))
   (define reasoning (hash-ref state 'reasoning))
   (define service-tier (hash-ref state 'service_tier))
@@ -61,7 +61,7 @@
                         (list (hash 'kind "tool_result"
                                     'call_id pending-call
                                     'content (value->jsexpr-string result)))))
-          (if (selected-compaction-needed? messages context-budget)
+          (if (selected-compaction-needed? messages last-usage context-budget)
               (begin
                 (set! next-state
                       (make-state messages "" "" compactions last-usage
@@ -82,9 +82,8 @@
          [(equal? activity "compacting")
           (set! messages
                 (complete-selected-compaction
-                  messages context-budget (hash-ref event 'events)))
+                  messages last-usage context-budget (hash-ref event 'events)))
           (set! compactions (+ compactions 1))
-          (set! last-usage (hash))
           (if (equal? pending-finish "")
               (begin
                 (set! next-state
@@ -140,7 +139,7 @@
                                               'content content 'phase phase)
                                         (hash 'kind "message" 'role "assistant"
                                               'content content)))))
-                (if (selected-compaction-needed? messages context-budget)
+                (if (selected-compaction-needed? messages last-usage context-budget)
                     (begin
                       (set! next-state
                             (make-state messages "" "" compactions last-usage
@@ -160,7 +159,7 @@
                                  'call_id pending-call
                                  'content (value->jsexpr-string
                                             (hash-ref event 'result))))))
-       (if (selected-compaction-needed? messages context-budget)
+       (if (selected-compaction-needed? messages last-usage context-budget)
            (begin
              (set! next-state
                    (make-state messages "" "" compactions last-usage context-budget
@@ -183,16 +182,21 @@
 
 (define (make-state messages pending-call pending-tool compactions last-usage context-budget
                     model reasoning service-tier activity pending-finish)
+  (define usage
+    (if (and (hash-try-get last-usage 'total_tokens)
+             (not (hash-try-get last-usage '_message_tokens)))
+        (hash-insert last-usage '_message_tokens
+                     (estimated-message-tokens messages))
+        last-usage))
   (hash 'messages messages
         'pending_call pending-call
         'pending_tool pending-tool
-        'estimated_tokens
-          (quotient (string-length (value->jsexpr-string messages)) 4)
+        'estimated_tokens (estimated-context-tokens messages usage)
         'compactions compactions
-        'last_usage last-usage
+        'last_usage usage
         'model model
         'reasoning reasoning
         'service_tier service-tier
         'activity activity
         'pending_finish pending-finish
-        'context_char_budget context-budget))
+        'context_token_budget context-budget))

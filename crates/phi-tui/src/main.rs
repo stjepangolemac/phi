@@ -1060,7 +1060,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
                 .min(areas[1].height.saturating_sub(3));
         frame.set_cursor_position((x, y));
     }
-    let context = match (app.input_tokens.or(app.estimated_tokens), app.token_budget) {
+    let context = match (app.estimated_tokens, app.token_budget) {
         (Some(used), Some(budget)) => format!("context {used}/{budget} tokens"),
         _ => "context —".into(),
     };
@@ -1755,7 +1755,7 @@ mod tests {
     fn shows_provider_usage_and_cache_counts() {
         let mut app = app();
         app.on_runtime(RuntimeEvent::ContextUpdated {
-            estimated_tokens: 400,
+            estimated_tokens: 1_500,
             token_budget: 6_000,
             compactions: 0,
             input_tokens: Some(1_500),

@@ -253,17 +253,33 @@ const PLUGIN_PRELUDE: &str = r#"
   ((hash-ref (find-named prompt-builder-registry selected-prompt-builder) 'builder)
    messages instructions tools))
 
-(define (selected-compaction-needed? messages max-chars)
+(define (estimated-message-tokens messages)
+  (quotient (string-length (value->jsexpr-string messages)) 4))
+
+(define (estimated-fixed-tokens messages usage)
+  (define total (hash-try-get usage 'total_tokens))
+  (define baseline (hash-try-get usage '_message_tokens))
+  (if (and total baseline (> total baseline)) (- total baseline) 0))
+
+(define (estimated-context-tokens messages usage)
+  (define total (hash-try-get usage 'total_tokens))
+  (define baseline (hash-try-get usage '_message_tokens))
+  (if (and total (not baseline))
+      total
+      (+ (estimated-fixed-tokens messages usage)
+         (estimated-message-tokens messages))))
+
+(define (selected-compaction-needed? messages usage max-tokens)
   ((hash-ref (find-named compactor-registry selected-compactor) 'needed)
-   messages max-chars selected-compactor-config))
+   messages usage max-tokens selected-compactor-config))
 
-(define (start-selected-compaction messages max-chars)
+(define (start-selected-compaction messages max-tokens)
   ((hash-ref (find-named compactor-registry selected-compactor) 'start)
-   messages max-chars selected-compactor-config))
+   messages max-tokens selected-compactor-config))
 
-(define (complete-selected-compaction messages max-chars events)
+(define (complete-selected-compaction messages usage max-tokens events)
   ((hash-ref (find-named compactor-registry selected-compactor) 'complete)
-   messages max-chars events selected-compactor-config))
+   messages usage max-tokens events selected-compactor-config))
 
 (define (validate-tool-preference preference)
   (define preferred (hash-try-get preference 'prefer))
@@ -301,7 +317,7 @@ impl Policy {
             agent,
             plugins,
             main,
-            r#"{"context_char_budget":24000,"model":"openai/gpt-5.6-luna","reasoning":"low","service_tier":"default"}"#,
+            r#"{"context_token_budget":6000,"model":"openai/gpt-5.6-luna","reasoning":"low","service_tier":"default"}"#,
             None,
         )
     }
@@ -474,7 +490,7 @@ pub fn replay_smoke(agent: &Path, plugins: &[PathBuf], main: &Path) -> Result<()
         agent,
         plugins,
         main,
-        r#"{"context_char_budget":24000,"model":"openai/gpt-5.6-luna","reasoning":"low","service_tier":"default"}"#,
+        r#"{"context_token_budget":6000,"model":"openai/gpt-5.6-luna","reasoning":"low","service_tier":"default"}"#,
         None,
     )?;
     let output = policy.on_event(&Event::UserMessage {
@@ -713,7 +729,7 @@ mod tests {
             &root.join("policy/agent.scm"),
             &plugins(&root),
             &root.join("main.scm"),
-            r#"{"context_char_budget":4000,"model":"openai/gpt-5.6-luna","reasoning":"low","service_tier":"default"}"#,
+            r#"{"context_token_budget":1000,"model":"openai/gpt-5.6-luna","reasoning":"low","service_tier":"default"}"#,
             None,
         )
         .unwrap();
@@ -770,13 +786,75 @@ mod tests {
     }
 
     #[test]
+    fn provider_total_tokens_trigger_and_anchor_compaction() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut policy = Policy::load_with_state(
+            &root.join("policy/agent.scm"),
+            &plugins(&root),
+            &root.join("main.scm"),
+            r#"{"context_token_budget":6000,"model":"openai/gpt-5.6-luna","reasoning":"low","service_tier":"default"}"#,
+            None,
+        )
+        .unwrap();
+        policy
+            .on_event(&Event::UserMessage {
+                content: "x".repeat(3_000),
+            })
+            .unwrap();
+        let output = policy
+            .on_event(&Event::HttpCompleted {
+                success: true,
+                status: 200,
+                events: vec![
+                    serde_json::json!({
+                        "type": "response.output_text.delta",
+                        "delta": "answer"
+                    }),
+                    serde_json::json!({
+                        "type": "response.completed",
+                        "response": {
+                            "usage": {
+                                "input_tokens": 6480,
+                                "output_tokens": 20,
+                                "total_tokens": 6500
+                            }
+                        }
+                    }),
+                ],
+                error: String::new(),
+            })
+            .unwrap();
+        assert!(matches!(
+            &output.effects[0],
+            Effect::HttpRequest { body, .. }
+                if body["instructions"].as_str().unwrap().contains("Summarize")
+        ));
+
+        policy
+            .on_event(&Event::HttpCompleted {
+                success: true,
+                status: 200,
+                events: vec![serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "delta": "short summary"
+                })],
+                error: String::new(),
+            })
+            .unwrap();
+        let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
+        let context = state["estimated_tokens"].as_f64().unwrap();
+        assert!(context < 6_000.0);
+        assert!(context > 5_000.0);
+    }
+
+    #[test]
     fn compaction_truncates_oversized_tool_result() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut policy = Policy::load_with_state(
             &root.join("policy/agent.scm"),
             &plugins(&root),
             &root.join("main.scm"),
-            r#"{"context_char_budget":4000,"model":"openai/gpt-5.6-luna","reasoning":"low","service_tier":"default"}"#,
+            r#"{"context_token_budget":1000,"model":"openai/gpt-5.6-luna","reasoning":"low","service_tier":"default"}"#,
             None,
         )
         .unwrap();

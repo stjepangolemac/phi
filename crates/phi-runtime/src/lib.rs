@@ -106,7 +106,7 @@ struct Config {
     allowed_programs: HashSet<String>,
     allowed_http_origins: HashSet<String>,
     secrets: BTreeMap<String, phi_core::http::SecretConfig>,
-    context_char_budget: usize,
+    context_token_budget: usize,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -124,7 +124,7 @@ struct ModelSelection {
 
 const DEFAULT_CONFIG: &str = r#"{
   "allowed_programs": ["cargo", "find", "git", "ls", "pwd", "rg", "sed"],
-  "context_char_budget": 24000,
+  "context_token_budget": 6000,
   "allowed_http_origins": [
     "https://auth.openai.com",
     "https://chatgpt.com",
@@ -609,7 +609,7 @@ fn policy_config(
     tools.push(phi_core::capability::shell_spec());
     tools.sort_by(|left, right| left.name.cmp(&right.name));
     let mut value = serde_json::json!({
-        "context_char_budget": config.context_char_budget,
+        "context_token_budget": config.context_token_budget,
         "session_id": session_id,
         "tools": tools,
     });
@@ -742,7 +742,7 @@ async fn run(
         let output = policy.on_event(&event)?;
         session.append(&output)?;
         session.save_state(policy.state())?;
-        send_context(events, policy.state(), config.context_char_budget)?;
+        send_context(events, policy.state(), config.context_token_budget)?;
         let next_activity = state_activity(policy.state())?;
         if next_activity != activity {
             if activity == "searching"
@@ -943,7 +943,7 @@ fn send(events: &mpsc::UnboundedSender<RuntimeEvent>, event: RuntimeEvent) -> Re
 fn send_context(
     events: &mpsc::UnboundedSender<RuntimeEvent>,
     state: &str,
-    context_char_budget: usize,
+    context_token_budget: usize,
 ) -> Result<()> {
     let state: serde_json::Value = serde_json::from_str(state)?;
     let usage = &state["last_usage"];
@@ -952,7 +952,7 @@ fn send_context(
         events,
         RuntimeEvent::ContextUpdated {
             estimated_tokens: state["estimated_tokens"].as_f64().unwrap_or_default() as u64,
-            token_budget: (context_char_budget / 4) as u64,
+            token_budget: context_token_budget as u64,
             compactions: state["compactions"].as_f64().unwrap_or_default() as u64,
             input_tokens: number_u64(&usage["input_tokens"]),
             cached_tokens: number_u64(&input_details["cached_tokens"]),

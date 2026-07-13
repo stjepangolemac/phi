@@ -1,8 +1,8 @@
 ;; Summarize oversized history through any registered model.
-(define (compaction-needed? messages max-chars _config)
-  (> (encoded-length messages) max-chars))
+(define (compaction-needed? messages usage max-tokens _config)
+  (> (estimated-context-tokens messages usage) max-tokens))
 
-(define (start-compaction messages _max-chars config)
+(define (start-compaction messages _max-tokens config)
   (provider-request
     (hash 'instructions
           "Summarize the conversation for another model that will continue the work. Preserve user requirements, decisions, file paths, code changes, tool results, unresolved work, and current state. Be concise and return only the summary."
@@ -12,12 +12,16 @@
     (hash-ref config 'reasoning)
     (hash-ref config 'service_tier)))
 
-(define (complete-compaction _messages max-chars events config)
+(define (complete-compaction messages usage max-tokens events config)
   (define summary
     (provider-output-for (hash-ref config 'model) events))
+  (define message-token-budget
+    (- max-tokens (estimated-fixed-tokens messages usage)))
   (if (equal? summary "")
       (error! "compactor returned no summary")
-      (fit-summary summary max-chars)))
+      (if (<= message-token-budget 0)
+          (error! "fixed prompt and tools exceed the context budget")
+          (fit-summary summary (* message-token-budget 4)))))
 
 (define (portable-messages messages)
   (cond
