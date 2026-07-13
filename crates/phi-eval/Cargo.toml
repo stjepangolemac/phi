@@ -1,0 +1,12 @@
+[package]
+name = "phi-eval"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+phi-core = { path = "../phi-core" }
+phi-steel = { path = "../phi-steel" }
+serde_json.workspace = true
+similar.workspace = true
+tempfile.workspace = true

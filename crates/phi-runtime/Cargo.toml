@@ -1,0 +1,15 @@
+[package]
+name = "phi-runtime"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+phi-core = { path = "../phi-core" }
+phi-eval = { path = "../phi-eval" }
+phi-protocol = { path = "../phi-protocol" }
+phi-steel = { path = "../phi-steel" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true

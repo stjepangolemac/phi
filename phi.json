@@ -1,0 +1,22 @@
+{
+  "policy": "policy/agent.scm",
+  "provider": "policy/providers/openai.scm",
+  "compaction": "policy/compaction/simple.scm",
+  "allowed_programs": ["cargo", "find", "git", "ls", "pwd", "rg", "sed"],
+  "context_char_budget": 24000,
+  "allowed_http_origins": ["https://auth.openai.com", "https://chatgpt.com"],
+  "secrets": {
+    "openai_chatgpt": {
+      "path": "~/.codex/auth.json",
+      "bearer_pointer": "/tokens/access_token",
+      "headers": {
+        "chatgpt-account-id": "/tokens/account_id"
+      },
+      "refresh": {
+        "url": "https://auth.openai.com/oauth/token",
+        "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+        "refresh_pointer": "/tokens/refresh_token"
+      }
+    }
+  }
+}

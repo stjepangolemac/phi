@@ -1,0 +1,13 @@
+[package]
+name = "phi-steel"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+phi-protocol = { path = "../phi-protocol" }
+serde_json.workspace = true
+steel-core.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
