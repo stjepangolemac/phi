@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub struct Session {
@@ -14,37 +14,72 @@ pub struct Session {
     dir: PathBuf,
 }
 
-pub struct Sources {
+#[derive(Clone)]
+pub struct PluginSource {
+    pub name: String,
+    pub root: PathBuf,
+    pub entrypoint: PathBuf,
+}
+
+pub struct ComposedSources {
     pub policy: PathBuf,
-    pub provider: PathBuf,
-    pub prompt: PathBuf,
-    pub compaction: PathBuf,
+    pub main: PathBuf,
+    pub plugins: Vec<PluginSource>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct CompositionSnapshot {
+    plugins: Vec<SnapshotPlugin>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct SnapshotPlugin {
+    name: String,
+    directory: String,
+    entrypoint: String,
 }
 
 impl Session {
-    pub fn create(
+    pub fn create_composed(
         root: &Path,
         policy: &Path,
-        provider: &Path,
-        prompt: &Path,
-        compaction: &Path,
+        main: &Path,
+        plugins: &[PluginSource],
     ) -> Result<Self> {
         let id = Uuid::new_v4().to_string();
         let session = Self::at(root, &id)?;
         fs::create_dir_all(&session.dir)?;
         fs::copy(policy, session.dir.join("policy.scm"))?;
-        fs::copy(provider, session.dir.join("provider.scm"))?;
-        fs::copy(prompt, session.dir.join("prompt.scm"))?;
-        fs::copy(compaction, session.dir.join("compaction.scm"))?;
+        fs::copy(main, session.dir.join("main.scm"))?;
+        let mut snapshot = CompositionSnapshot {
+            plugins: Vec::new(),
+        };
+        for plugin in plugins {
+            let directory = plugin.name.clone();
+            let target = session.dir.join("plugins").join(&directory);
+            copy_tree(&plugin.root, &target)?;
+            let entrypoint = plugin
+                .entrypoint
+                .strip_prefix(&plugin.root)
+                .context("plugin entrypoint is outside its package")?;
+            snapshot.plugins.push(SnapshotPlugin {
+                name: plugin.name.clone(),
+                directory,
+                entrypoint: entrypoint.to_string_lossy().into(),
+            });
+        }
+        write_atomic(
+            &session.dir.join("composition.json"),
+            &serde_json::to_vec_pretty(&snapshot)?,
+        )?;
         write_atomic(
             &session.dir.join("meta.json"),
             &serde_json::to_vec_pretty(&serde_json::json!({
                 "id": id,
                 "created_at": SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
                 "policy": policy.display().to_string(),
-                "provider": provider.display().to_string(),
-                "prompt": prompt.display().to_string(),
-                "compaction": compaction.display().to_string(),
+                "main": main.display().to_string(),
+                "plugins": snapshot.plugins.iter().map(|plugin| &plugin.name).collect::<Vec<_>>(),
             }))?,
         )?;
         Ok(session)
@@ -74,23 +109,33 @@ impl Session {
         fs::read_to_string(self.dir.join("state.json")).context("session has no saved state")
     }
 
-    pub fn sources(&self, prompt_fallback: &Path) -> Result<Sources> {
-        let pinned_prompt = self.dir.join("prompt.scm");
-        let sources = Sources {
-            policy: self.dir.join("policy.scm"),
-            provider: self.dir.join("provider.scm"),
-            prompt: if pinned_prompt.is_file() {
-                pinned_prompt
-            } else {
-                prompt_fallback.to_owned()
-            },
-            compaction: self.dir.join("compaction.scm"),
-        };
-        if !sources.policy.is_file() || !sources.provider.is_file() || !sources.compaction.is_file()
-        {
-            anyhow::bail!("session has no complete policy snapshot");
+    pub fn composed_sources(&self) -> Result<Option<ComposedSources>> {
+        let path = self.dir.join("composition.json");
+        if !path.is_file() {
+            return Ok(None);
         }
-        Ok(sources)
+        let snapshot: CompositionSnapshot = serde_json::from_slice(&fs::read(path)?)?;
+        let plugins = snapshot
+            .plugins
+            .into_iter()
+            .map(|plugin| {
+                let root = self.dir.join("plugins").join(plugin.directory);
+                let entrypoint = root.join(plugin.entrypoint);
+                if !entrypoint.is_file() {
+                    anyhow::bail!("session plugin snapshot is incomplete: {}", plugin.name);
+                }
+                Ok(PluginSource {
+                    name: plugin.name,
+                    root,
+                    entrypoint,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(ComposedSources {
+            policy: self.dir.join("policy.scm"),
+            main: self.dir.join("main.scm"),
+            plugins,
+        }))
     }
 
     fn at(root: &Path, id: &str) -> Result<Self> {
@@ -100,6 +145,23 @@ impl Session {
             id,
         })
     }
+}
+
+fn copy_tree(source: &Path, target: &Path) -> Result<()> {
+    fs::create_dir_all(target)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let destination = target.join(entry.file_name());
+        if kind.is_symlink() {
+            anyhow::bail!("plugin packages may not contain symlinks");
+        } else if kind.is_dir() {
+            copy_tree(&entry.path(), &destination)?;
+        } else if kind.is_file() {
+            fs::copy(entry.path(), destination)?;
+        }
+    }
+    Ok(())
 }
 
 pub fn append(path: &Path, value: &impl Serialize) -> Result<()> {
@@ -130,34 +192,47 @@ mod tests {
     fn creates_and_resumes_state() {
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join("agent.scm"), "agent").unwrap();
-        fs::write(root.path().join("provider.scm"), "provider").unwrap();
-        fs::write(root.path().join("prompt.scm"), "prompt").unwrap();
-        fs::write(root.path().join("compaction.scm"), "compaction").unwrap();
-        let session = Session::create(
+        fs::write(root.path().join("main.scm"), "main").unwrap();
+        let session = Session::create_composed(
             root.path(),
             &root.path().join("agent.scm"),
-            &root.path().join("provider.scm"),
-            &root.path().join("prompt.scm"),
-            &root.path().join("compaction.scm"),
+            &root.path().join("main.scm"),
+            &[],
         )
         .unwrap();
         session.save_state("{\"input\":[]}").unwrap();
         let resumed = Session::open(root.path(), session.id()).unwrap();
         assert_eq!(resumed.load_state().unwrap(), "{\"input\":[]}");
         assert_eq!(
-            fs::read_to_string(
-                resumed
-                    .sources(&root.path().join("prompt.scm"))
-                    .unwrap()
-                    .policy,
-            )
-            .unwrap(),
+            fs::read_to_string(resumed.composed_sources().unwrap().unwrap().policy).unwrap(),
             "agent"
         );
+    }
 
-        fs::remove_file(resumed.dir.join("prompt.scm")).unwrap();
-        let fallback = root.path().join("prompt-fallback.scm");
-        fs::write(&fallback, "fallback").unwrap();
-        assert_eq!(resumed.sources(&fallback).unwrap().prompt, fallback);
+    #[test]
+    fn snapshots_complete_composition() {
+        let root = tempfile::tempdir().unwrap();
+        let plugin = root.path().join("plugin");
+        fs::create_dir(&plugin).unwrap();
+        fs::write(plugin.join("main.scm"), "plugin").unwrap();
+        fs::write(root.path().join("agent.scm"), "agent").unwrap();
+        fs::write(root.path().join("main.scm"), "main").unwrap();
+        let session = Session::create_composed(
+            &root.path().join("sessions"),
+            &root.path().join("agent.scm"),
+            &root.path().join("main.scm"),
+            &[PluginSource {
+                name: "example".into(),
+                root: plugin.clone(),
+                entrypoint: plugin.join("main.scm"),
+            }],
+        )
+        .unwrap();
+        let sources = session.composed_sources().unwrap().unwrap();
+        assert_eq!(fs::read_to_string(sources.main).unwrap(), "main");
+        assert_eq!(
+            fs::read_to_string(&sources.plugins[0].entrypoint).unwrap(),
+            "plugin"
+        );
     }
 }
