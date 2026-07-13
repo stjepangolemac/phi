@@ -284,6 +284,7 @@ struct App {
 
 impl App {
     fn new(options: RunOptions, catalog: CommandCatalog) -> Self {
+        let token_budget = selected_context_window(&catalog);
         let transcript = if options.session_id.is_none() {
             vec![(
                 "note".into(),
@@ -307,8 +308,8 @@ impl App {
             picker: None,
             approval: None,
             status: "ready".into(),
-            estimated_tokens: None,
-            token_budget: None,
+            estimated_tokens: token_budget.map(|_| 0),
+            token_budget,
             input_tokens: None,
             cached_tokens: None,
             cache_write_tokens: None,
@@ -393,6 +394,7 @@ impl App {
                 self.session_id = Some(execution.session_id);
                 self.options.session_id = self.session_id.clone();
                 self.catalog = execution.catalog;
+                self.token_budget = selected_context_window(&self.catalog);
                 self.transcript.push(("note".into(), execution.content));
             }
             Err(error) => self.transcript.push(("error".into(), error.to_string())),
@@ -1061,7 +1063,13 @@ fn draw(frame: &mut Frame, app: &mut App) {
         frame.set_cursor_position((x, y));
     }
     let context = match (app.estimated_tokens, app.token_budget) {
-        (Some(used), Some(budget)) => format!("context {used}/{budget} tokens"),
+        (Some(used), Some(budget)) => {
+            format!(
+                "context {}/{} tokens",
+                human_tokens(used),
+                human_tokens(budget)
+            )
+        }
         _ => "context —".into(),
     };
     let cache = match (app.cached_tokens, app.cache_write_tokens) {
@@ -1593,6 +1601,30 @@ fn human_duration(duration: Duration) -> String {
     }
 }
 
+fn selected_context_window(catalog: &CommandCatalog) -> Option<u64> {
+    let selected = catalog.selected_model.as_deref()?;
+    catalog
+        .models
+        .iter()
+        .find(|model| model.id == selected)
+        .map(|model| model.context_window)
+}
+
+fn human_tokens(tokens: u64) -> String {
+    if tokens < 1_000 {
+        return tokens.to_string();
+    }
+    let thousands = tokens as f64 / 1_000.0;
+    let formatted = if thousands >= 100.0 {
+        return format!("{thousands:.0}K");
+    } else if thousands >= 10.0 {
+        format!("{thousands:.1}")
+    } else {
+        format!("{thousands:.2}")
+    };
+    format!("{}K", formatted.trim_end_matches('0').trim_end_matches('.'))
+}
+
 fn centered(area: Rect, percent: u16, height: u16) -> Rect {
     let width = area.width.saturating_mul(percent) / 100;
     Rect {
@@ -1639,6 +1671,8 @@ mod tests {
                     model: "model".into(),
                     label: "Test".into(),
                     description: "Test model.".into(),
+                    context_window: 1_000,
+                    compaction_token_limit: 900,
                     function_tools: true,
                     hosted_tools: Vec::new(),
                     reasoning: vec![
@@ -1766,7 +1800,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let content = terminal.backend().to_string();
-        assert!(content.contains("context 1500/6000 tokens"));
+        assert!(content.contains("context 1.5K/6K tokens"));
         assert!(content.contains("cache 1024 read/128 write"));
         assert!(content.contains("output 50"));
     }
@@ -2089,6 +2123,8 @@ mod tests {
     #[test]
     fn model_picker_and_status_use_qualified_model_id() {
         let app = app();
+        assert_eq!(app.estimated_tokens, Some(0));
+        assert_eq!(app.token_budget, Some(1_000));
         let options = picker_options(&Picker::Model { selected: 0 }, &app.catalog);
         assert_eq!(options[0].label, "test/model");
 
@@ -2097,7 +2133,18 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let content = terminal.backend().to_string();
         assert!(content.contains("test/model · low · default"));
+        assert!(content.contains("context 0/1K tokens"));
         assert!(!content.contains(" · ready · "));
+    }
+
+    #[test]
+    fn formats_token_counts_with_three_significant_digits() {
+        assert_eq!(human_tokens(999), "999");
+        assert_eq!(human_tokens(1_000), "1K");
+        assert_eq!(human_tokens(4_812), "4.81K");
+        assert_eq!(human_tokens(27_200), "27.2K");
+        assert_eq!(human_tokens(272_000), "272K");
+        assert_eq!(human_tokens(500_000), "500K");
     }
 
     #[test]

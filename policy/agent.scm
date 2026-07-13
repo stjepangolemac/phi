@@ -3,9 +3,12 @@
 
 (define (init encoded-config)
   (define config (string->jsexpr encoded-config))
+  (define model (or (hash-try-get config 'model) ""))
+  (define context-budget
+    (hash-ref (model-spec model) 'compaction_token_limit))
   (value->jsexpr-string
-    (make-state '() "" "" 0 (hash) (hash-ref config 'context_token_budget)
-                (or (hash-try-get config 'model) "")
+    (make-state '() "" "" 0 (hash) context-budget
+                model
                 (or (hash-try-get config 'reasoning) "")
                 (or (hash-try-get config 'service_tier) "")
                 "ready" "")))
@@ -19,8 +22,9 @@
   (define pending-tool (hash-ref state 'pending_tool))
   (define compactions (hash-ref state 'compactions))
   (define last-usage (hash-ref state 'last_usage))
-  (define context-budget (hash-ref state 'context_token_budget))
   (define model (hash-ref state 'model))
+  (define context-budget
+    (hash-ref (model-spec model) 'compaction_token_limit))
   (define reasoning (hash-ref state 'reasoning))
   (define service-tier (hash-ref state 'service_tier))
   (define activity (hash-ref state 'activity))
@@ -39,6 +43,8 @@
        (request-effect messages model reasoning service-tier)]
       [(equal? event-type "model_selected")
        (set! model (hash-ref event 'model))
+       (set! context-budget
+             (hash-ref (model-spec model) 'compaction_token_limit))
        (set! reasoning (hash-ref event 'reasoning))
        (set! service-tier (hash-ref event 'service_tier))
        (set! next-state
@@ -199,4 +205,4 @@
         'service_tier service-tier
         'activity activity
         'pending_finish pending-finish
-        'context_token_budget context-budget))
+        'context_window (hash-ref (model-spec model) 'context_window)))

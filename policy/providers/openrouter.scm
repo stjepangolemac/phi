@@ -11,6 +11,8 @@
     (hash 'id id
           'label id
           'description description
+          'context_window 500000
+          'compaction_token_limit 180000
           'function_tools #t
           'hosted_tools (list "openrouter/hosted-web-search")
           'reasoning openrouter-reasoning-options
@@ -20,8 +22,6 @@
 
 (register-openrouter-model!
   "x-ai/grok-4.5" "Grok 4.5 through OpenRouter." "medium")
-(register-openrouter-model!
-  "openai/gpt-5.6-luna" "GPT-5.6 Luna through OpenRouter." "low")
 
 (define (openrouter-provider-effect prompt model reasoning _service-tier)
   (hash 'type "http_request"

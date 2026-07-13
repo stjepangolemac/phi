@@ -17,6 +17,8 @@
     (hash 'id id
           'label id
           'description description
+          'context_window 272000
+          'compaction_token_limit 244800
           'function_tools #t
           'hosted_tools (list "openai/hosted-web-search")
           'reasoning reasoning

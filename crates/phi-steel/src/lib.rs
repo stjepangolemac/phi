@@ -317,7 +317,7 @@ impl Policy {
             agent,
             plugins,
             main,
-            r#"{"context_token_budget":6000,"model":"openai/gpt-5.6-luna","reasoning":"low","service_tier":"default"}"#,
+            r#"{"model":"openai/gpt-5.6-luna","reasoning":"low","service_tier":"default"}"#,
             None,
         )
     }
@@ -490,7 +490,7 @@ pub fn replay_smoke(agent: &Path, plugins: &[PathBuf], main: &Path) -> Result<()
         agent,
         plugins,
         main,
-        r#"{"context_token_budget":6000,"model":"openai/gpt-5.6-luna","reasoning":"low","service_tier":"default"}"#,
+        r#"{"model":"openai/gpt-5.6-luna","reasoning":"low","service_tier":"default"}"#,
         None,
     )?;
     let output = policy.on_event(&Event::UserMessage {
@@ -523,6 +523,26 @@ mod tests {
         Policy::load(
             &root.join("policy/agent.scm"),
             &plugins(root),
+            &root.join("main.scm"),
+        )
+        .unwrap()
+    }
+
+    fn compact_policy(root: &Path, limit: u64) -> Policy {
+        let temp = tempfile::tempdir().unwrap();
+        let provider = temp.path().join("openai.scm");
+        let source = fs::read_to_string(root.join("policy/providers/openai.scm"))
+            .unwrap()
+            .replace(
+                "'compaction_token_limit 244800",
+                &format!("'compaction_token_limit {limit}"),
+            );
+        fs::write(&provider, source).unwrap();
+        let mut sources = plugins(root);
+        sources[1] = provider;
+        Policy::load(
+            &root.join("policy/agent.scm"),
+            &sources,
             &root.join("main.scm"),
         )
         .unwrap()
@@ -725,14 +745,7 @@ mod tests {
     #[test]
     fn compaction_bounds_large_context() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let mut policy = Policy::load_with_state(
-            &root.join("policy/agent.scm"),
-            &plugins(&root),
-            &root.join("main.scm"),
-            r#"{"context_token_budget":1000,"model":"openai/gpt-5.6-luna","reasoning":"low","service_tier":"default"}"#,
-            None,
-        )
-        .unwrap();
+        let mut policy = compact_policy(&root, 1_000);
         policy
             .on_event(&Event::UserMessage {
                 content: "x".repeat(3_000),
@@ -788,14 +801,7 @@ mod tests {
     #[test]
     fn provider_total_tokens_trigger_and_anchor_compaction() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let mut policy = Policy::load_with_state(
-            &root.join("policy/agent.scm"),
-            &plugins(&root),
-            &root.join("main.scm"),
-            r#"{"context_token_budget":6000,"model":"openai/gpt-5.6-luna","reasoning":"low","service_tier":"default"}"#,
-            None,
-        )
-        .unwrap();
+        let mut policy = compact_policy(&root, 6_000);
         policy
             .on_event(&Event::UserMessage {
                 content: "x".repeat(3_000),
@@ -850,14 +856,7 @@ mod tests {
     #[test]
     fn compaction_truncates_oversized_tool_result() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let mut policy = Policy::load_with_state(
-            &root.join("policy/agent.scm"),
-            &plugins(&root),
-            &root.join("main.scm"),
-            r#"{"context_token_budget":1000,"model":"openai/gpt-5.6-luna","reasoning":"low","service_tier":"default"}"#,
-            None,
-        )
-        .unwrap();
+        let mut policy = compact_policy(&root, 1_000);
         policy
             .on_event(&Event::UserMessage {
                 content: "list files".into(),
@@ -947,6 +946,7 @@ mod tests {
             r#"(register-model!
                  "other"
                  (hash 'id "model" 'label "model" 'description ""
+                       'context_window 1000 'compaction_token_limit 900
                        'function_tools #t 'hosted_tools '()
                        'reasoning '() 'default_reasoning ""
                        'service_tiers '() 'default_service_tier ""))"#,
@@ -990,6 +990,7 @@ mod tests {
                (register-model!
                  "other"
                  (hash 'id "gpt-5.6-luna" 'label "other" 'description ""
+                       'context_window 1000 'compaction_token_limit 900
                        'function_tools #t 'hosted_tools '()
                        'reasoning (list (hash 'id "low" 'description ""))
                        'default_reasoning "low"

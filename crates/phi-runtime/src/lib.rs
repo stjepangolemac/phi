@@ -106,7 +106,6 @@ struct Config {
     allowed_programs: HashSet<String>,
     allowed_http_origins: HashSet<String>,
     secrets: BTreeMap<String, phi_core::http::SecretConfig>,
-    context_token_budget: usize,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -124,7 +123,6 @@ struct ModelSelection {
 
 const DEFAULT_CONFIG: &str = r#"{
   "allowed_programs": ["cargo", "find", "git", "ls", "pwd", "rg", "sed"],
-  "context_token_budget": 6000,
   "allowed_http_origins": [
     "https://auth.openai.com",
     "https://chatgpt.com",
@@ -600,7 +598,7 @@ fn model_command(
 }
 
 fn policy_config(
-    config: &Config,
+    _config: &Config,
     capabilities: &phi_core::capability::Registry,
     session_id: &str,
     user_state: &UserState,
@@ -609,7 +607,6 @@ fn policy_config(
     tools.push(phi_core::capability::shell_spec());
     tools.sort_by(|left, right| left.name.cmp(&right.name));
     let mut value = serde_json::json!({
-        "context_token_budget": config.context_token_budget,
         "session_id": session_id,
         "tools": tools,
     });
@@ -742,7 +739,7 @@ async fn run(
         let output = policy.on_event(&event)?;
         session.append(&output)?;
         session.save_state(policy.state())?;
-        send_context(events, policy.state(), config.context_token_budget)?;
+        send_context(events, policy.state())?;
         let next_activity = state_activity(policy.state())?;
         if next_activity != activity {
             if activity == "searching"
@@ -940,11 +937,7 @@ fn send(events: &mpsc::UnboundedSender<RuntimeEvent>, event: RuntimeEvent) -> Re
         .map_err(|_| anyhow::anyhow!("frontend disconnected"))
 }
 
-fn send_context(
-    events: &mpsc::UnboundedSender<RuntimeEvent>,
-    state: &str,
-    context_token_budget: usize,
-) -> Result<()> {
+fn send_context(events: &mpsc::UnboundedSender<RuntimeEvent>, state: &str) -> Result<()> {
     let state: serde_json::Value = serde_json::from_str(state)?;
     let usage = &state["last_usage"];
     let input_details = &usage["input_tokens_details"];
@@ -952,7 +945,7 @@ fn send_context(
         events,
         RuntimeEvent::ContextUpdated {
             estimated_tokens: state["estimated_tokens"].as_f64().unwrap_or_default() as u64,
-            token_budget: context_token_budget as u64,
+            token_budget: state["context_window"].as_u64().unwrap_or_default(),
             compactions: state["compactions"].as_f64().unwrap_or_default() as u64,
             input_tokens: number_u64(&usage["input_tokens"]),
             cached_tokens: number_u64(&input_details["cached_tokens"]),

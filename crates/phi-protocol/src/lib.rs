@@ -98,6 +98,8 @@ pub struct ModelSpec {
     pub label: String,
     #[serde(default)]
     pub description: String,
+    pub context_window: u64,
+    pub compaction_token_limit: u64,
     #[serde(default)]
     pub function_tools: bool,
     #[serde(default)]
