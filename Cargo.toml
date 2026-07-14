@@ -28,7 +28,7 @@ futures-util = "0.3"
 similar = "2"
 steel-core = "0.8.2"
 tempfile = "3"
-tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "signal", "time"] }
 tokio-util = "0.7"
 unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }

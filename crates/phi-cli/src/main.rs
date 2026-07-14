@@ -82,7 +82,7 @@ enum PluginCommand {
     Sync,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     tokio::task::LocalSet::new().run_until(run()).await
 }
