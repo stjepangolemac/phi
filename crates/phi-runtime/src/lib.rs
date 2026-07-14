@@ -1,14 +1,17 @@
 use std::{
     collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, bail};
-use phi_protocol::{Effect, Event, StreamRule};
+use phi_protocol::{Effect, Event, StreamRule, ToolCall, ToolExecution, ToolResult};
 use serde::{Deserialize, Serialize};
+use similar::TextDiff;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+pub use phi_core::process::ShellSessions as ProcessManager;
 pub use phi_protocol::{CommandInvocation, CommandSpec, ModelSpec, PickerOptionSpec};
 
 #[derive(Clone)]
@@ -19,6 +22,7 @@ pub struct RunOptions {
     pub allow_shell: bool,
     pub allow_write: bool,
     pub interactive_approvals: bool,
+    pub processes: Arc<phi_core::process::ShellSessions>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -50,10 +54,17 @@ pub enum RuntimeEvent {
         content: String,
     },
     ToolStarted {
+        call_id: String,
         name: String,
         arguments: serde_json::Value,
     },
+    ToolOutput {
+        call_id: String,
+        name: String,
+        content: String,
+    },
     ToolCompleted {
+        call_id: String,
         name: String,
         result: serde_json::Value,
     },
@@ -92,6 +103,7 @@ pub struct CommandCatalog {
 pub struct CommandExecution {
     pub session_id: String,
     pub content: String,
+    pub role: String,
     pub catalog: CommandCatalog,
 }
 
@@ -101,7 +113,7 @@ impl Handle {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Config {
     allowed_programs: HashSet<String>,
     allowed_http_origins: HashSet<String>,
@@ -155,6 +167,7 @@ const OPENAI_WEB_SEARCH_PLUGIN: &str = include_str!("../../../policy/tools/opena
 const OPENROUTER_WEB_SEARCH_PLUGIN: &str =
     include_str!("../../../policy/tools/openrouter-web-search.scm");
 const SKILLS_PLUGIN: &str = include_str!("../../../policy/tools/skills.scm");
+const CODEX_PATCH_PLUGIN: &str = include_str!("../../../policy/tools/codex-patch.scm");
 const PROMPT_PLUGIN: &str = include_str!("../../../policy/prompts/simple.scm");
 const COMPACTION_PLUGIN: &str = include_str!("../../../policy/compaction/simple.scm");
 
@@ -194,6 +207,7 @@ pub fn initialize_at(home: &phi_core::home::PhiHome) -> Result<()> {
         OPENROUTER_WEB_SEARCH_PLUGIN,
     )?;
     write_builtin(&builtins, "skills", SKILLS_PLUGIN)?;
+    write_builtin(&builtins, "codex-patch", CODEX_PATCH_PLUGIN)?;
     write_builtin(&builtins, "simple-prompt", PROMPT_PLUGIN)?;
     write_builtin(&builtins, "simple-compaction", COMPACTION_PLUGIN)?;
     Ok(())
@@ -393,8 +407,24 @@ pub fn execute_command(
         saved_state,
     )?;
     let initial_catalog = catalog(&mut policy)?;
+    let role = if invocation.name == "ps" {
+        "processes"
+    } else {
+        "note"
+    };
     let content = match invocation.name.as_str() {
         "help" => help(&initial_catalog),
+        "ps" => process_list(&options.processes, &workspace)?,
+        "stop" => {
+            if !invocation.arguments.is_empty() {
+                bail!("usage: /stop");
+            }
+            let stopped = options.processes.stop_all();
+            format!(
+                "Stopped {stopped} background process{}.",
+                if stopped == 1 { "" } else { "es" }
+            )
+        }
         "model" => model_command(
             &home,
             &session,
@@ -411,14 +441,14 @@ pub fn execute_command(
             if command.source == "core" {
                 bail!("unsupported core command: /{name}");
             }
-            let content = policy.run_command(name, &invocation.arguments)?;
-            session.save_state(policy.state())?;
-            content
+            policy.run_command(name, &invocation.arguments)?
         }
     };
+    session.save_state(policy.state())?;
     Ok(CommandExecution {
         session_id: session.id().into(),
         content,
+        role: role.into(),
         catalog: catalog(&mut policy)?,
     })
 }
@@ -435,6 +465,18 @@ fn catalog(policy: &mut phi_steel::Policy) -> Result<CommandCatalog> {
             name: "model".into(),
             usage: "/model".into(),
             description: "Show or select model settings.".into(),
+            source: "core".into(),
+        },
+        CommandSpec {
+            name: "ps".into(),
+            usage: "/ps".into(),
+            description: "Show managed background processes.".into(),
+            source: "core".into(),
+        },
+        CommandSpec {
+            name: "stop".into(),
+            usage: "/stop".into(),
+            description: "Stop all background processes.".into(),
             source: "core".into(),
         },
     ];
@@ -519,6 +561,53 @@ fn help(catalog: &CommandCatalog) -> String {
         .map(|command| format!("{:<20} {}", command.usage, command.description))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn process_list(processes: &phi_core::process::ShellSessions, workspace: &Path) -> Result<String> {
+    let processes = processes.list()?;
+    if processes.is_empty() {
+        return Ok("## Background processes\n\nNo background processes.".into());
+    }
+    let items = processes
+        .into_iter()
+        .map(|process| {
+            let workdir = Path::new(&process.workdir)
+                .strip_prefix(workspace)
+                .unwrap_or_else(|_| Path::new(&process.workdir));
+            let workdir = if workdir.as_os_str().is_empty() {
+                ".".into()
+            } else {
+                workdir.display().to_string()
+            };
+            let status = if process.status == "running" {
+                format!("Running for {}", format_elapsed(process.elapsed_ms))
+            } else if let Some(code) = process.exit_code {
+                format!("Finished · exit {code}")
+            } else {
+                "Finished".into()
+            };
+            let workdir = if workdir == "." {
+                String::new()
+            } else {
+                format!(" · `{workdir}`")
+            };
+            format!(
+                "• **{status}**{workdir}\n\n```bash\n{}\n```",
+                process.command
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    Ok(format!("## Background processes\n\n{items}"))
+}
+
+fn format_elapsed(milliseconds: u64) -> String {
+    let seconds = milliseconds / 1_000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    }
 }
 
 fn model_command(
@@ -609,7 +698,10 @@ fn policy_config(
     skills: &[phi_core::skill::SkillSpec],
 ) -> String {
     let mut tools = capabilities.specs();
-    tools.push(phi_core::capability::shell_spec());
+    tools.push(phi_core::capability::exec_command_spec());
+    tools.push(phi_core::capability::list_processes_spec());
+    tools.push(phi_core::capability::terminate_process_spec());
+    tools.push(phi_core::capability::write_stdin_spec());
     tools.sort_by(|left, right| left.name.cmp(&right.name));
     let mut value = serde_json::json!({
         "session_id": session_id,
@@ -630,7 +722,6 @@ fn capabilities(
 ) -> phi_core::capability::Registry {
     let mut capabilities = phi_core::capability::Registry::default();
     capabilities.register(phi_core::capability::ReadFile);
-    capabilities.register(phi_core::capability::ReplaceFile);
     capabilities.register_hidden(phi_core::skill::LoadSkill {
         personal_root: home.skills(),
     });
@@ -695,7 +786,7 @@ async fn run(
             (session, sources, None)
         }
     };
-    let capabilities = capabilities(&sources, &home);
+    let capabilities = Arc::new(capabilities(&sources, &home));
     let skills = phi_core::skill::discover(&home.skills(), &workspace)?;
     send(
         events,
@@ -721,12 +812,9 @@ async fn run(
         ),
         saved_state,
     )?;
+    let file_editor_tool = policy.file_editor_tool_name()?;
     let selected_model = state_string(policy.state(), "model")?;
     let tool_routes = policy.resolved_tool_routes(&selected_model)?;
-    let tool_capabilities = tool_routes
-        .iter()
-        .map(|route| (route.implementation.clone(), route.capability.clone()))
-        .collect::<BTreeMap<_, _>>();
     for route in tool_routes {
         send(
             events,
@@ -738,11 +826,11 @@ async fn run(
     }
     let mut event = Event::UserMessage { content: prompt };
     let mut activity = "ready".to_owned();
-    let mut callable_tool = None;
     let permissions = phi_core::permissions::Permissions {
         allow_shell: options.allow_shell,
         allow_write: options.allow_write,
     };
+    let shell_sessions = Arc::clone(&options.processes);
 
     for _ in 0..16 {
         if cancellation.is_cancelled() {
@@ -755,32 +843,6 @@ async fn run(
         send_context(events, policy.state())?;
         let next_activity = state_activity(policy.state())?;
         if next_activity != activity {
-            if activity == "searching"
-                && let Some(name) = callable_tool.take()
-            {
-                send(
-                    events,
-                    RuntimeEvent::ToolCompleted {
-                        name,
-                        result: serde_json::json!({}),
-                    },
-                )?;
-            }
-            if next_activity == "searching" {
-                let implementation = state_string(policy.state(), "pending_tool")?;
-                let name = tool_capabilities
-                    .get(&implementation)
-                    .cloned()
-                    .unwrap_or(implementation);
-                send(
-                    events,
-                    RuntimeEvent::ToolStarted {
-                        name: name.clone(),
-                        arguments: serde_json::json!({}),
-                    },
-                )?;
-                callable_tool = Some(name);
-            }
             send(
                 events,
                 RuntimeEvent::ActivityChanged {
@@ -815,52 +877,26 @@ async fn run(
                 )
                 .await??;
             }
-            Effect::RunTool { name, arguments } => {
-                send(
+            Effect::RunTools { calls } => {
+                let executor = ToolBatchExecutor {
+                    workspace: &workspace,
+                    capabilities: Arc::clone(&capabilities),
+                    config: Arc::new(config.clone()),
+                    file_editor_tool: &file_editor_tool,
                     events,
-                    RuntimeEvent::ToolStarted {
-                        name: name.clone(),
-                        arguments: arguments.clone(),
-                    },
-                )?;
-                let approved = match permissions.authorize_tool(&name) {
-                    Ok(()) => true,
-                    Err(_) if options.interactive_approvals => {
-                        send(
-                            events,
-                            RuntimeEvent::ApprovalRequested { name: name.clone() },
-                        )?;
-                        matches!(
-                            cancellable(cancellation, commands.recv()).await?,
-                            Some(RuntimeCommand::ApproveOnce)
-                        )
-                    }
-                    Err(_) => false,
+                    cancellation,
                 };
-                let result = if !approved {
-                    serde_json::json!({ "error": format!("{name} approval denied") })
-                } else if name == "shell" {
-                    cancellable(
-                        cancellation,
-                        run_shell_tool(&workspace, &config.allowed_programs, &arguments),
-                    )
-                    .await
-                    .and_then(|result| result)
-                    .and_then(|event| serde_json::to_value(event).map_err(Into::into))
-                    .unwrap_or_else(|error| serde_json::json!({ "error": error.to_string() }))
-                } else {
-                    capabilities
-                        .execute(&workspace, &name, arguments)
-                        .unwrap_or_else(|error| serde_json::json!({ "error": error.to_string() }))
-                };
-                send(
-                    events,
-                    RuntimeEvent::ToolCompleted {
-                        name: name.clone(),
-                        result: result.clone(),
-                    },
-                )?;
-                event = Event::ToolCompleted { name, result };
+                let results = execute_tool_calls(
+                    calls,
+                    &executor,
+                    &permissions,
+                    options.interactive_approvals,
+                    &mut commands,
+                    &mut policy,
+                    &shell_sessions,
+                )
+                .await?;
+                event = Event::ToolsCompleted { results };
             }
             Effect::HttpRequest {
                 url,
@@ -882,7 +918,9 @@ async fn run(
                     },
                     |provider_event| {
                         if stream_output {
-                            emit_stream_events(events, provider_event, &stream);
+                            emit_stream_events(events, provider_event, &stream)
+                        } else {
+                            false
                         }
                     },
                 );
@@ -897,11 +935,405 @@ async fn run(
     bail!("effect limit reached")
 }
 
+struct PendingToolCall {
+    index: usize,
+    call: ToolCall,
+}
+
+struct RawToolResult {
+    index: usize,
+    call_id: String,
+    name: String,
+    result: RawToolOutput,
+}
+
+enum RawToolOutput {
+    Value {
+        result: serde_json::Value,
+        display: Option<serde_json::Value>,
+    },
+    Http {
+        implementation: String,
+        event: Event,
+    },
+}
+
+struct ToolBatchExecutor<'a> {
+    workspace: &'a Path,
+    capabilities: Arc<phi_core::capability::Registry>,
+    config: Arc<Config>,
+    file_editor_tool: &'a str,
+    events: &'a mpsc::UnboundedSender<RuntimeEvent>,
+    cancellation: &'a CancellationToken,
+}
+
+async fn execute_tool_calls(
+    calls: Vec<ToolCall>,
+    executor: &ToolBatchExecutor<'_>,
+    permissions: &phi_core::permissions::Permissions,
+    interactive_approvals: bool,
+    commands: &mut mpsc::UnboundedReceiver<RuntimeCommand>,
+    policy: &mut phi_steel::Policy,
+    shell_sessions: &Arc<phi_core::process::ShellSessions>,
+) -> Result<Vec<ToolResult>> {
+    let mut completed = Vec::new();
+    let mut parallel = Vec::new();
+    for (index, call) in calls.into_iter().enumerate() {
+        let parallel_safe =
+            tool_call_parallel_safe(&call, &executor.capabilities, executor.file_editor_tool);
+        if !parallel_safe {
+            flush_parallel_calls(
+                executor,
+                &mut parallel,
+                policy,
+                &mut completed,
+                shell_sessions,
+            )
+            .await?;
+        }
+        send(
+            executor.events,
+            RuntimeEvent::ToolStarted {
+                call_id: call.call_id.clone(),
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+            },
+        )?;
+        let approved = match permissions.authorize_tool(&call.name) {
+            Ok(()) => true,
+            Err(_) if interactive_approvals => {
+                send(
+                    executor.events,
+                    RuntimeEvent::ApprovalRequested {
+                        name: call.name.clone(),
+                    },
+                )?;
+                matches!(
+                    cancellable(executor.cancellation, commands.recv()).await?,
+                    Some(RuntimeCommand::ApproveOnce)
+                )
+            }
+            Err(_) => false,
+        };
+        if approved {
+            let pending = PendingToolCall { index, call };
+            if parallel_safe {
+                parallel.push(pending);
+            } else {
+                let raw = execute_serial_call(executor, pending, policy, shell_sessions).await;
+                finish_tool_call(raw, policy, executor.events, &mut completed)?;
+            }
+        } else {
+            let result = serde_json::json!({
+                "error": format!("{} approval denied", call.name)
+            });
+            send(
+                executor.events,
+                RuntimeEvent::ToolCompleted {
+                    call_id: call.call_id.clone(),
+                    name: call.name.clone(),
+                    result: result.clone(),
+                },
+            )?;
+            completed.push((
+                index,
+                ToolResult {
+                    call_id: call.call_id,
+                    name: call.name,
+                    result,
+                },
+            ));
+        }
+    }
+    flush_parallel_calls(
+        executor,
+        &mut parallel,
+        policy,
+        &mut completed,
+        shell_sessions,
+    )
+    .await?;
+    completed.sort_by_key(|(index, _)| *index);
+    Ok(completed.into_iter().map(|(_, result)| result).collect())
+}
+
+fn tool_call_parallel_safe(
+    call: &ToolCall,
+    capabilities: &phi_core::capability::Registry,
+    file_editor_tool: &str,
+) -> bool {
+    match &call.execution {
+        ToolExecution::Http { parallel, .. } => *parallel,
+        ToolExecution::Direct => {
+            call.name == "exec_command"
+                || (call.name != "write_stdin"
+                    && call.name != "list_processes"
+                    && call.name != file_editor_tool
+                    && capabilities.parallel_safe(&call.name))
+        }
+    }
+}
+
+async fn flush_parallel_calls(
+    executor: &ToolBatchExecutor<'_>,
+    calls: &mut Vec<PendingToolCall>,
+    policy: &mut phi_steel::Policy,
+    completed: &mut Vec<(usize, ToolResult)>,
+    shell_sessions: &Arc<phi_core::process::ShellSessions>,
+) -> Result<()> {
+    let mut tasks = tokio::task::JoinSet::new();
+    for call in calls.drain(..) {
+        let workspace = executor.workspace.to_owned();
+        let capabilities = Arc::clone(&executor.capabilities);
+        let config = Arc::clone(&executor.config);
+        let shell_sessions = Arc::clone(shell_sessions);
+        let events = executor.events.clone();
+        tasks.spawn_local(async move {
+            execute_parallel_call(
+                call,
+                workspace,
+                capabilities,
+                config,
+                shell_sessions,
+                events,
+            )
+            .await
+        });
+    }
+    while !tasks.is_empty() {
+        let raw = cancellable(executor.cancellation, tasks.join_next())
+            .await?
+            .context("parallel tool task missing")?
+            .context("parallel tool task failed")?;
+        finish_tool_call(raw, policy, executor.events, completed)?;
+    }
+    Ok(())
+}
+
+async fn execute_parallel_call(
+    pending: PendingToolCall,
+    workspace: PathBuf,
+    capabilities: Arc<phi_core::capability::Registry>,
+    config: Arc<Config>,
+    shell_sessions: Arc<phi_core::process::ShellSessions>,
+    events: mpsc::UnboundedSender<RuntimeEvent>,
+) -> RawToolResult {
+    let PendingToolCall { index, call } = pending;
+    let ToolCall {
+        call_id,
+        name,
+        arguments,
+        execution,
+    } = call;
+    if name == "exec_command" {
+        let event_name = name.clone();
+        let event_call_id = call_id.clone();
+        let result = shell_sessions
+            .exec(&workspace, &arguments, move |content| {
+                let _ = events.send(RuntimeEvent::ToolOutput {
+                    call_id: event_call_id.clone(),
+                    name: event_name.clone(),
+                    content: content.to_owned(),
+                });
+            })
+            .await
+            .unwrap_or_else(|error| serde_json::json!({ "error": error.to_string() }));
+        return RawToolResult {
+            index,
+            call_id,
+            name,
+            result: RawToolOutput::Value {
+                result,
+                display: None,
+            },
+        };
+    }
+    let result = match execution {
+        ToolExecution::Direct => {
+            let tool_name = name.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                capabilities.execute(&workspace, &tool_name, arguments)
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!(error))
+            .and_then(|result| result)
+            .unwrap_or_else(|error| serde_json::json!({ "error": error.to_string() }));
+            RawToolOutput::Value {
+                result,
+                display: None,
+            }
+        }
+        ToolExecution::Http {
+            implementation,
+            url,
+            secret,
+            headers,
+            body,
+            timeout_ms,
+            ..
+        } => {
+            let event = phi_core::http::post_sse(
+                phi_core::http::SseRequest {
+                    allowed_origins: &config.allowed_http_origins,
+                    secrets: &config.secrets,
+                    url: &url,
+                    secret_name: &secret,
+                    headers: &headers,
+                    body,
+                    timeout_ms,
+                },
+                |_| false,
+            )
+            .await
+            .unwrap_or_else(|error| Event::HttpCompleted {
+                success: false,
+                status: 0,
+                events: Vec::new(),
+                error: error.to_string(),
+            });
+            RawToolOutput::Http {
+                implementation,
+                event,
+            }
+        }
+    };
+    RawToolResult {
+        index,
+        call_id,
+        name,
+        result,
+    }
+}
+
+async fn execute_serial_call(
+    executor: &ToolBatchExecutor<'_>,
+    pending: PendingToolCall,
+    policy: &mut phi_steel::Policy,
+    shell_sessions: &Arc<phi_core::process::ShellSessions>,
+) -> RawToolResult {
+    let index = pending.index;
+    let call = pending.call;
+    if matches!(
+        call.name.as_str(),
+        "exec_command" | "write_stdin" | "list_processes" | "terminate_process"
+    ) {
+        let name = call.name.clone();
+        let call_id = call.call_id.clone();
+        let events = executor.events.clone();
+        let result = cancellable(executor.cancellation, async {
+            let emit = move |content: &str| {
+                let _ = events.send(RuntimeEvent::ToolOutput {
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    content: content.to_owned(),
+                });
+            };
+            if call.name == "exec_command" {
+                shell_sessions
+                    .exec(executor.workspace, &call.arguments, emit)
+                    .await
+            } else if call.name == "write_stdin" {
+                shell_sessions.write_stdin(&call.arguments, emit).await
+            } else if call.name == "terminate_process" {
+                shell_sessions.terminate(&call.arguments).await
+            } else {
+                shell_sessions
+                    .list()
+                    .map(|processes| serde_json::json!({ "processes": processes }))
+            }
+        })
+        .await
+        .and_then(|result| result)
+        .unwrap_or_else(|error| serde_json::json!({ "error": error.to_string() }));
+        return RawToolResult {
+            index,
+            call_id: call.call_id,
+            name: call.name,
+            result: RawToolOutput::Value {
+                result,
+                display: None,
+            },
+        };
+    }
+    if call.name == executor.file_editor_tool {
+        let (result, display) =
+            execute_file_edit(executor.workspace, policy, &call.name, &call.arguments)
+                .map(|(result, display)| (result, Some(display)))
+                .unwrap_or_else(|error| (serde_json::json!({ "error": error.to_string() }), None));
+        return RawToolResult {
+            index,
+            call_id: call.call_id,
+            name: call.name,
+            result: RawToolOutput::Value { result, display },
+        };
+    }
+    execute_parallel_call(
+        PendingToolCall { index, call },
+        executor.workspace.to_owned(),
+        Arc::clone(&executor.capabilities),
+        Arc::clone(&executor.config),
+        Arc::clone(shell_sessions),
+        executor.events.clone(),
+    )
+    .await
+}
+
+fn finish_tool_call(
+    raw: RawToolResult,
+    policy: &mut phi_steel::Policy,
+    events: &mpsc::UnboundedSender<RuntimeEvent>,
+    completed: &mut Vec<(usize, ToolResult)>,
+) -> Result<()> {
+    let (result, display) = match raw.result {
+        RawToolOutput::Value { result, display } => (result, display),
+        RawToolOutput::Http {
+            implementation,
+            event:
+                Event::HttpCompleted {
+                    success: true,
+                    events,
+                    ..
+                },
+        } => (
+            policy
+                .complete_callable_tool(&implementation, &events)
+                .unwrap_or_else(|error| serde_json::json!({ "error": error.to_string() })),
+            None,
+        ),
+        RawToolOutput::Http {
+            event: Event::HttpCompleted { error, .. },
+            ..
+        } => (serde_json::json!({ "error": error }), None),
+        RawToolOutput::Http { .. } => (
+            serde_json::json!({ "error": "invalid HTTP tool result" }),
+            None,
+        ),
+    };
+    send(
+        events,
+        RuntimeEvent::ToolCompleted {
+            call_id: raw.call_id.clone(),
+            name: raw.name.clone(),
+            result: display.unwrap_or_else(|| result.clone()),
+        },
+    )?;
+    completed.push((
+        raw.index,
+        ToolResult {
+            call_id: raw.call_id,
+            name: raw.name,
+            result,
+        },
+    ));
+    Ok(())
+}
+
 fn emit_stream_events(
     events: &mpsc::UnboundedSender<RuntimeEvent>,
     provider_event: &serde_json::Value,
     rules: &[StreamRule],
-) {
+) -> bool {
+    let mut emitted = false;
     for rule in rules {
         if !rule
             .matches
@@ -919,10 +1351,12 @@ fn emit_stream_events(
                 content: content.into(),
             }),
             "tool_started" => Some(RuntimeEvent::ToolStarted {
+                call_id: String::new(),
                 name: rule.name.clone(),
                 arguments: value,
             }),
             "tool_completed" => Some(RuntimeEvent::ToolCompleted {
+                call_id: String::new(),
                 name: rule.name.clone(),
                 result: value,
             }),
@@ -930,8 +1364,10 @@ fn emit_stream_events(
         };
         if let Some(event) = event {
             let _ = events.send(event);
+            emitted = true;
         }
     }
+    emitted
 }
 
 async fn cancellable<T>(
@@ -990,42 +1426,151 @@ fn load_config(path: &Path) -> Result<Config> {
     serde_json::from_slice(&std::fs::read(path)?).context("read config")
 }
 
-async fn run_shell_tool(
+fn execute_file_edit(
     workspace: &Path,
-    allowed: &HashSet<String>,
+    policy: &mut phi_steel::Policy,
+    name: &str,
     arguments: &serde_json::Value,
-) -> Result<Event> {
-    let program = arguments
-        .get("program")
-        .and_then(serde_json::Value::as_str)
-        .context("shell requires program")?;
-    let args = arguments
-        .get("args")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default()
+) -> Result<(serde_json::Value, serde_json::Value)> {
+    let preparation: phi_core::file_edit::EditPreparation =
+        serde_json::from_value(policy.prepare_file_edit(name, arguments)?)?;
+    let snapshots = phi_core::file_edit::snapshots(workspace, &preparation.targets)?;
+    let changes: Vec<phi_core::file_edit::FileChange> = serde_json::from_value(
+        policy.propose_file_edit(name, &preparation.plan, &serde_json::to_value(&snapshots)?)?,
+    )?;
+    let summaries = changes.iter().map(file_change_summary).collect::<Vec<_>>();
+    let display = changes
         .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .map(str::to_owned)
-                .context("shell args must be strings")
-        })
+        .map(|change| file_change_display(change, &snapshots))
         .collect::<Result<Vec<_>>>()?;
-    let stdin = arguments
-        .get("stdin")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    let timeout_ms = arguments
-        .get("timeout_ms")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(30_000);
-    phi_core::process::run(workspace, allowed, program, &args, stdin, timeout_ms).await
+    phi_core::file_edit::apply(workspace, &snapshots, &changes)?;
+    Ok((
+        serde_json::json!({ "changes": summaries }),
+        serde_json::json!({ "changes": display }),
+    ))
+}
+
+fn file_change_summary(change: &phi_core::file_edit::FileChange) -> serde_json::Value {
+    match change {
+        phi_core::file_edit::FileChange::Create { path, .. } => {
+            serde_json::json!({ "operation": "create", "path": path })
+        }
+        phi_core::file_edit::FileChange::Replace { path, .. } => {
+            serde_json::json!({ "operation": "replace", "path": path })
+        }
+        phi_core::file_edit::FileChange::Delete { path } => {
+            serde_json::json!({ "operation": "delete", "path": path })
+        }
+        phi_core::file_edit::FileChange::Move {
+            path, destination, ..
+        } => serde_json::json!({
+            "operation": "move",
+            "path": path,
+            "destination": destination
+        }),
+    }
+}
+
+fn file_change_display(
+    change: &phi_core::file_edit::FileChange,
+    snapshots: &[phi_core::file_edit::FileSnapshot],
+) -> Result<serde_json::Value> {
+    let mut summary = file_change_summary(change);
+    let (old_path, new_path, old, new) = match change {
+        phi_core::file_edit::FileChange::Create { path, content } => {
+            ("/dev/null", path.as_str(), "", content.as_str())
+        }
+        phi_core::file_edit::FileChange::Replace { path, content } => (
+            path.as_str(),
+            path.as_str(),
+            snapshot_content(snapshots, path)?,
+            content.as_str(),
+        ),
+        phi_core::file_edit::FileChange::Delete { path } => (
+            path.as_str(),
+            "/dev/null",
+            snapshot_content(snapshots, path)?,
+            "",
+        ),
+        phi_core::file_edit::FileChange::Move {
+            path,
+            destination,
+            content,
+        } => (
+            path.as_str(),
+            destination.as_str(),
+            snapshot_content(snapshots, path)?,
+            content.as_str(),
+        ),
+    };
+    summary["diff"] = TextDiff::from_lines(old, new)
+        .unified_diff()
+        .context_radius(1)
+        .header(old_path, new_path)
+        .to_string()
+        .into();
+    Ok(summary)
+}
+
+fn snapshot_content<'a>(
+    snapshots: &'a [phi_core::file_edit::FileSnapshot],
+    path: &str,
+) -> Result<&'a str> {
+    snapshots
+        .iter()
+        .find(|snapshot| snapshot.path == path)
+        .map(|snapshot| snapshot.content.as_str())
+        .with_context(|| format!("missing file snapshot: {path}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        sync::{Condvar, Mutex},
+        time::Duration,
+    };
+
+    struct ConcurrentTool {
+        gate: Arc<(Mutex<usize>, Condvar)>,
+    }
+
+    impl phi_core::capability::Tool for ConcurrentTool {
+        fn spec(&self) -> phi_protocol::ToolSpec {
+            phi_protocol::ToolSpec {
+                name: "concurrent_test".into(),
+                description: String::new(),
+                parameters: serde_json::json!({ "type": "object" }),
+            }
+        }
+
+        fn execute(
+            &self,
+            _workspace: &Path,
+            arguments: serde_json::Value,
+        ) -> Result<serde_json::Value> {
+            let (lock, ready) = &*self.gate;
+            let mut count = lock.lock().unwrap();
+            *count += 1;
+            ready.notify_all();
+            while *count < 2 {
+                let (next, timeout) = ready.wait_timeout(count, Duration::from_secs(1)).unwrap();
+                count = next;
+                if timeout.timed_out() {
+                    bail!("tool calls did not overlap");
+                }
+            }
+            let id = arguments["id"].as_str().unwrap();
+            if id == "first" {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(serde_json::json!({ "concurrent": true, "id": id }))
+        }
+
+        fn parallel_safe(&self) -> bool {
+            true
+        }
+    }
 
     fn options() -> (tempfile::TempDir, RunOptions) {
         let workspace = tempfile::tempdir().unwrap();
@@ -1040,6 +1585,7 @@ mod tests {
             allow_shell: false,
             allow_write: false,
             interactive_approvals: false,
+            processes: Arc::new(phi_core::process::ShellSessions::default()),
         };
         (workspace, options)
     }
@@ -1054,7 +1600,83 @@ mod tests {
                 .iter()
                 .any(|command| command.name == "model")
         );
+        assert!(catalog.commands.iter().any(|command| command.name == "ps"));
+        assert!(
+            catalog
+                .commands
+                .iter()
+                .any(|command| command.name == "stop")
+        );
         assert_eq!(catalog.models[0].id, "openai/gpt-5.6-luna");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_commands_use_the_shared_registry() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (workspace, mut options) = options();
+                std::fs::create_dir(workspace.path().join("nested")).unwrap();
+                options
+                    .processes
+                    .exec(
+                        workspace.path(),
+                        &serde_json::json!({
+                            "cmd": "trap 'printf stopped > stop-marker; exit 0' INT; printf ready; : > armed; sleep 10",
+                            "yield_time_ms": 250
+                        }),
+                        |_| {},
+                    )
+                    .await
+                    .unwrap();
+                options
+                    .processes
+                    .exec(
+                        workspace.path(),
+                        &serde_json::json!({
+                            "cmd": "sleep 10",
+                            "workdir": "nested",
+                            "yield_time_ms": 0
+                        }),
+                        |_| {},
+                    )
+                    .await
+                    .unwrap();
+                let listed = execute_command(
+                    &options,
+                    &CommandInvocation {
+                        name: "ps".into(),
+                        arguments: String::new(),
+                    },
+                )
+                .unwrap();
+                assert_eq!(listed.role, "processes");
+                assert!(listed.content.starts_with("## Background processes"));
+                assert!(listed.content.contains("\n\n• **Running for"));
+                assert!(listed.content.contains("Running for"));
+                assert!(!listed.content.contains("session 1"));
+                assert!(listed.content.contains("printf ready"));
+                assert!(listed.content.contains("`nested`"));
+                assert!(!listed.content.contains("cwd"));
+                assert!(!listed.content.contains("`.`"));
+                assert_eq!(listed.content.matches("ready").count(), 1);
+                options.session_id = Some(listed.session_id);
+
+                let stopped = execute_command(
+                    &options,
+                    &CommandInvocation {
+                        name: "stop".into(),
+                        arguments: String::new(),
+                    },
+                )
+                .unwrap();
+                assert_eq!(stopped.content, "Stopped 2 background processes.");
+                assert!(options.processes.list().unwrap().is_empty());
+                assert_eq!(
+                    std::fs::read_to_string(workspace.path().join("stop-marker")).unwrap(),
+                    "stopped"
+                );
+            })
+            .await;
     }
 
     #[test]
@@ -1194,12 +1816,25 @@ mod tests {
                     && body["service_tier"] == "priority"
                     && body["prompt_cache_key"] == execution.session_id
                     && headers["session_id"] == execution.session_id
-                    && body["tools"].as_array().unwrap().len() == 5
-                    && body["tools"][0]["name"] == "read_file"
+                    && body["tools"].as_array().unwrap().len() == 8
+                    && body["tools"].as_array().unwrap().iter()
+                        .any(|tool| tool["name"] == "read_file")
+                    && body["tools"].as_array().unwrap().iter()
+                        .any(|tool| tool["name"] == "exec_command")
+                    && body["tools"].as_array().unwrap().iter()
+                        .any(|tool| tool["name"] == "write_stdin")
+                    && body["tools"].as_array().unwrap().iter()
+                        .any(|tool| tool["name"] == "list_processes")
+                    && body["tools"].as_array().unwrap().iter()
+                        .any(|tool| tool["name"] == "terminate_process")
+                    && body["tools"].as_array().unwrap().iter()
+                        .any(|tool| tool["name"] == "patch")
+                    && !body["tools"].as_array().unwrap().iter()
+                        .any(|tool| tool["name"] == "replace_file")
                     && body["tools"].as_array().unwrap().iter()
                         .any(|tool| tool["type"] == "web_search")
                     && body["instructions"]
-                        .as_str().unwrap().contains("Answer ordinary requests")
+                        .as_str().unwrap().contains("running inside a Phi harness")
         ));
     }
 
@@ -1207,6 +1842,153 @@ mod tests {
     fn reads_provider_reported_token_counts() {
         assert_eq!(number_u64(&serde_json::json!(378.0)), Some(378));
         assert_eq!(number_u64(&serde_json::Value::Null), None);
+    }
+
+    #[test]
+    fn selected_steel_editor_applies_a_patch_through_rust_core() {
+        let (workspace, options) = options();
+        std::fs::create_dir(workspace.path().join("src")).unwrap();
+        std::fs::write(
+            workspace.path().join("src/main.rs"),
+            "fn main() {\n    old();\n}\n",
+        )
+        .unwrap();
+        std::fs::write(workspace.path().join("src/old.rs"), "remove me\n").unwrap();
+        std::fs::write(workspace.path().join("src/move.rs"), "pub fn before() {}\n").unwrap();
+        let home = home_for_config(&options.config_path).unwrap();
+        let sources = resolve_sources(&home, workspace.path()).unwrap();
+        let capabilities = capabilities(&sources, &home);
+        let mut policy = phi_steel::Policy::load_with_state(
+            &sources.policy,
+            &entrypoints(&sources),
+            &sources.main,
+            &policy_config(&capabilities, "test", &load_user_state(&home).unwrap(), &[]),
+            None,
+        )
+        .unwrap();
+
+        let (result, display) = execute_file_edit(
+            workspace.path(),
+            &mut policy,
+            "patch",
+            &serde_json::json!({
+                "patch": concat!(
+                    "*** Begin Patch\n",
+                    "*** Update File: src/main.rs\n",
+                    "@@ fn main() {\n",
+                    "-    old();\n",
+                    "+    new();\n",
+                    "*** Add File: src/lib.rs\n",
+                    "+pub fn added() {}\n",
+                    "*** Delete File: src/old.rs\n",
+                    "*** Update File: src/move.rs\n",
+                    "*** Move to: src/moved.rs\n",
+                    "@@\n",
+                    "-pub fn before() {}\n",
+                    "+pub fn after() {}\n",
+                    "*** End Patch\n"
+                )
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(result["changes"].as_array().unwrap().len(), 4);
+        assert!(result["changes"][0].get("diff").is_none());
+        assert!(
+            display["changes"][0]["diff"]
+                .as_str()
+                .unwrap()
+                .contains("-    old();\n+    new();")
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("src/main.rs")).unwrap(),
+            "fn main() {\n    new();\n}\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("src/lib.rs")).unwrap(),
+            "pub fn added() {}\n"
+        );
+        assert!(!workspace.path().join("src/old.rs").exists());
+        assert!(!workspace.path().join("src/move.rs").exists());
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("src/moved.rs")).unwrap(),
+            "pub fn after() {}\n"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn executes_parallel_safe_calls_concurrently() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (workspace, options) = options();
+                let home = home_for_config(&options.config_path).unwrap();
+                let sources = resolve_sources(&home, workspace.path()).unwrap();
+                let mut policy = phi_steel::Policy::load_with_state(
+                    &sources.policy,
+                    &entrypoints(&sources),
+                    &sources.main,
+                    &policy_config(
+                        &capabilities(&sources, &home),
+                        "test",
+                        &load_user_state(&home).unwrap(),
+                        &[],
+                    ),
+                    None,
+                )
+                .unwrap();
+                let gate = Arc::new((Mutex::new(0), Condvar::new()));
+                let mut registry = phi_core::capability::Registry::default();
+                registry.register(ConcurrentTool { gate });
+                let registry = Arc::new(registry);
+                let config = Arc::new(Config {
+                    allowed_programs: HashSet::new(),
+                    allowed_http_origins: HashSet::new(),
+                    secrets: BTreeMap::new(),
+                });
+                let (event_tx, _event_rx) = mpsc::unbounded_channel();
+                let (_command_tx, mut command_rx) = mpsc::unbounded_channel();
+                let calls = ["first", "second"]
+                    .into_iter()
+                    .map(|call_id| ToolCall {
+                        call_id: call_id.into(),
+                        name: "concurrent_test".into(),
+                        arguments: serde_json::json!({ "id": call_id }),
+                        execution: ToolExecution::Direct,
+                    })
+                    .collect();
+                let cancellation = CancellationToken::new();
+                let executor = ToolBatchExecutor {
+                    workspace: workspace.path(),
+                    capabilities: registry,
+                    config,
+                    file_editor_tool: "patch",
+                    events: &event_tx,
+                    cancellation: &cancellation,
+                };
+                let results = execute_tool_calls(
+                    calls,
+                    &executor,
+                    &phi_core::permissions::Permissions {
+                        allow_shell: true,
+                        allow_write: true,
+                    },
+                    false,
+                    &mut command_rx,
+                    &mut policy,
+                    &Arc::new(phi_core::process::ShellSessions::default()),
+                )
+                .await
+                .unwrap();
+                assert_eq!(results.len(), 2);
+                assert_eq!(results[0].call_id, "first");
+                assert_eq!(results[1].call_id, "second");
+                assert!(
+                    results
+                        .iter()
+                        .all(|result| result.result["concurrent"] == true)
+                );
+            })
+            .await;
     }
 
     #[test]

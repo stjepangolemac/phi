@@ -11,6 +11,7 @@ phi-protocol = { path = "../phi-protocol" }
 phi-steel = { path = "../phi-steel" }
 serde.workspace = true
 serde_json.workspace = true
+similar.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 

@@ -39,5 +39,5 @@
   openai-web-search-wire)
 
 (register-callable-tool!
-  "openai/callable-web-search" "web_search" web-search-spec
+  "openai/callable-web-search" "web_search" #t web-search-spec
   start-openai-web-search complete-openai-web-search)

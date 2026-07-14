@@ -4,10 +4,12 @@
 (load-plugin! "openai-web-search")
 (load-plugin! "openrouter-web-search")
 (load-plugin! "skills")
+(load-plugin! "codex-patch")
 (load-plugin! "simple-prompt")
 (load-plugin! "simple-compaction")
 
 (select-prompt-builder! "simple")
+(select-file-editor! "codex-patch")
 (configure-tool! "openai/hosted-web-search" (hash))
 (configure-tool!
   "openai/callable-web-search"

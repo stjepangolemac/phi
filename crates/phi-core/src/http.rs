@@ -40,7 +40,7 @@ pub struct SseRequest<'a> {
 
 pub async fn post_sse<F>(request: SseRequest<'_>, mut on_event: F) -> Result<Event>
 where
-    F: FnMut(&Value),
+    F: FnMut(&Value) -> bool,
 {
     let SseRequest {
         allowed_origins,
@@ -57,7 +57,8 @@ where
         bail!("HTTP origin is not allowed: {origin}");
     }
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(timeout_ms))
+        .connect_timeout(Duration::from_millis(timeout_ms))
+        .read_timeout(Duration::from_millis(timeout_ms))
         .build()?;
     let secret = secrets.get(secret_name).context("unknown secret handle")?;
     let values = load_and_refresh_secret(&client, allowed_origins, secret).await?;
@@ -73,56 +74,77 @@ where
     for (header, pointer) in &secret.headers {
         request = request.header(header, pointer_string(&values, pointer)?);
     }
-    let response = send_with_retries(request).await?;
-    let status = response.status();
-    if !status.is_success() {
-        return Ok(Event::HttpCompleted {
-            success: false,
-            status: status.as_u16(),
-            events: Vec::new(),
-            error: response.text().await?,
-        });
-    }
-
-    let mut decoder = SseDecoder::default();
-    let mut events = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        decoder.push(&chunk?);
-        for event in decoder.drain()? {
-            on_event(&event);
-            events.push(event);
-        }
-    }
-    for event in decoder.finish()? {
-        on_event(&event);
-        events.push(event);
-    }
-    Ok(Event::HttpCompleted {
-        success: true,
-        status: status.as_u16(),
-        events,
-        error: String::new(),
-    })
-}
-
-async fn send_with_retries(request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
     for attempt in 0..3 {
         let current = request
             .try_clone()
             .context("HTTP request is not retryable")?;
-        match current.send().await {
+        let response = match current.send().await {
             Ok(response)
                 if attempt < 2
                     && (response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
-                        || response.status().is_server_error()) => {}
-            Ok(response) => return Ok(response),
-            Err(error) if attempt < 2 && (error.is_connect() || error.is_timeout()) => {}
+                        || response.status().is_server_error()) =>
+            {
+                retry_delay(attempt).await;
+                continue;
+            }
+            Ok(response) => response,
+            Err(error) if attempt < 2 && (error.is_connect() || error.is_timeout()) => {
+                retry_delay(attempt).await;
+                continue;
+            }
             Err(error) => return Err(error.into()),
+        };
+        let status = response.status();
+        if !status.is_success() {
+            return Ok(Event::HttpCompleted {
+                success: false,
+                status: status.as_u16(),
+                events: Vec::new(),
+                error: response.text().await?,
+            });
         }
-        tokio::time::sleep(Duration::from_millis(250 * (attempt + 1))).await;
+
+        let mut decoder = SseDecoder::default();
+        let mut events = Vec::new();
+        let mut emitted_output = false;
+        let mut stream = response.bytes_stream();
+        let mut retry = false;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(chunk) => {
+                    decoder.push(&chunk);
+                    for event in decoder.drain()? {
+                        emitted_output |= on_event(&event);
+                        events.push(event);
+                    }
+                }
+                Err(error) if attempt < 2 && error.is_timeout() && !emitted_output => {
+                    retry = true;
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if retry {
+            retry_delay(attempt).await;
+            continue;
+        }
+        for event in decoder.finish()? {
+            on_event(&event);
+            events.push(event);
+        }
+        return Ok(Event::HttpCompleted {
+            success: true,
+            status: status.as_u16(),
+            events,
+            error: String::new(),
+        });
     }
     unreachable!("retry loop returns on its last attempt")
+}
+
+async fn retry_delay(attempt: usize) {
+    tokio::time::sleep(Duration::from_millis(250 * (attempt as u64 + 1))).await;
 }
 
 #[derive(Default)]
@@ -261,6 +283,34 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
 
+    fn secret(path: PathBuf) -> SecretConfig {
+        fs::write(&path, r#"{"token":"test"}"#).unwrap();
+        SecretConfig {
+            path,
+            bearer_pointer: "/token".into(),
+            headers: BTreeMap::new(),
+            refresh: None,
+        }
+    }
+
+    fn request<'a>(
+        origin: &'a str,
+        allowed_origins: &'a HashSet<String>,
+        secrets: &'a BTreeMap<String, SecretConfig>,
+        headers: &'a BTreeMap<String, String>,
+        timeout_ms: u64,
+    ) -> SseRequest<'a> {
+        SseRequest {
+            allowed_origins,
+            secrets,
+            url: origin,
+            secret_name: "test",
+            headers,
+            body: serde_json::json!({}),
+            timeout_ms,
+        }
+    }
+
     #[test]
     fn decodes_sse_across_chunks() {
         let mut decoder = SseDecoder::default();
@@ -271,6 +321,87 @@ mod tests {
             decoder.drain().unwrap(),
             vec![serde_json::json!({ "type": "one" })]
         );
+    }
+
+    #[tokio::test]
+    async fn read_timeout_resets_when_data_arrives() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 2048];
+            let _ = stream.read(&mut request).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            for event in ["one", "two"] {
+                std::thread::sleep(Duration::from_millis(60));
+                write!(stream, "data: {{\"type\":\"{event}\"}}\n\n").unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        let root = tempfile::tempdir().unwrap();
+        let origin = format!("http://{address}");
+        let allowed_origins = HashSet::from([origin.clone()]);
+        let secrets = BTreeMap::from([("test".into(), secret(root.path().join("auth.json")))]);
+        let headers = BTreeMap::new();
+
+        let event = post_sse(
+            request(&origin, &allowed_origins, &secrets, &headers, 100),
+            |_| false,
+        )
+        .await
+        .unwrap();
+        server.join().unwrap();
+        let Event::HttpCompleted { events, .. } = event else {
+            panic!("expected HTTP completion");
+        };
+        assert_eq!(events.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn retries_an_idle_stream_before_visible_output() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 2048];
+                let _ = stream.read(&mut request).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                stream.flush().unwrap();
+                if attempt == 0 {
+                    write!(stream, "data: {{\"type\":\"response.created\"}}\n\n").unwrap();
+                    stream.flush().unwrap();
+                    std::thread::sleep(Duration::from_millis(100));
+                } else {
+                    write!(stream, "data: {{\"type\":\"done\"}}\n\n").unwrap();
+                }
+            }
+        });
+        let root = tempfile::tempdir().unwrap();
+        let origin = format!("http://{address}");
+        let allowed_origins = HashSet::from([origin.clone()]);
+        let secrets = BTreeMap::from([("test".into(), secret(root.path().join("auth.json")))]);
+        let headers = BTreeMap::new();
+
+        let event = post_sse(
+            request(&origin, &allowed_origins, &secrets, &headers, 50),
+            |_| false,
+        )
+        .await
+        .unwrap();
+        server.join().unwrap();
+        let Event::HttpCompleted { events, .. } = event else {
+            panic!("expected HTTP completion");
+        };
+        assert_eq!(events, vec![serde_json::json!({ "type": "done" })]);
     }
 
     #[test]

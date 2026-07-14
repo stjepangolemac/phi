@@ -20,10 +20,13 @@ phi check-policy
 phi run "Reply with exactly: phi works"
 phi --json run "Stream this response"
 phi --allow-shell run "List files in this directory"
+phi --yolo # run all tools without approval
 phi resume SESSION_ID "Continue"
 ```
 
 Sessions and their exact policy/plugin sources are stored under `.phi/sessions/` in the working directory.
+
+The shell tools run arbitrary commands through the user's shell, including pipelines and compound commands. Long-running commands yield a background session that survives model turns; the model can list sessions, poll them, or continue through stdin. Use `/ps` to inspect background processes and `/stop` to stop them. PTYs are available for interactive programs. Tool approval is still required unless `--allow-shell` or `--yolo` is used. OS sandboxing is intentionally not implemented yet.
 
 ## Configuration
 
@@ -49,10 +52,12 @@ Phi keeps behavior in Scheme and data in JSON:
 (load-plugin! "openai-web-search")
 (load-plugin! "openrouter-web-search")
 (load-plugin! "skills")
+(load-plugin! "codex-patch")
 (load-plugin! "simple-prompt")
 (load-plugin! "simple-compaction")
 
 (select-prompt-builder! "simple")
+(select-file-editor! "codex-patch")
 (configure-tool! "openai/hosted-web-search" (hash))
 (configure-tool!
   "openai/callable-web-search"
@@ -73,6 +78,8 @@ Phi keeps behavior in Scheme and data in JSON:
         'reasoning "low"
         'service_tier "default"))
 ```
+
+The selected file editor owns its model-facing format and matching logic in Steel. Rust supplies contained file snapshots, checks revisions, requests write approval, and persists the proposed changes. The bundled `codex-patch` editor exposes one `patch` tool for add, update, delete, and move operations.
 
 There is no default provider. Providers register qualified model identities such as `openai/gpt-5.6-luna`; the selected model determines the provider. Use `/model` in the TUI to pick the model, reasoning, and provider-supported service tier.
 
@@ -116,6 +123,23 @@ phi plugin remove example
 Installation records the resolved commit but does not activate the plugin. Add `(load-plugin! "example")` to `~/.phi/main.scm` and compose its registered behavior there.
 
 Plugins have no package-level type. Their entrypoints may register providers and models, prompt builders, compactors, or slash commands. The registration functions enforce the contract of each extension point.
+
+## Optional features
+
+These are possible extensions, not committed scope. Do not implement them without explicit operator approval:
+
+- file review
+- layered project instructions
+- sandbox and permission modes
+- turn steering and structured questions
+- richer session management
+- MCP integration
+- plans and task tracking
+- checkpoints and rewind
+- lifecycle hooks
+- subagents and worktrees
+- durable memory
+- multimodal, editor, and browser context
 
 ## Workspace
 

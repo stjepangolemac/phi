@@ -8,8 +8,10 @@ pub struct Permissions {
 impl Permissions {
     pub fn authorize_tool(&self, name: &str) -> Result<()> {
         match name {
-            "shell" if !self.allow_shell => bail!("shell approval required: use --allow-shell"),
-            "replace_file" if !self.allow_write => {
+            "exec_command" | "write_stdin" | "terminate_process" if !self.allow_shell => {
+                bail!("shell approval required: use --allow-shell")
+            }
+            "patch" if !self.allow_write => {
                 bail!("write approval required: use --allow-write")
             }
             _ => Ok(()),
@@ -28,7 +30,9 @@ mod tests {
             allow_write: false,
         };
         assert!(permissions.authorize_tool("read_file").is_ok());
-        assert!(permissions.authorize_tool("shell").is_err());
-        assert!(permissions.authorize_tool("replace_file").is_err());
+        assert!(permissions.authorize_tool("exec_command").is_err());
+        assert!(permissions.authorize_tool("write_stdin").is_err());
+        assert!(permissions.authorize_tool("terminate_process").is_err());
+        assert!(permissions.authorize_tool("patch").is_err());
     }
 }

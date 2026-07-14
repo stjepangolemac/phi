@@ -4,9 +4,12 @@ use anyhow::{Context, Result, bail};
 pub use phi_protocol::ToolSpec;
 use serde_json::{Value, json};
 
-pub trait Tool {
+pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
     fn execute(&self, workspace: &Path, arguments: Value) -> Result<Value>;
+    fn parallel_safe(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Default)]
@@ -53,9 +56,19 @@ impl Registry {
             .map(|entry| entry.tool.spec())
             .collect()
     }
+
+    pub fn parallel_safe(&self, name: &str) -> bool {
+        self.tools
+            .get(name)
+            .is_some_and(|entry| entry.tool.parallel_safe())
+    }
 }
 
 pub struct ReadFile;
+
+const DEFAULT_READ_LINES: usize = 200;
+const MAX_READ_LINES: usize = 1_000;
+const MAX_READ_BYTES: usize = 16 * 1024;
 
 impl Tool for ReadFile {
     fn spec(&self) -> ToolSpec {
@@ -72,53 +85,66 @@ impl Tool for ReadFile {
         if !path.starts_with(&root) {
             bail!("path is outside workspace");
         }
+
+        let start_line = arguments
+            .get("start_line")
+            .filter(|value| !value.is_null())
+            .map(|value| value.as_u64().context("start_line must be an integer"))
+            .transpose()?
+            .unwrap_or(1);
+        if start_line == 0 {
+            bail!("start_line must be at least 1");
+        }
+
+        let line_count = arguments
+            .get("line_count")
+            .filter(|value| !value.is_null())
+            .map(|value| value.as_u64().context("line_count must be an integer"))
+            .transpose()?
+            .unwrap_or(DEFAULT_READ_LINES as u64);
+        if !(1..=MAX_READ_LINES as u64).contains(&line_count) {
+            bail!("line_count must be between 1 and {MAX_READ_LINES}");
+        }
+
+        let bytes = fs::read(&path)?;
+        let content = std::str::from_utf8(&bytes).context("file is not UTF-8")?;
+        let lines: Vec<_> = content.split_inclusive('\n').collect();
+        let first = usize::try_from(start_line - 1)
+            .unwrap_or(usize::MAX)
+            .min(lines.len());
+        let mut selected = String::new();
+        let mut lines_read = 0;
+
+        for (offset, line) in lines[first..].iter().take(line_count as usize).enumerate() {
+            if line.len() > MAX_READ_BYTES {
+                bail!(
+                    "line {} exceeds the {MAX_READ_BYTES}-byte read limit",
+                    first + offset + 1
+                );
+            }
+            if selected.len() + line.len() > MAX_READ_BYTES {
+                break;
+            }
+            selected.push_str(line);
+            lines_read += 1;
+        }
+
+        let end_index = first + lines_read;
+        let end_line = (lines_read > 0).then_some(end_index);
+        let next_line = (end_index < lines.len()).then_some(end_index + 1);
         Ok(json!({
             "path": path.strip_prefix(&root)?.display().to_string(),
-            "content": fs::read_to_string(&path)?,
-            "revision": blake3::hash(&fs::read(&path)?).to_hex().to_string(),
+            "content": selected,
+            "start_line": start_line,
+            "end_line": end_line,
+            "next_line": next_line,
+            "total_lines": lines.len(),
+            "revision": blake3::hash(&bytes).to_hex().to_string(),
         }))
     }
-}
 
-pub struct ReplaceFile;
-
-impl Tool for ReplaceFile {
-    fn spec(&self) -> ToolSpec {
-        Self::spec()
-    }
-
-    fn execute(&self, workspace: &Path, arguments: Value) -> Result<Value> {
-        let relative = arguments
-            .get("path")
-            .and_then(Value::as_str)
-            .context("replace_file requires a path")?;
-        let revision = arguments
-            .get("revision")
-            .and_then(Value::as_str)
-            .context("replace_file requires a revision")?;
-        let content = arguments
-            .get("content")
-            .and_then(Value::as_str)
-            .context("replace_file requires content")?;
-        let root = fs::canonicalize(workspace)?;
-        let path = fs::canonicalize(root.join(relative))?;
-        if !path.starts_with(&root) {
-            bail!("path is outside workspace");
-        }
-        let current = fs::read(&path)?;
-        if blake3::hash(&current).to_hex().as_str() != revision {
-            bail!("stale file revision");
-        }
-        let permissions = fs::metadata(&path)?.permissions();
-        let parent = path.parent().context("file has no parent")?;
-        let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-        std::io::Write::write_all(&mut temp, content.as_bytes())?;
-        temp.as_file().set_permissions(permissions)?;
-        temp.persist(&path).map_err(|error| error.error)?;
-        Ok(json!({
-            "path": path.strip_prefix(&root)?.display().to_string(),
-            "revision": blake3::hash(content.as_bytes()).to_hex().to_string(),
-        }))
+    fn parallel_safe(&self) -> bool {
+        true
     }
 }
 
@@ -126,49 +152,83 @@ impl ReadFile {
     pub fn spec() -> ToolSpec {
         ToolSpec {
             name: "read_file".into(),
-            description: "Read a UTF-8 file inside the workspace.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": { "path": { "type": "string" } },
-                "required": ["path"],
-                "additionalProperties": false
-            }),
-        }
-    }
-}
-
-impl ReplaceFile {
-    pub fn spec() -> ToolSpec {
-        ToolSpec {
-            name: "replace_file".into(),
-            description: "Atomically replace an existing UTF-8 workspace file using the revision returned by read_file.".into(),
+            description: "Read a bounded range of complete UTF-8 lines inside the workspace. Use next_line to continue.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
-                    "revision": { "type": "string" },
-                    "content": { "type": "string" }
+                    "start_line": { "type": ["integer", "null"], "minimum": 1, "description": "First line to read. Use null for line 1." },
+                    "line_count": { "type": ["integer", "null"], "minimum": 1, "maximum": 1000, "description": "Maximum lines to read. Use null for 200." }
                 },
-                "required": ["path", "revision", "content"],
+                "required": ["path", "start_line", "line_count"],
                 "additionalProperties": false
             }),
         }
     }
 }
 
-pub fn shell_spec() -> ToolSpec {
+pub fn exec_command_spec() -> ToolSpec {
     ToolSpec {
-        name: "shell".into(),
-        description: "Run one allowlisted program in the workspace without shell expansion.".into(),
+        name: "exec_command".into(),
+        description: "Run a command in a Phi-managed process. For background or long-running work, run the command directly: never use nohup, &, or disown. Set yield_time_ms to 0 to return a managed session immediately. Once a session_id is returned, the command is already running; do not start it again. Use write_stdin to poll or interact with it and list_processes to inspect it. Managed processes stop when Phi exits.".into(),
         parameters: json!({
             "type": "object",
             "properties": {
-                "program": { "type": "string" },
-                "args": { "type": "array", "items": { "type": "string" } },
-                "stdin": { "type": "string" },
-                "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 60000 }
+                "cmd": { "type": "string", "description": "Shell command to execute." },
+                "workdir": { "type": ["string", "null"], "description": "Working directory relative to the workspace. Use null for the workspace root." },
+                "shell": { "type": ["string", "null"], "description": "Shell binary. Use null for the user's shell." },
+                "login": { "type": ["boolean", "null"], "description": "Use login-shell semantics. Use null for false." },
+                "tty": { "type": ["boolean", "null"], "description": "Allocate a pseudo-terminal only for genuinely interactive programs. Use null for false." },
+                "yield_time_ms": { "type": ["integer", "null"], "minimum": 0, "maximum": 30000, "description": "Milliseconds to wait before returning a running session. Use 0 for intentional background work; use null for 10000." },
+                "max_output_tokens": { "type": ["integer", "null"], "minimum": 1, "maximum": 100000, "description": "Approximate output token budget. Use null for 10000." }
             },
-            "required": ["program", "args", "stdin", "timeout_ms"],
+            "required": ["cmd", "workdir", "shell", "login", "tty", "yield_time_ms", "max_output_tokens"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+pub fn write_stdin_spec() -> ToolSpec {
+    ToolSpec {
+        name: "write_stdin".into(),
+        description: "Write to or poll a managed exec_command session. Use null or an empty chars value to wait for new output. Do not start the command again after receiving a session_id.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "session_id": { "type": "integer", "minimum": 1 },
+                "chars": { "type": ["string", "null"], "description": "Characters to write. Use null or an empty string to poll." },
+                "yield_time_ms": { "type": ["integer", "null"], "minimum": 1, "maximum": 300000 },
+                "max_output_tokens": { "type": ["integer", "null"], "minimum": 1, "maximum": 100000 }
+            },
+            "required": ["session_id", "chars", "yield_time_ms", "max_output_tokens"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+pub fn list_processes_spec() -> ToolSpec {
+    ToolSpec {
+        name: "list_processes".into(),
+        description: "List shell processes managed by the current Phi session, including IDs, status, commands, and recent output.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        }),
+    }
+}
+
+pub fn terminate_process_spec() -> ToolSpec {
+    ToolSpec {
+        name: "terminate_process".into(),
+        description: "Gracefully terminate one managed background process. Phi sends SIGINT, then SIGTERM, then SIGKILL if the process does not exit.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "session_id": { "type": "integer", "minimum": 1 }
+            },
+            "required": ["session_id"],
             "additionalProperties": false
         }),
     }
@@ -188,6 +248,10 @@ mod tests {
             .execute(dir.path(), "read_file", json!({ "path": "a.txt" }))
             .unwrap();
         assert_eq!(result["content"], "hello");
+        assert_eq!(result["start_line"], 1);
+        assert_eq!(result["end_line"], 1);
+        assert_eq!(result["next_line"], Value::Null);
+        assert_eq!(result["total_lines"], 1);
         assert!(
             registry
                 .execute(dir.path(), "hash_edit", json!({}))
@@ -196,33 +260,60 @@ mod tests {
     }
 
     #[test]
-    fn replacement_requires_current_revision() {
+    fn read_file_paginates_with_default_and_explicit_ranges() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("a.txt"), "old").unwrap();
-        let mut registry = Registry::default();
-        registry.register(ReadFile);
-        registry.register(ReplaceFile);
-        let read = registry
-            .execute(dir.path(), "read_file", json!({ "path": "a.txt" }))
+        let content: String = (1..=250).map(|line| format!("line {line}\n")).collect();
+        fs::write(dir.path().join("lines.txt"), content).unwrap();
+        let tool = ReadFile;
+
+        let first = tool
+            .execute(dir.path(), json!({ "path": "lines.txt" }))
             .unwrap();
-        registry
+        assert_eq!(first["end_line"], 200);
+        assert_eq!(first["next_line"], 201);
+        assert_eq!(first["total_lines"], 250);
+
+        let second = tool
             .execute(
                 dir.path(),
-                "replace_file",
-                json!({ "path": "a.txt", "revision": read["revision"], "content": "new" }),
+                json!({ "path": "lines.txt", "start_line": 201, "line_count": 100 }),
             )
             .unwrap();
-        assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "new");
+        assert_eq!(second["end_line"], 250);
+        assert_eq!(second["next_line"], Value::Null);
         assert!(
-            registry
-                .execute(
-                    dir.path(),
-                    "replace_file",
-                    json!({ "path": "a.txt", "revision": read["revision"], "content": "again" }),
-                )
-                .unwrap_err()
-                .to_string()
-                .contains("stale")
+            second["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("line 201\n")
+        );
+    }
+
+    #[test]
+    fn read_file_enforces_line_and_byte_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = format!("{}\n", "x".repeat(8_191));
+        fs::write(dir.path().join("large.txt"), line.repeat(3)).unwrap();
+        let tool = ReadFile;
+
+        let result = tool
+            .execute(dir.path(), json!({ "path": "large.txt", "line_count": 3 }))
+            .unwrap();
+        assert_eq!(result["content"].as_str().unwrap().len(), MAX_READ_BYTES);
+        assert_eq!(result["end_line"], 2);
+        assert_eq!(result["next_line"], 3);
+
+        assert!(
+            tool.execute(
+                dir.path(),
+                json!({ "path": "large.txt", "line_count": 1001 }),
+            )
+            .is_err()
+        );
+        fs::write(dir.path().join("wide.txt"), "x".repeat(MAX_READ_BYTES + 1)).unwrap();
+        assert!(
+            tool.execute(dir.path(), json!({ "path": "wide.txt" }))
+                .is_err()
         );
     }
 }

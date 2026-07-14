@@ -1,10 +1,14 @@
 use std::{
-    path::PathBuf,
+    collections::HashMap,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 use anyhow::Result;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyModifiers,
+    MouseEventKind,
+};
 use futures_util::{FutureExt, StreamExt, future::pending};
 use phi_runtime::{
     CommandCatalog, CommandExecution, CommandInvocation, Handle, RunOptions, RuntimeCommand,
@@ -19,6 +23,8 @@ use ratatui::{
 };
 use tui_markdown::StyleSheet;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+mod diff_render;
 
 #[derive(Clone)]
 struct PhiMarkdown;
@@ -270,7 +276,8 @@ struct App {
     compactions: u64,
     turn_started: Option<Instant>,
     compaction_started: Option<Instant>,
-    tool_started: Option<(String, Instant)>,
+    tool_started: HashMap<String, (String, Instant)>,
+    tool_blocks: HashMap<String, usize>,
     final_response_rendered: bool,
     command_filter: Option<String>,
     command_selected: usize,
@@ -317,7 +324,8 @@ impl App {
             compactions: 0,
             turn_started: None,
             compaction_started: None,
-            tool_started: None,
+            tool_started: HashMap::new(),
+            tool_blocks: HashMap::new(),
             final_response_rendered: false,
             command_filter: None,
             command_selected: 0,
@@ -395,7 +403,7 @@ impl App {
                 self.options.session_id = self.session_id.clone();
                 self.catalog = execution.catalog;
                 self.token_budget = selected_context_window(&self.catalog);
-                self.transcript.push(("note".into(), execution.content));
+                self.transcript.push((execution.role, execution.content));
             }
             Err(error) => self.transcript.push(("error".into(), error.to_string())),
         }
@@ -566,36 +574,73 @@ impl App {
             },
             RuntimeEvent::ToolRouteSelected { .. } => {}
             RuntimeEvent::ModelDelta { content } => self.current_model.push_str(&content),
-            RuntimeEvent::ToolStarted { name, arguments } => {
+            RuntimeEvent::ToolStarted {
+                call_id,
+                name,
+                arguments,
+            } => {
                 self.flush_model();
-                self.tool_started = Some((name.clone(), Instant::now()));
+                self.tool_started
+                    .insert(call_id.clone(), (name.clone(), Instant::now()));
                 if name == "web_search" {
                     self.status = "searching".into();
                 }
+                let block = self.transcript.len();
                 self.transcript.push((
                     "tool".into(),
                     match name.as_str() {
-                        "shell" => format!("Ran `{}`", display_command(&arguments)),
+                        "exec_command" => format!("Ran `{}`", display_command(&arguments)),
+                        "write_stdin" => "Checked background process".into(),
+                        "list_processes" => "Checking background processes".into(),
+                        "terminate_process" => "Stopping background process".into(),
+                        "read_file" => format!(
+                            "Read {}",
+                            display_relative_path(
+                                &self.options.workspace,
+                                arguments["path"].as_str().unwrap_or("file")
+                            )
+                        ),
                         "web_search" => "Searching the web".into(),
                         "load_skill" => format!(
                             "Loading skill `{}`",
                             arguments["name"].as_str().unwrap_or("unknown")
                         ),
+                        "patch" => "Applying patch".into(),
                         _ => format!("Ran `{name}`"),
                     },
                 ));
+                self.tool_blocks.insert(call_id, block);
             }
-            RuntimeEvent::ToolCompleted { name, result } => {
+            RuntimeEvent::ToolOutput {
+                call_id,
+                name,
+                content,
+            } => {
+                if matches!(name.as_str(), "exec_command" | "write_stdin")
+                    && let Some((_, block)) = self
+                        .tool_blocks
+                        .get(&call_id)
+                        .and_then(|index| self.transcript.get_mut(*index))
+                {
+                    if !block.contains("\n\n") {
+                        block.push_str("\n\n");
+                    }
+                    block.push_str(&content.replace("\r\n", "\n"));
+                }
+            }
+            RuntimeEvent::ToolCompleted {
+                call_id,
+                name,
+                result,
+            } => {
                 let elapsed = self
                     .tool_started
-                    .take()
+                    .remove(&call_id)
                     .filter(|(started_name, _)| started_name == &name)
                     .map_or(Duration::ZERO, |(_, started)| started.elapsed());
-                if let Some((_, content)) = self
-                    .transcript
-                    .iter_mut()
-                    .rev()
-                    .find(|(role, _)| role == "tool")
+                let block = self.tool_blocks.remove(&call_id);
+                if let Some((role, content)) =
+                    block.and_then(|index| self.transcript.get_mut(index))
                 {
                     if name == "web_search" {
                         let action = &result["action"];
@@ -630,6 +675,46 @@ impl App {
                                 human_duration(elapsed)
                             );
                         }
+                    } else if name == "patch" {
+                        *role = "patch".into();
+                        *content = patch_result(&result, elapsed);
+                    } else if matches!(name.as_str(), "exec_command" | "write_stdin") {
+                        let streamed = content.contains("\n\n");
+                        let result_text = tool_result(&result);
+                        if !result_text.is_empty() && (!streamed || result.get("error").is_some()) {
+                            content.push_str("\n\n");
+                            content.push_str(&result_text);
+                        }
+                        if result["session_id"].as_u64().is_some() {
+                            content.push_str(if name == "write_stdin" {
+                                "\n\nStill running"
+                            } else {
+                                "\n\nProcess running"
+                            });
+                        } else if name == "write_stdin" && result["exit_code"].is_number() {
+                            content.push_str("\n\nFinished");
+                        } else if let Some(exit_code) = result["exit_code"].as_i64()
+                            && exit_code != 0
+                        {
+                            content.push_str(&format!("\n\nExited with code {exit_code}"));
+                        }
+                    } else if name == "list_processes" {
+                        *content = process_tool_result(&result, elapsed);
+                    } else if name == "terminate_process" {
+                        if let Some(error) = result["error"].as_str() {
+                            *content = format!("Failed to stop background process\n\n{error}");
+                        } else if result["status"] == "exited" {
+                            *content = format!(
+                                "Background process already finished · {}",
+                                human_duration(elapsed)
+                            );
+                        } else {
+                            *content = format!(
+                                "Stopped background process · {}\n\n{}",
+                                human_duration(elapsed),
+                                result["signal"].as_str().unwrap_or("terminated")
+                            );
+                        }
                     } else {
                         let result = tool_result(&result);
                         if !result.is_empty() {
@@ -658,7 +743,8 @@ impl App {
                 ));
                 self.handle = None;
                 self.compaction_started = None;
-                self.tool_started = None;
+                self.tool_started.clear();
+                self.tool_blocks.clear();
                 self.final_response_rendered = false;
                 self.status = "ready".into();
             }
@@ -669,7 +755,8 @@ impl App {
                 self.approval = None;
                 self.turn_started = None;
                 self.compaction_started = None;
-                self.tool_started = None;
+                self.tool_started.clear();
+                self.tool_blocks.clear();
                 self.final_response_rendered = false;
                 self.status = "ready".into();
             }
@@ -776,6 +863,24 @@ impl App {
         self.history_draft.clear();
     }
 
+    fn scroll_up(&mut self, lines: u16) {
+        self.scroll = self.scroll.saturating_sub(lines);
+        self.follow = false;
+    }
+
+    fn scroll_down(&mut self, lines: u16) {
+        self.scroll = self.scroll.saturating_add(lines);
+        self.follow = false;
+    }
+
+    fn on_mouse(&mut self, kind: MouseEventKind) {
+        match kind {
+            MouseEventKind::ScrollUp => self.scroll_up(3),
+            MouseEventKind::ScrollDown => self.scroll_down(3),
+            _ => {}
+        }
+    }
+
     fn on_key(&mut self, key: KeyEvent) {
         if self.picker.is_some() {
             self.on_picker_key(key);
@@ -866,6 +971,8 @@ impl App {
                 self.edit_composer();
                 self.composer.insert(character);
             }
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => self.scroll_up(3),
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => self.scroll_down(3),
             KeyCode::Up if self.navigate_commands(false) => {}
             KeyCode::Down if self.navigate_commands(true) => {}
             KeyCode::Left
@@ -911,12 +1018,10 @@ impl App {
                 self.composer.move_down();
             }
             KeyCode::PageUp => {
-                self.scroll = self.scroll.saturating_sub(1);
-                self.follow = false;
+                self.scroll_up(10);
             }
             KeyCode::PageDown => {
-                self.scroll = self.scroll.saturating_add(1);
-                self.follow = false;
+                self.scroll_down(10);
             }
             _ => {}
         }
@@ -932,7 +1037,12 @@ pub async fn launch(options: RunOptions, prompt: Option<String>) -> Result<()> {
     }
 
     let mut terminal = ratatui::init();
+    if let Err(error) = crossterm::execute!(std::io::stdout(), EnableMouseCapture) {
+        ratatui::restore();
+        return Err(error.into());
+    }
     let result = event_loop(&mut terminal, &mut app).await;
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -947,6 +1057,7 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> R
             event = input.next().fuse() => {
                 match event.transpose()? {
                     Some(Event::Key(key)) if key.is_press() => app.on_key(key),
+                    Some(Event::Mouse(mouse)) => app.on_mouse(mouse.kind),
                     Some(Event::Resize(_, _)) => {},
                     Some(_) => {},
                     None => app.quit = true,
@@ -1290,8 +1401,10 @@ fn transcript_text(app: &App, width: usize) -> Text<'static> {
             "searching" => (
                 "Searching",
                 app.tool_started
-                    .as_ref()
+                    .values()
+                    .filter(|(name, _)| name == "web_search")
                     .map(|(_, started)| *started)
+                    .min()
                     .unwrap_or(turn_started),
             ),
             _ => ("Working", turn_started),
@@ -1322,7 +1435,11 @@ fn push_message(lines: &mut Vec<Line<'static>>, role: &str, content: &str, width
         push_tool(lines, content, width);
         return;
     }
-    if role == "you" || role == "phi" {
+    if role == "patch" {
+        push_patch(lines, content, width);
+        return;
+    }
+    if role == "you" || role == "phi" || role == "processes" {
         push_markdown(lines, role, content, width);
         return;
     }
@@ -1367,6 +1484,8 @@ fn push_markdown(lines: &mut Vec<Line<'static>>, role: &str, content: &str, widt
     };
     let code_style = PhiMarkdown.code();
     let code_background = Style::default().bg(code_style.bg.unwrap());
+    let code_inset = usize::from(role == "processes") * 2;
+    let code_padding = code_inset;
     let marker = if role == "you" { "‣ " } else { "• " };
     lines.push(Line::styled(" ".repeat(width), block_style));
 
@@ -1378,22 +1497,38 @@ fn push_markdown(lines: &mut Vec<Line<'static>>, role: &str, content: &str, widt
     for line in markdown.lines {
         let plain = line.to_string();
         if plain.trim_start().starts_with("```") {
+            let padding = || {
+                if code_inset == 0 {
+                    Line::styled(" ".repeat(width), block_style.patch(code_style))
+                } else {
+                    Line::from(vec![
+                        Span::styled(" ".repeat(code_inset), block_style),
+                        Span::styled(
+                            " ".repeat(width.saturating_sub(code_inset * 2)),
+                            block_style.patch(code_style),
+                        ),
+                        Span::styled(" ".repeat(code_inset), block_style),
+                    ])
+                    .style(block_style)
+                }
+            };
             if in_code {
-                lines.push(Line::styled(
-                    " ".repeat(width),
-                    block_style.patch(code_style),
-                ));
+                lines.push(padding());
                 in_code = false;
             } else {
                 in_code = true;
-                lines.push(Line::styled(
-                    " ".repeat(width),
-                    block_style.patch(code_style),
-                ));
+                lines.push(padding());
             }
             continue;
         }
-        for wrapped in wrap_styled_line(&line, content_width) {
+        let line_width = if in_code && code_inset > 0 {
+            width
+                .saturating_sub(code_inset * 2 + code_padding * 2)
+                .max(1)
+        } else {
+            content_width
+        };
+        for wrapped in wrap_styled_line(&line, line_width) {
             let has_content = !wrapped.to_string().trim().is_empty();
             let prefix = if !marked && has_content {
                 marked = true;
@@ -1416,7 +1551,20 @@ fn push_markdown(lines: &mut Vec<Line<'static>>, role: &str, content: &str, widt
                 .patch(block_style)
                 .patch(wrapped.style)
                 .patch(extra_style);
-            let mut spans = vec![Span::styled(prefix.to_owned(), style)];
+            let prefix_style = if in_code && code_inset > 0 {
+                block_style
+            } else {
+                style
+            };
+            let line_style = if in_code && code_inset > 0 {
+                block_style
+            } else {
+                style
+            };
+            let mut spans = vec![Span::styled(prefix.to_owned(), prefix_style)];
+            if in_code && code_padding > 0 {
+                spans.push(Span::styled(" ".repeat(code_padding), style));
+            }
             spans.extend(wrapped.spans.into_iter().map(|span| {
                 let mut span_style = Style::default()
                     .fg(inherited)
@@ -1432,8 +1580,16 @@ fn push_markdown(lines: &mut Vec<Line<'static>>, role: &str, content: &str, widt
                 .iter()
                 .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
                 .sum::<usize>();
-            spans.push(Span::styled(" ".repeat(width.saturating_sub(used)), style));
-            lines.push(Line::from(spans).style(style));
+            if in_code && code_inset > 0 {
+                spans.push(Span::styled(
+                    " ".repeat(width.saturating_sub(used + code_inset)),
+                    style,
+                ));
+                spans.push(Span::styled(" ".repeat(code_inset), block_style));
+            } else {
+                spans.push(Span::styled(" ".repeat(width.saturating_sub(used)), style));
+            }
+            lines.push(Line::from(spans).style(line_style));
         }
     }
     if !marked && !content.is_empty() {
@@ -1507,6 +1663,10 @@ fn push_tool(lines: &mut Vec<Line<'static>>, content: &str, width: usize) {
     lines.push(Line::styled(" ".repeat(width), command_style));
 }
 
+fn push_patch(lines: &mut Vec<Line<'static>>, content: &str, width: usize) {
+    diff_render::push(lines, content, width);
+}
+
 fn turn_divider(label: &str, width: usize) -> String {
     let label_width = UnicodeWidthStr::width(label);
     if width <= label_width + 2 {
@@ -1536,34 +1696,111 @@ fn wrap_line(line: &str, width: usize) -> Vec<String> {
 }
 
 fn display_command(arguments: &serde_json::Value) -> String {
-    let mut command = vec![
-        arguments
-            .get("program")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("shell")
-            .to_owned(),
-    ];
-    command.extend(
-        arguments
-            .get("args")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(serde_json::Value::as_str)
-            .map(quote_argument),
-    );
-    command.join(" ")
+    arguments
+        .get("cmd")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("command")
+        .to_owned()
 }
 
-fn quote_argument(argument: &str) -> String {
-    if argument
-        .chars()
-        .all(|character| character.is_ascii_alphanumeric() || "-_=./:".contains(character))
-    {
-        argument.into()
-    } else {
-        format!("{:?}", argument)
+fn process_tool_result(result: &serde_json::Value, elapsed: Duration) -> String {
+    if let Some(error) = result.get("error").and_then(serde_json::Value::as_str) {
+        return format!("Failed to list background processes\n\n{error}");
     }
+    let processes = result["processes"].as_array().cloned().unwrap_or_default();
+    if processes.is_empty() {
+        return format!("No background processes · {}", human_duration(elapsed));
+    }
+    let output = processes
+        .iter()
+        .map(|process| {
+            let status = if process["status"].as_str() == Some("running") {
+                format!(
+                    "Running for {}",
+                    human_duration(Duration::from_millis(
+                        process["elapsed_ms"].as_u64().unwrap_or_default()
+                    ))
+                )
+            } else if let Some(code) = process["exit_code"].as_i64() {
+                format!("Finished · exit {code}")
+            } else {
+                "Finished".into()
+            };
+            format!(
+                "{status} · {}",
+                process["command"].as_str().unwrap_or("command")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Checked background processes · {}\n\n{output}",
+        human_duration(elapsed),
+    )
+}
+
+fn display_relative_path(workspace: &Path, path: &str) -> String {
+    Path::new(path)
+        .strip_prefix(workspace)
+        .unwrap_or_else(|_| Path::new(path))
+        .display()
+        .to_string()
+        .trim_start_matches("./")
+        .to_owned()
+}
+
+fn patch_result(result: &serde_json::Value, elapsed: Duration) -> String {
+    if let Some(error) = result.get("error").and_then(serde_json::Value::as_str) {
+        return format!(
+            "Patch failed · {}\n\n{}",
+            human_duration(elapsed),
+            truncate_display(error, 2_000)
+        );
+    }
+    let changes = result
+        .get("changes")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let descriptions = changes
+        .iter()
+        .map(|change| {
+            let path = change["path"].as_str().unwrap_or("unknown");
+            let description = match change["operation"].as_str() {
+                Some("create") => format!("Created `{path}`"),
+                Some("replace") => format!("Updated `{path}`"),
+                Some("delete") => format!("Deleted `{path}`"),
+                Some("move") => format!(
+                    "Moved `{path}` → `{}`",
+                    change["destination"].as_str().unwrap_or("unknown")
+                ),
+                _ => format!("Changed `{path}`"),
+            };
+            (
+                description,
+                change["diff"].as_str().unwrap_or("").trim_end(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if descriptions.len() == 1 {
+        return format!(
+            "{} · {}\n\n{}",
+            descriptions[0].0,
+            human_duration(elapsed),
+            descriptions[0].1
+        );
+    }
+    let details = descriptions
+        .iter()
+        .map(|(description, diff)| format!("{description}\n{diff}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    format!(
+        "Patched {} files · {}\n\n{}",
+        descriptions.len(),
+        human_duration(elapsed),
+        details
+    )
 }
 
 fn tool_result(result: &serde_json::Value) -> String {
@@ -1663,6 +1900,7 @@ mod tests {
                 allow_shell: false,
                 allow_write: false,
                 interactive_approvals: true,
+                processes: std::sync::Arc::new(phi_runtime::ProcessManager::default()),
             },
             CommandCatalog {
                 commands: vec![
@@ -1726,11 +1964,12 @@ mod tests {
             content: "hi".into(),
         });
         app.on_runtime(RuntimeEvent::ToolStarted {
+            call_id: "read".into(),
             name: "read_file".into(),
-            arguments: serde_json::json!({}),
+            arguments: serde_json::json!({ "path": "src/main.rs" }),
         });
         assert_eq!(app.transcript[0], ("phi".into(), "hi".into()));
-        assert_eq!(app.transcript[1].1, "Ran `read_file`");
+        assert_eq!(app.transcript[1].1, "Read src/main.rs");
     }
 
     #[test]
@@ -1738,14 +1977,19 @@ mod tests {
         let mut app = app();
         app.turn_started = Some(Instant::now());
         app.on_runtime(RuntimeEvent::ToolStarted {
+            call_id: "search".into(),
             name: "web_search".into(),
             arguments: serde_json::json!({}),
         });
         assert_eq!(app.status, "searching");
         assert_eq!(app.transcript[0].1, "Searching the web");
-        app.tool_started = Some(("web_search".into(), Instant::now() - Duration::from_secs(3)));
+        app.tool_started.insert(
+            "search".into(),
+            ("web_search".into(), Instant::now() - Duration::from_secs(3)),
+        );
 
         app.on_runtime(RuntimeEvent::ToolCompleted {
+            call_id: "search".into(),
             name: "web_search".into(),
             result: serde_json::json!({
                 "action": { "type": "search", "sources": [{}, {}] }
@@ -1760,11 +2004,13 @@ mod tests {
     fn shows_skill_loading_without_echoing_instructions() {
         let mut app = app();
         app.on_runtime(RuntimeEvent::ToolStarted {
+            call_id: "skill".into(),
             name: "load_skill".into(),
             arguments: serde_json::json!({ "name": "review", "path": "SKILL.md" }),
         });
         assert_eq!(app.transcript[0].1, "Loading skill `review`");
         app.on_runtime(RuntimeEvent::ToolCompleted {
+            call_id: "skill".into(),
             name: "load_skill".into(),
             result: serde_json::json!({
                 "name": "review",
@@ -1777,13 +2023,65 @@ mod tests {
     }
 
     #[test]
+    fn shows_completed_patch_operations() {
+        let mut app = app();
+        app.on_runtime(RuntimeEvent::ToolStarted {
+            call_id: "patch".into(),
+            name: "patch".into(),
+            arguments: serde_json::json!({ "patch": "ignored by the UI" }),
+        });
+        assert_eq!(app.transcript[0].1, "Applying patch");
+        app.on_runtime(RuntimeEvent::ToolCompleted {
+            call_id: "patch".into(),
+            name: "patch".into(),
+            result: serde_json::json!({
+                "changes": [
+                    {
+                        "operation": "create",
+                        "path": "new.rs",
+                        "diff": "--- /dev/null\n+++ new.rs\n@@ -0,0 +1 @@\n+new\n"
+                    },
+                    {
+                        "operation": "replace",
+                        "path": "src/main.rs",
+                        "diff": "--- src/main.rs\n+++ src/main.rs\n@@ -1 +1 @@\n-old\n+new\n"
+                    },
+                    {
+                        "operation": "move",
+                        "path": "old.rs",
+                        "destination": "moved.rs",
+                        "diff": "--- old.rs\n+++ moved.rs\n"
+                    },
+                    {
+                        "operation": "delete",
+                        "path": "unused.rs",
+                        "diff": "--- unused.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-unused\n"
+                    },
+                ]
+            }),
+        });
+        assert_eq!(
+            app.transcript[0].1,
+            concat!(
+                "Patched 4 files · 0s\n\n",
+                "Created `new.rs`\n--- /dev/null\n+++ new.rs\n@@ -0,0 +1 @@\n+new\n\n",
+                "Updated `src/main.rs`\n--- src/main.rs\n+++ src/main.rs\n@@ -1 +1 @@\n-old\n+new\n\n",
+                "Moved `old.rs` → `moved.rs`\n--- old.rs\n+++ moved.rs\n\n",
+                "Deleted `unused.rs`\n--- unused.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-unused"
+            )
+        );
+    }
+
+    #[test]
     fn labels_opened_web_pages_separately() {
         let mut app = app();
         app.on_runtime(RuntimeEvent::ToolStarted {
+            call_id: "page".into(),
             name: "web_search".into(),
             arguments: serde_json::json!({}),
         });
         app.on_runtime(RuntimeEvent::ToolCompleted {
+            call_id: "page".into(),
             name: "web_search".into(),
             result: serde_json::json!({
                 "action": {
@@ -1982,6 +2280,52 @@ mod tests {
     }
 
     #[test]
+    fn renders_process_list_as_highlighted_shell_commands() {
+        let mut lines = Vec::new();
+        push_message(
+            &mut lines,
+            "processes",
+            "## Background processes\n\n• **Running for 2m 13s**\n\n```bash\nwhile true; do echo hi; done\n```",
+            80,
+        );
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.to_string().contains("Background processes"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.to_string().contains("Running for 2m 13s"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.to_string().contains("• Running for 2m 13s"))
+        );
+        let command = lines
+            .iter()
+            .find(|line| line.to_string().contains("while true"))
+            .unwrap();
+        assert_eq!(command.style.bg, None);
+        assert_eq!(command.spans.first().unwrap().style.bg, None);
+        assert_eq!(command.spans.last().unwrap().style.bg, None);
+        assert_eq!(command.spans.first().unwrap().content, "  ");
+        assert_eq!(command.spans.last().unwrap().content, "  ");
+        assert_eq!(command.spans[1].content, "  ");
+        assert_eq!(command.spans[1].style.bg, Some(Color::Rgb(27, 28, 31)));
+        assert!(command.to_string().starts_with("    while true"));
+        assert!(
+            command
+                .spans
+                .iter()
+                .any(|span| span.style.bg == Some(Color::Rgb(27, 28, 31)))
+        );
+        assert!(command.spans.iter().any(|span| span.style.fg.is_some()));
+    }
+
+    #[test]
     fn streaming_does_not_override_manual_scroll() {
         let mut app = app();
         app.follow = false;
@@ -2043,8 +2387,7 @@ mod tests {
     #[test]
     fn formats_shell_command_and_indented_output() {
         let command = display_command(&serde_json::json!({
-            "program": "rg",
-            "args": ["hello world", "src"]
+            "cmd": "rg \"hello world\" src"
         }));
         assert_eq!(command, "rg \"hello world\" src");
         let mut lines = Vec::new();
@@ -2055,6 +2398,152 @@ mod tests {
         assert_eq!(lines[3].to_string(), "  └ match");
         assert_eq!(lines[4].to_string(), "    second");
         assert_eq!(lines[3].style.fg, Some(Color::Rgb(125, 125, 122)));
+    }
+
+    #[test]
+    fn streams_shell_output_without_repeating_it_on_completion() {
+        let mut app = app();
+        app.on_runtime(RuntimeEvent::ToolStarted {
+            call_id: "shell".into(),
+            name: "exec_command".into(),
+            arguments: serde_json::json!({ "cmd": "printf hello" }),
+        });
+        app.on_runtime(RuntimeEvent::ToolOutput {
+            call_id: "shell".into(),
+            name: "exec_command".into(),
+            content: "hello".into(),
+        });
+        app.on_runtime(RuntimeEvent::ToolCompleted {
+            call_id: "shell".into(),
+            name: "exec_command".into(),
+            result: serde_json::json!({
+                "exit_code": 0,
+                "stdout": "hello",
+                "stderr": "",
+                "session_id": null
+            }),
+        });
+
+        assert_eq!(app.transcript[0].1, "Ran `printf hello`\n\nhello");
+    }
+
+    #[test]
+    fn routes_concurrent_shell_output_to_its_own_block() {
+        let mut app = app();
+        for (call_id, cmd) in [("first", "printf first"), ("second", "printf second")] {
+            app.on_runtime(RuntimeEvent::ToolStarted {
+                call_id: call_id.into(),
+                name: "exec_command".into(),
+                arguments: serde_json::json!({ "cmd": cmd }),
+            });
+        }
+        app.on_runtime(RuntimeEvent::ToolOutput {
+            call_id: "first".into(),
+            name: "exec_command".into(),
+            content: "first".into(),
+        });
+        app.on_runtime(RuntimeEvent::ToolOutput {
+            call_id: "second".into(),
+            name: "exec_command".into(),
+            content: "second".into(),
+        });
+
+        assert!(app.transcript[0].1.ends_with("\n\nfirst"));
+        assert!(app.transcript[1].1.ends_with("\n\nsecond"));
+    }
+
+    #[test]
+    fn displays_model_process_listing() {
+        let mut app = app();
+        app.on_runtime(RuntimeEvent::ToolStarted {
+            call_id: "processes".into(),
+            name: "list_processes".into(),
+            arguments: serde_json::json!({}),
+        });
+        app.on_runtime(RuntimeEvent::ToolCompleted {
+            call_id: "processes".into(),
+            name: "list_processes".into(),
+            result: serde_json::json!({
+                "processes": [{
+                    "session_id": 4,
+                    "command": "cargo test",
+                    "status": "running",
+                    "elapsed_ms": 2_000
+                }]
+            }),
+        });
+
+        assert_eq!(
+            app.transcript[0].1,
+            "Checked background processes · 0s\n\nRunning for 2s · cargo test"
+        );
+    }
+
+    #[test]
+    fn process_poll_hides_internal_session_id() {
+        let mut app = app();
+        app.on_runtime(RuntimeEvent::ToolStarted {
+            call_id: "poll".into(),
+            name: "write_stdin".into(),
+            arguments: serde_json::json!({ "session_id": 7, "chars": "" }),
+        });
+        app.on_runtime(RuntimeEvent::ToolCompleted {
+            call_id: "poll".into(),
+            name: "write_stdin".into(),
+            result: serde_json::json!({
+                "session_id": 7,
+                "exit_code": null,
+                "stdout": "",
+                "stderr": ""
+            }),
+        });
+
+        assert_eq!(
+            app.transcript[0].1,
+            "Checked background process\n\nStill running"
+        );
+        assert!(!app.transcript[0].1.contains('7'));
+    }
+
+    #[test]
+    fn process_termination_hides_internal_session_id() {
+        let mut app = app();
+        app.on_runtime(RuntimeEvent::ToolStarted {
+            call_id: "terminate".into(),
+            name: "terminate_process".into(),
+            arguments: serde_json::json!({ "session_id": 7 }),
+        });
+        app.on_runtime(RuntimeEvent::ToolCompleted {
+            call_id: "terminate".into(),
+            name: "terminate_process".into(),
+            result: serde_json::json!({
+                "session_id": 7,
+                "status": "terminated",
+                "signal": "SIGINT",
+                "exit_code": null
+            }),
+        });
+
+        assert_eq!(
+            app.transcript[0].1,
+            "Stopped background process · 0s\n\nSIGINT"
+        );
+        assert!(!app.transcript[0].1.contains('7'));
+    }
+
+    #[test]
+    fn chat_history_scrolls_independently_of_input_history() {
+        let mut app = app();
+        app.scroll = 30;
+        app.follow = true;
+
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
+        assert_eq!(app.scroll, 27);
+        assert!(!app.follow);
+
+        app.on_mouse(MouseEventKind::ScrollDown);
+        assert_eq!(app.scroll, 30);
+        assert!(!app.follow);
     }
 
     #[test]

@@ -26,9 +26,11 @@ const PLUGIN_PRELUDE: &str = r#"
 (define provider-registry '())
 (define prompt-builder-registry '())
 (define compactor-registry '())
+(define file-editor-registry '())
 (define selected-prompt-builder "")
 (define selected-compactor "")
 (define selected-compactor-config (hash))
+(define selected-file-editor "")
 (define agent-instructions "")
 (define session-id "")
 (define runtime-config (hash))
@@ -72,11 +74,12 @@ const PLUGIN_PRELUDE: &str = r#"
                 (list (hash 'name name 'capability capability 'mode "hosted"
                             'provider provider 'build build)))))
 
-(define (register-callable-tool! name capability spec start complete)
+(define (register-callable-tool! name capability parallel spec start complete)
   (set! tool-implementation-registry
         (append tool-implementation-registry
                 (list (hash 'name name 'capability capability 'mode "callable"
-                            'spec spec 'start start 'complete complete)))))
+                            'parallel parallel 'spec spec
+                            'start start 'complete complete)))))
 
 (define (configure-tool! name config)
   (set! tool-config-registry
@@ -97,10 +100,17 @@ const PLUGIN_PRELUDE: &str = r#"
                 (list (hash 'name name 'needed needed 'start start
                             'complete complete)))))
 
+(define (register-file-editor! name spec prepare propose)
+  (set! file-editor-registry
+        (append file-editor-registry
+                (list (hash 'name name 'spec spec 'prepare prepare
+                            'propose propose)))))
+
 (define (select-prompt-builder! name) (set! selected-prompt-builder name))
 (define (select-compactor! name config)
   (set! selected-compactor name)
   (set! selected-compactor-config config))
+(define (select-file-editor! name) (set! selected-file-editor name))
 (define (load-plugin! _) #t)
 
 (define (registered-command-specs)
@@ -230,7 +240,30 @@ const PLUGIN_PRELUDE: &str = r#"
 
 (define (tools-for-model model)
   (append (registered-tools)
+          (if (equal? selected-file-editor "")
+              '()
+              (list (hash-ref
+                      (find-named file-editor-registry selected-file-editor)
+                      'spec)))
           (map resolved-tool-spec (resolved-tool-implementations model))))
+
+(define (selected-file-editor-entry)
+  (find-named file-editor-registry selected-file-editor))
+
+(define (selected-file-editor-tool-name)
+  (if (equal? selected-file-editor "")
+      ""
+      (hash-ref (hash-ref (selected-file-editor-entry) 'spec) 'name)))
+
+(define (prepare-file-edit name arguments)
+  (if (not (equal? name (selected-file-editor-tool-name)))
+      (error! (string-append "unknown file editor tool: " name)))
+  ((hash-ref (selected-file-editor-entry) 'prepare) arguments))
+
+(define (propose-file-edit name plan snapshots)
+  (if (not (equal? name (selected-file-editor-tool-name)))
+      (error! (string-append "unknown file editor tool: " name)))
+  ((hash-ref (selected-file-editor-entry) 'propose) plan snapshots))
 
 (define (callable-tool-for model name)
   (define (find implementations)
@@ -254,7 +287,7 @@ const PLUGIN_PRELUDE: &str = r#"
 (define (provider-request prompt model reasoning service-tier)
   ((hash-ref (model-provider model) 'effect)
    prompt (hash-ref (model-spec model) 'model) reasoning service-tier))
-(define (provider-call-for model events)
+(define (provider-calls-for model events)
   ((hash-ref (model-provider model) 'call) events))
 (define (provider-arguments-for model call)
   ((hash-ref (model-provider model) 'arguments) call))
@@ -312,6 +345,8 @@ const PLUGIN_PRELUDE: &str = r#"
   (if (equal? selected-compactor "") (error! "no compactor selected"))
   (find-named prompt-builder-registry selected-prompt-builder)
   (find-named compactor-registry selected-compactor)
+  (if (not (equal? selected-file-editor ""))
+      (find-named file-editor-registry selected-file-editor))
   (map (lambda (entry)
          (find-named tool-implementation-registry (hash-ref entry 'name)))
        tool-config-registry)
@@ -427,6 +462,64 @@ impl Policy {
         serde_json::from_str(&encoded).context("decode resolved tool routes")
     }
 
+    pub fn file_editor_tool_name(&mut self) -> Result<String> {
+        eval_string(&mut self.vm, "(selected-file-editor-tool-name)")
+    }
+
+    pub fn prepare_file_edit(
+        &mut self,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let encoded_arguments = serde_json::to_string(arguments)?;
+        let encoded = eval_string(
+            &mut self.vm,
+            &format!(
+                "(value->jsexpr-string (prepare-file-edit {} (string->jsexpr {})))",
+                scheme_string(name),
+                scheme_string(&encoded_arguments),
+            ),
+        )?;
+        serde_json::from_str(&encoded).context("decode file edit preparation")
+    }
+
+    pub fn propose_file_edit(
+        &mut self,
+        name: &str,
+        plan: &serde_json::Value,
+        snapshots: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let encoded_plan = serde_json::to_string(plan)?;
+        let encoded_snapshots = serde_json::to_string(snapshots)?;
+        let encoded = eval_string(
+            &mut self.vm,
+            &format!(
+                "(value->jsexpr-string (propose-file-edit {} (string->jsexpr {}) (string->jsexpr {})))",
+                scheme_string(name),
+                scheme_string(&encoded_plan),
+                scheme_string(&encoded_snapshots),
+            ),
+        )?;
+        serde_json::from_str(&encoded).context("decode proposed file changes")
+    }
+
+    pub fn complete_callable_tool(
+        &mut self,
+        implementation: &str,
+        events: &[serde_json::Value],
+    ) -> Result<serde_json::Value> {
+        let encoded_events = serde_json::to_string(events)?;
+        let encoded = eval_string(
+            &mut self.vm,
+            &format!(
+                "(value->jsexpr-string (complete-callable-tool (find-named tool-implementation-registry {}) (string->jsexpr {})))",
+                scheme_string(implementation),
+                scheme_string(&encoded_events),
+            ),
+        )?;
+        serde_json::from_str(&encoded).context("decode callable tool result")
+    }
+
     pub fn run_command(&mut self, name: &str, arguments: &str) -> Result<String> {
         let expression = format!(
             "(value->jsexpr-string (dispatch-command {} (string->jsexpr {}) {}))",
@@ -453,6 +546,7 @@ pub fn composition_plugins(main: &Path) -> Result<Vec<String>> {
             (define (select-compactor! _ __) #t)
             (define (configure-tool! _ __) #t)
             (define (select-tool! _ __) #t)
+            (define (select-file-editor! _) #t)
             {}
         "#,
         fs::read_to_string(main)?
@@ -533,6 +627,7 @@ mod tests {
             root.join("policy/tools/openai-web-search.scm"),
             root.join("policy/tools/openrouter-web-search.scm"),
             root.join("policy/tools/skills.scm"),
+            root.join("policy/tools/codex-patch.scm"),
             root.join("policy/prompts/simple.scm"),
             root.join("policy/compaction/simple.scm"),
         ]
@@ -703,6 +798,7 @@ mod tests {
             root.join("policy/providers/openrouter.scm"),
             root.join("policy/tools/openai-web-search.scm"),
             root.join("policy/tools/openrouter-web-search.scm"),
+            root.join("policy/tools/codex-patch.scm"),
             prompt,
             root.join("policy/compaction/simple.scm"),
         ];
@@ -751,14 +847,138 @@ mod tests {
                 error: String::new(),
             })
             .unwrap();
-        assert!(matches!(&output.effects[0], Effect::RunTool { name, .. } if name == "read_file"));
+        assert!(matches!(&output.effects[0], Effect::RunTools { calls }
+            if calls.len() == 1 && calls[0].name == "read_file"));
         let output = policy
-            .on_event(&Event::ToolCompleted {
-                name: "read_file".into(),
-                result: serde_json::json!({ "content": "policy" }),
+            .on_event(&Event::ToolsCompleted {
+                results: vec![phi_protocol::ToolResult {
+                    call_id: "call-1".into(),
+                    name: "read_file".into(),
+                    result: serde_json::json!({ "content": "policy" }),
+                }],
             })
             .unwrap();
         assert!(matches!(&output.effects[0], Effect::HttpRequest { .. }));
+    }
+
+    #[test]
+    fn policy_returns_all_tool_calls_in_one_batch() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut policy = policy(&root);
+        policy
+            .on_event(&Event::UserMessage {
+                content: "inspect both".into(),
+            })
+            .unwrap();
+        let output = policy
+            .on_event(&Event::HttpCompleted {
+                success: true,
+                status: 200,
+                events: ["a.rs", "b.rs"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, path)| {
+                        serde_json::json!({
+                            "type": "response.output_item.done",
+                            "item": {
+                                "type": "function_call",
+                                "call_id": format!("call-{index}"),
+                                "name": "read_file",
+                                "arguments": serde_json::json!({ "path": path }).to_string()
+                            }
+                        })
+                    })
+                    .collect(),
+                error: String::new(),
+            })
+            .unwrap();
+        let Effect::RunTools { calls } = &output.effects[0] else {
+            panic!("expected tool batch");
+        };
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].call_id, "call-0");
+        assert_eq!(calls[1].arguments["path"], "b.rs");
+
+        let output = policy
+            .on_event(&Event::ToolsCompleted {
+                results: calls
+                    .iter()
+                    .map(|call| phi_protocol::ToolResult {
+                        call_id: call.call_id.clone(),
+                        name: call.name.clone(),
+                        result: serde_json::json!({ "content": call.arguments["path"] }),
+                    })
+                    .collect(),
+            })
+            .unwrap();
+        assert!(
+            matches!(&output.effects[0], Effect::HttpRequest { body, .. }
+            if body["input"].as_array().unwrap().iter().filter(|item|
+                item["type"] == "function_call_output").count() == 2)
+        );
+    }
+
+    #[test]
+    fn codex_patch_plugin_prepares_and_proposes_file_changes() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut policy = policy(&root);
+        assert_eq!(policy.file_editor_tool_name().unwrap(), "patch");
+
+        let preparation = policy
+            .prepare_file_edit(
+                "patch",
+                &serde_json::json!({
+                    "patch": concat!(
+                        "*** Begin Patch\n",
+                        "*** Update File: src/main.rs\n",
+                        "@@ mod app {\n",
+                        "@@ fn main() {\n",
+                        "-    old();\n",
+                        "+    new();\n",
+                        "*** Add File: src/new.rs\n",
+                        "+pub fn added() {}\n",
+                        "*** Delete File: src/old.rs\n",
+                        "*** End Patch\n"
+                    )
+                }),
+            )
+            .unwrap();
+        assert_eq!(preparation["targets"].as_array().unwrap().len(), 3);
+
+        let changes = policy
+            .propose_file_edit(
+                "patch",
+                &preparation["plan"],
+                &serde_json::json!([
+                    {
+                        "path": "src/main.rs",
+                        "exists": true,
+                        "content": "mod app {\nfn main() {\n    old();\n}\n}\n",
+                        "revision": "one"
+                    },
+                    {
+                        "path": "src/new.rs",
+                        "exists": false,
+                        "content": "",
+                        "revision": ""
+                    },
+                    {
+                        "path": "src/old.rs",
+                        "exists": true,
+                        "content": "old\n",
+                        "revision": "two"
+                    }
+                ]),
+            )
+            .unwrap();
+        assert_eq!(changes[0]["operation"], "replace");
+        assert_eq!(
+            changes[0]["content"],
+            "mod app {\nfn main() {\n    new();\n}\n}\n"
+        );
+        assert_eq!(changes[1]["operation"], "create");
+        assert_eq!(changes[1]["content"], "pub fn added() {}\n");
+        assert_eq!(changes[2]["operation"], "delete");
     }
 
     #[test]
@@ -890,7 +1110,7 @@ mod tests {
                     "item": {
                         "type": "function_call",
                         "call_id": "call-1",
-                        "name": "shell",
+                        "name": "exec_command",
                         "arguments": "{}"
                     }
                 })],
@@ -898,9 +1118,12 @@ mod tests {
             })
             .unwrap();
         let output = policy
-            .on_event(&Event::ToolCompleted {
-                name: "shell".into(),
-                result: serde_json::json!({ "stdout": "x".repeat(64 * 1024) }),
+            .on_event(&Event::ToolsCompleted {
+                results: vec![phi_protocol::ToolResult {
+                    call_id: "call-1".into(),
+                    name: "exec_command".into(),
+                    result: serde_json::json!({ "stdout": "x".repeat(64 * 1024) }),
+                }],
             })
             .unwrap();
         assert!(
@@ -920,7 +1143,7 @@ mod tests {
             .unwrap();
         assert!(
             matches!(&output.effects[0], Effect::HttpRequest { body, .. }
-            if body["instructions"].as_str().unwrap().contains("Answer ordinary requests"))
+            if body["instructions"].as_str().unwrap().contains("running inside a Phi harness"))
         );
         let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
         assert!(serde_json::to_string(&state["messages"]).unwrap().len() <= 4_000);
@@ -1037,7 +1260,7 @@ mod tests {
         fs::write(
             &fallback,
             r#"(register-provider!
-                 "other" provider-effect responses-call responses-arguments
+                 "other" provider-effect responses-calls responses-arguments
                  responses-output responses-usage
                  (lambda (events) (responses-preserved-items "openai" events))
                  responses-message-phase)
@@ -1092,22 +1315,31 @@ mod tests {
             .unwrap();
         assert!(matches!(
             &output.effects[0],
-            Effect::HttpRequest { body, .. }
+            Effect::RunTools { calls }
+                if matches!(&calls[0].execution,
+                    phi_protocol::ToolExecution::Http { body, .. }
                 if body["model"] == "gpt-5.6-luna"
-                    && body["tools"][0]["type"] == "web_search"
+                    && body["tools"][0]["type"] == "web_search")
         ));
         let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
-        assert_eq!(state["activity"], "searching");
+        assert_eq!(state["activity"], "working");
 
-        let output = policy
-            .on_event(&Event::HttpCompleted {
-                success: true,
-                status: 200,
-                events: vec![serde_json::json!({
+        let result = policy
+            .complete_callable_tool(
+                "openai/callable-web-search",
+                &[serde_json::json!({
                     "type": "response.output_text.delta",
                     "delta": "Rust 1.97.0 (https://rust-lang.org)"
                 })],
-                error: String::new(),
+            )
+            .unwrap();
+        let output = policy
+            .on_event(&Event::ToolsCompleted {
+                results: vec![phi_protocol::ToolResult {
+                    call_id: "search-1".into(),
+                    name: "web_search".into(),
+                    result,
+                }],
             })
             .unwrap();
         assert!(matches!(
@@ -1143,6 +1375,7 @@ mod tests {
             root.join("policy/providers/openrouter.scm"),
             root.join("policy/tools/openai-web-search.scm"),
             root.join("policy/tools/openrouter-web-search.scm"),
+            root.join("policy/tools/codex-patch.scm"),
             root.join("policy/prompts/simple.scm"),
             root.join("policy/compaction/simple.scm"),
         ];
@@ -1183,7 +1416,8 @@ mod tests {
             .unwrap();
         assert!(matches!(
             &output.effects[0],
-            Effect::RunTool { arguments, .. } if arguments.get("malformed_arguments").is_some()
+            Effect::RunTools { calls }
+                if calls[0].arguments.get("malformed_arguments").is_some()
         ));
     }
 }

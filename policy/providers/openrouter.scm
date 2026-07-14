@@ -39,12 +39,13 @@
                    (hash-ref prompt 'messages))
               'tools (map responses-tool (hash-ref prompt 'tools))
               'tool_choice "auto"
+              'parallel_tool_calls #t
               'reasoning (hash 'effort reasoning)
               'store #f
               'stream #t)))
 
 (register-provider!
-  "openrouter" openrouter-provider-effect responses-call responses-arguments
+  "openrouter" openrouter-provider-effect responses-calls responses-arguments
   responses-output responses-usage
   (lambda (events) (responses-preserved-items "openrouter" events))
   responses-message-phase)

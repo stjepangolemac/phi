@@ -49,19 +49,21 @@
          (error! "provider item belongs to another provider"))]
     [else (error! "unsupported normalized message")]))
 
-(define (responses-call events)
+(define (responses-calls events)
   (if (null? events)
-      #f
+      '()
       (let* ([event (car events)]
-             [item (hash-try-get event 'item)])
+             [item (hash-try-get event 'item)]
+             [rest (responses-calls (cdr events))])
         (if (and (equal? (hash-ref event 'type) "response.output_item.done")
                  item
                  (equal? (hash-ref item 'type) "function_call"))
-            (hash 'kind "tool_call"
-                  'call_id (hash-ref item 'call_id)
-                  'name (hash-ref item 'name)
-                  'arguments (hash-ref item 'arguments))
-            (responses-call (cdr events))))))
+            (cons (hash 'kind "tool_call"
+                        'call_id (hash-ref item 'call_id)
+                        'name (hash-ref item 'name)
+                        'arguments (hash-ref item 'arguments))
+                  rest)
+            rest))))
 
 (define (responses-arguments call)
   (with-handler

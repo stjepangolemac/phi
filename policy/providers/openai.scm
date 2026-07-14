@@ -46,7 +46,7 @@
           'tools (map responses-tool (hash-ref prompt 'tools))
           'prompt_cache_key (runtime-session-id)
           'tool_choice "auto"
-          'parallel_tool_calls #f
+          'parallel_tool_calls #t
           'reasoning (hash 'effort reasoning 'context "all_turns")
           'service_tier service-tier
           'store #f
@@ -68,7 +68,7 @@
                     [else body])))
 
 (register-provider!
-  "openai" provider-effect responses-call responses-arguments responses-output
+  "openai" provider-effect responses-calls responses-arguments responses-output
   responses-usage
   (lambda (events) (responses-preserved-items "openai" events))
   responses-message-phase)

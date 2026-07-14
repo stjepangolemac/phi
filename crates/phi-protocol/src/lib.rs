@@ -19,9 +19,8 @@ pub enum Event {
         stdout_truncated: bool,
         stderr_truncated: bool,
     },
-    ToolCompleted {
-        name: String,
-        result: serde_json::Value,
+    ToolsCompleted {
+        results: Vec<ToolResult>,
     },
     HttpCompleted {
         success: bool,
@@ -40,9 +39,8 @@ pub enum Effect {
         stdin: String,
         timeout_ms: u64,
     },
-    RunTool {
-        name: String,
-        arguments: serde_json::Value,
+    RunTools {
+        calls: Vec<ToolCall>,
     },
     HttpRequest {
         url: String,
@@ -56,6 +54,37 @@ pub enum Effect {
     Finish {
         content: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolCall {
+    pub call_id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+    #[serde(flatten)]
+    pub execution: ToolExecution,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ToolExecution {
+    Direct,
+    Http {
+        implementation: String,
+        parallel: bool,
+        url: String,
+        secret: String,
+        headers: std::collections::BTreeMap<String, String>,
+        body: serde_json::Value,
+        timeout_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolResult {
+    pub call_id: String,
+    pub name: String,
+    pub result: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -1,4 +1,5 @@
 pub mod capability;
+pub mod file_edit;
 pub mod home;
 pub mod http;
 pub mod permissions;

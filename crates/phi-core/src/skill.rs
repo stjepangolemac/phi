@@ -77,6 +77,10 @@ impl Tool for LoadSkill {
             "content": fs::read_to_string(path)?,
         }))
     }
+
+    fn parallel_safe(&self) -> bool {
+        true
+    }
 }
 
 fn index(personal_root: &Path, workspace: &Path) -> Result<BTreeMap<String, Skill>> {
