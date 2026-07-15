@@ -1041,7 +1041,7 @@ fn start_event(options: RunOptions, initial_event: Event) -> Handle {
         .await
         {
             let _ = event_tx.send(RuntimeEvent::Error {
-                message: format!("{error:#}"),
+                message: runtime_error(&error),
             });
         }
     });
@@ -1380,7 +1380,7 @@ async fn execute_tool_calls(
                     "commands": catalog.commands.len()
                 })
             })
-            .unwrap_or_else(|error| serde_json::json!({ "error": format!("{error:#}") }));
+            .unwrap_or_else(|error| serde_json::json!({ "error": runtime_error(&error) }));
             send(
                 executor.events,
                 RuntimeEvent::ToolCompleted {
@@ -1528,7 +1528,7 @@ async fn execute_parallel_call(
                 });
             })
             .await
-            .unwrap_or_else(|error| serde_json::json!({ "error": error.to_string() }));
+            .unwrap_or_else(|error| serde_json::json!({ "error": runtime_error(&error) }));
         return RawToolResult {
             index,
             call_id,
@@ -1548,7 +1548,7 @@ async fn execute_parallel_call(
             .await
             .map_err(|error| anyhow::anyhow!(error))
             .and_then(|result| result)
-            .unwrap_or_else(|error| serde_json::json!({ "error": error.to_string() }));
+            .unwrap_or_else(|error| serde_json::json!({ "error": runtime_error(&error) }));
             RawToolOutput::Value {
                 result,
                 display: None,
@@ -1580,7 +1580,7 @@ async fn execute_parallel_call(
                 success: false,
                 status: 0,
                 events: Vec::new(),
-                error: error.to_string(),
+                error: runtime_error(&error),
             });
             RawToolOutput::Http {
                 implementation,
@@ -1636,7 +1636,7 @@ async fn execute_serial_call(
         })
         .await
         .and_then(|result| result)
-        .unwrap_or_else(|error| serde_json::json!({ "error": error.to_string() }));
+        .unwrap_or_else(|error| serde_json::json!({ "error": runtime_error(&error) }));
         return RawToolResult {
             index,
             call_id: call.call_id,
@@ -1683,7 +1683,7 @@ async fn execute_serial_call(
         })
         .await
         .and_then(|result| result)
-        .unwrap_or_else(|error| serde_json::json!({ "error": error.to_string() }));
+        .unwrap_or_else(|error| serde_json::json!({ "error": runtime_error(&error) }));
         return RawToolResult {
             index,
             call_id: call.call_id,
@@ -1704,7 +1704,7 @@ async fn execute_serial_call(
             executor.full_access,
         )
         .map(|(result, display)| (result, Some(display)))
-        .unwrap_or_else(|error| (serde_json::json!({ "error": error.to_string() }), None));
+        .unwrap_or_else(|error| (serde_json::json!({ "error": runtime_error(&error) }), None));
         return RawToolResult {
             index,
             call_id: call.call_id,
@@ -1743,7 +1743,7 @@ fn finish_tool_call(
         } => (
             policy
                 .complete_callable_tool(&implementation, &events)
-                .unwrap_or_else(|error| serde_json::json!({ "error": error.to_string() })),
+                .unwrap_or_else(|error| serde_json::json!({ "error": runtime_error(&error) })),
             None,
         ),
         RawToolOutput::Http {
@@ -1824,6 +1824,10 @@ async fn cancellable<T>(
         value = future => Ok(value),
         () = cancellation.cancelled() => bail!("cancelled"),
     }
+}
+
+fn runtime_error(error: &anyhow::Error) -> String {
+    phi_steel::user_error_message(error).unwrap_or_else(|| format!("{error:#}"))
 }
 
 fn send(events: &mpsc::UnboundedSender<RuntimeEvent>, event: RuntimeEvent) -> Result<()> {

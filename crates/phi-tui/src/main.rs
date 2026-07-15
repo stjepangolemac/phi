@@ -122,12 +122,20 @@ struct App {
     composer_width: usize,
     scroll: u16,
     follow: bool,
+    transcript_revision: u64,
+    transcript_cache: Option<TranscriptCache>,
     quit: bool,
 }
 
 struct ShellStream {
     heading: String,
     output: String,
+}
+
+struct TranscriptCache {
+    revision: u64,
+    width: usize,
+    lines: Vec<Line<'static>>,
 }
 
 impl App {
@@ -177,8 +185,19 @@ impl App {
             composer_width: 80,
             scroll: 0,
             follow: true,
+            transcript_revision: 0,
+            transcript_cache: None,
             quit: false,
         }
+    }
+
+    fn push_transcript(&mut self, role: impl Into<String>, content: impl Into<String>) {
+        self.transcript.push((role.into(), content.into()));
+        self.transcript_changed();
+    }
+
+    fn transcript_changed(&mut self) {
+        self.transcript_revision = self.transcript_revision.wrapping_add(1);
     }
 
     fn submit(&mut self) {
@@ -195,19 +214,17 @@ impl App {
         if let Some(invocation) = CommandInvocation::parse(&prompt) {
             match invocation.name.as_str() {
                 "help" if invocation.arguments.is_empty() => {
-                    self.transcript.push(("note".into(), self.help()));
+                    self.push_transcript("note", self.help());
                 }
                 "compact" if invocation.arguments.is_empty() => self.start_compaction(),
-                "compact" => self
-                    .transcript
-                    .push(("error".into(), "usage: /compact".into())),
+                "compact" => self.push_transcript("error", "usage: /compact"),
                 "model" if invocation.arguments.is_empty() => self.open_model_picker(),
                 _ => self.start_command(invocation),
             }
             self.follow = true;
             return;
         }
-        self.transcript.push(("you".into(), prompt.clone()));
+        self.push_transcript("you", prompt.clone());
         self.message_history.push(prompt.clone());
         self.history_index = None;
         self.history_draft.clear();
@@ -260,15 +277,16 @@ impl App {
                 if execution.action == CommandAction::NewSession {
                     self.reset_chat_state();
                 }
-                self.transcript.push((execution.role, execution.content));
+                self.push_transcript(execution.role, execution.content);
             }
-            Err(error) => self.transcript.push(("error".into(), error.to_string())),
+            Err(error) => self.push_transcript("error", error.to_string()),
         }
         self.status = "ready".into();
     }
 
     fn reset_chat_state(&mut self) {
         self.transcript.clear();
+        self.transcript_changed();
         self.current_model.clear();
         self.approval = None;
         self.estimated_tokens = self.token_budget.map(|_| 0);
@@ -323,15 +341,13 @@ impl App {
                 *selected = (*selected + 1).min(options.len().saturating_sub(1));
             }
             KeyCode::Esc => {
-                self.transcript
-                    .push(("note".into(), "Model selection cancelled.".into()));
+                self.push_transcript("note", "Model selection cancelled.");
                 self.follow = true;
                 return;
             }
             KeyCode::Enter => {
                 let Some(value) = options.get(*selected).map(|option| option.value.clone()) else {
-                    self.transcript
-                        .push(("error".into(), "No models available.".into()));
+                    self.push_transcript("error", "No models available.");
                     return;
                 };
                 picker = match picker {
@@ -422,15 +438,15 @@ impl App {
                         .compaction_started
                         .take()
                         .map_or(Duration::ZERO, |time| time.elapsed());
-                    self.transcript.push((
-                        "compaction_end".into(),
+                    self.push_transcript(
+                        "compaction_end",
                         format!(
                             "Compacted in {} · context {} → {} tokens",
                             human_duration(elapsed),
                             before,
                             estimated_tokens
                         ),
-                    ));
+                    );
                 }
                 self.estimated_tokens = Some(estimated_tokens);
                 self.token_budget = Some(token_budget);
@@ -499,7 +515,7 @@ impl App {
                     );
                 }
                 let block = self.transcript.len();
-                self.transcript.push(("tool".into(), content));
+                self.push_transcript("tool", content);
                 self.tool_blocks.insert(call_id, block);
             }
             RuntimeEvent::ToolOutput {
@@ -523,6 +539,7 @@ impl App {
                             .and_then(|index| self.transcript.get_mut(*index))
                     {
                         *block = rendered;
+                        self.transcript_changed();
                     }
                 }
             }
@@ -633,6 +650,7 @@ impl App {
                             content.push_str(&result);
                         }
                     }
+                    self.transcript_changed();
                 }
             }
             RuntimeEvent::ApprovalRequested { name } => self.approval = Some(name),
@@ -648,10 +666,10 @@ impl App {
                     .turn_started
                     .take()
                     .map_or(Duration::ZERO, |time| time.elapsed());
-                self.transcript.push((
-                    "turn_end".into(),
+                self.push_transcript(
+                    "turn_end",
                     format!("Worked for {}", human_duration(elapsed)),
-                ));
+                );
                 self.handle = None;
                 self.compaction_started = None;
                 self.tool_started.clear();
@@ -662,14 +680,14 @@ impl App {
             }
             RuntimeEvent::Error { message } => {
                 self.flush_model();
-                self.transcript.push((
-                    "error".into(),
+                self.push_transcript(
+                    "error",
                     if message == "cancelled" {
                         "Cancelled by user".into()
                     } else {
                         message
                     },
-                ));
+                );
                 self.handle = None;
                 self.approval = None;
                 self.turn_started = None;
@@ -685,8 +703,8 @@ impl App {
 
     fn flush_model(&mut self) {
         if !self.current_model.is_empty() {
-            self.transcript
-                .push(("phi".into(), std::mem::take(&mut self.current_model)));
+            let content = std::mem::take(&mut self.current_model);
+            self.push_transcript("phi", content);
         }
     }
 
@@ -1379,11 +1397,23 @@ fn picker_area(composer: Rect, height: u16) -> Rect {
     }
 }
 
-fn transcript_text(app: &App, width: usize) -> Text<'static> {
-    let mut lines = Vec::new();
-    for (role, content) in &app.transcript {
-        push_message(&mut lines, role, content, width);
+fn transcript_text(app: &mut App, width: usize) -> Text<'static> {
+    let stale = app
+        .transcript_cache
+        .as_ref()
+        .is_none_or(|cache| cache.revision != app.transcript_revision || cache.width != width);
+    if stale {
+        let mut lines = Vec::new();
+        for (role, content) in &app.transcript {
+            push_message(&mut lines, role, content, width);
+        }
+        app.transcript_cache = Some(TranscriptCache {
+            revision: app.transcript_revision,
+            width,
+            lines,
+        });
     }
+    let mut lines = app.transcript_cache.as_ref().unwrap().lines.clone();
     if !app.current_model.is_empty() {
         push_message(&mut lines, "phi", &app.current_model, width);
     }
@@ -2325,7 +2355,7 @@ mod tests {
         );
         assert!(app.current_model.is_empty());
         assert!(
-            transcript_text(&app, 80)
+            transcript_text(&mut app, 80)
                 .lines
                 .iter()
                 .any(|line| line.to_string().contains("Compacting for"))
@@ -2368,7 +2398,7 @@ mod tests {
     fn preserves_model_line_breaks() {
         let mut app = app();
         app.current_model = "Question?\n\nAnswer.".into();
-        let text = transcript_text(&app, 20);
+        let text = transcript_text(&mut app, 20);
         assert_eq!(text.lines.len(), 5);
         assert_eq!(text.lines[1].to_string().trim(), "• Question?");
         assert_eq!(text.lines[2].to_string().trim(), "");
@@ -2379,7 +2409,7 @@ mod tests {
     fn user_background_spans_the_full_block() {
         let mut app = app();
         app.transcript.push(("you".into(), "hello".into()));
-        let text = transcript_text(&app, 20);
+        let text = transcript_text(&mut app, 20);
         assert_eq!(text.lines.len(), 4);
         assert!(
             text.lines
@@ -2515,6 +2545,28 @@ mod tests {
                 app.handle.as_ref().unwrap().cancel();
             })
             .await;
+    }
+
+    #[test]
+    fn scrolling_reuses_the_rendered_transcript() {
+        let mut app = app();
+        app.push_transcript("phi", "**history**\n".repeat(10_000));
+        transcript_text(&mut app, 80);
+        let rendered = app.transcript_cache.as_ref().unwrap().lines.as_ptr();
+
+        app.scroll_up(3);
+        transcript_text(&mut app, 80);
+        assert_eq!(
+            app.transcript_cache.as_ref().unwrap().lines.as_ptr(),
+            rendered
+        );
+
+        app.push_transcript("phi", "new message");
+        transcript_text(&mut app, 80);
+        assert_ne!(
+            app.transcript_cache.as_ref().unwrap().lines.as_ptr(),
+            rendered
+        );
     }
 
     #[test]
@@ -2836,7 +2888,7 @@ mod tests {
         let mut app = app();
         app.current_model = "partial response".into();
         app.turn_started = Some(Instant::now() - Duration::from_secs(133));
-        let text = transcript_text(&app, 40);
+        let text = transcript_text(&mut app, 40);
         assert!(
             text.lines[text.lines.len() - 2]
                 .to_string()
@@ -2850,7 +2902,7 @@ mod tests {
         let mut app = app();
         app.transcript.push(("you".into(), "hello".into()));
         app.turn_started = Some(Instant::now());
-        let text = transcript_text(&app, 40);
+        let text = transcript_text(&mut app, 40);
         let gap = &text.lines[text.lines.len() - 3];
         assert!(gap.to_string().trim().is_empty());
         assert_eq!(gap.style.bg, None);

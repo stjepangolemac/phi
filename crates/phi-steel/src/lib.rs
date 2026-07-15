@@ -1,16 +1,42 @@
 use std::{
-    fs,
+    error::Error,
+    fmt, fs,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
 use phi_protocol::{CommandSpec, Event, ModelSpec, PolicyOutput};
 use serde::{Deserialize, Serialize};
-use steel::{rvals::FromSteelVal, steel_vm::engine::Engine};
+use steel::{SteelErr, rerrs::ErrorKind, rvals::FromSteelVal, steel_vm::engine::Engine};
 
 pub struct Policy {
     vm: Engine,
     state: String,
+}
+
+#[derive(Debug)]
+struct PolicyRejected {
+    message: String,
+}
+
+impl fmt::Display for PolicyRejected {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Error for PolicyRejected {}
+
+pub fn user_error_message(error: &anyhow::Error) -> Option<String> {
+    for cause in error.chain() {
+        if let Some(rejected) = cause.downcast_ref::<PolicyRejected>() {
+            return Some(rejected.message.clone());
+        }
+        if cause.downcast_ref::<SteelErr>().is_some() {
+            return Some("Internal policy error.".into());
+        }
+    }
+    None
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -630,9 +656,24 @@ pub struct ToolRoute {
 fn eval_string(vm: &mut Engine, expression: &str) -> Result<String> {
     let values = vm
         .compile_and_run_raw_program(expression.to_owned())
-        .context("run Steel policy")?;
+        .map_err(policy_error)?;
     let value = values.last().context("Steel policy returned no value")?;
     String::from_steelval(value).map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
+fn policy_error(error: SteelErr) -> anyhow::Error {
+    if error.kind() == ErrorKind::Generic {
+        let rendered = error.to_string();
+        let prefix = format!("Error: {}:", error.kind());
+        return anyhow::Error::new(PolicyRejected {
+            message: rendered
+                .strip_prefix(&prefix)
+                .unwrap_or(&rendered)
+                .trim()
+                .to_owned(),
+        });
+    }
+    anyhow::Error::new(error).context("run policy")
 }
 
 fn scheme_string(value: &str) -> String {
@@ -1010,6 +1051,46 @@ mod tests {
         assert_eq!(changes[1]["operation"], "create");
         assert_eq!(changes[1]["content"], "pub fn added() {}\n");
         assert_eq!(changes[2]["operation"], "delete");
+    }
+
+    #[test]
+    fn policy_rejections_expose_only_the_domain_message() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut policy = policy(&root);
+        let error = policy
+            .prepare_file_edit(
+                "patch",
+                &serde_json::json!({
+                    "patch": concat!(
+                        "*** Begin Patch\n",
+                        "*** Update File: src/main.rs\n",
+                        "@@ fn main() {\n",
+                        " unchanged();\n",
+                        "*** End Patch\n"
+                    )
+                }),
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            user_error_message(&error).as_deref(),
+            Some("patch hunk makes no change")
+        );
+        assert!(!error.to_string().contains("Steel"));
+        assert!(!error.to_string().contains("policy"));
+    }
+
+    #[test]
+    fn unexpected_steel_errors_are_hidden_from_users() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut policy = policy(&root);
+        let error = eval_string(&mut policy.vm, "missing-policy-function").unwrap_err();
+
+        assert_eq!(
+            user_error_message(&error).as_deref(),
+            Some("Internal policy error.")
+        );
+        assert!(format!("{error:#}").contains("FreeIdentifier"));
     }
 
     #[test]
