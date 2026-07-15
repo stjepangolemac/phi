@@ -7,7 +7,8 @@ use std::{
 use anyhow::Result;
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyModifiers,
-    MouseEventKind,
+    KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use futures_util::{FutureExt, StreamExt, future::pending};
 use phi_runtime::{
@@ -19,7 +20,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Clear, Padding, Paragraph},
+    widgets::{Block, Clear, Paragraph},
 };
 use tui_markdown::StyleSheet;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -837,7 +838,10 @@ impl App {
                 self.status = "cancelling".into();
             }
             KeyCode::Enter
-                if key.modifiers.contains(KeyModifiers::CONTROL) && !self.composer_locked() =>
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                    && !self.composer_locked() =>
             {
                 self.edit_composer();
                 self.composer.insert('\n');
@@ -968,7 +972,15 @@ pub async fn launch(options: RunOptions, prompt: Option<String>) -> Result<()> {
         ratatui::restore();
         return Err(error.into());
     }
+    let keyboard_enhanced = crossterm::execute!(
+        std::io::stdout(),
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )
+    .is_ok();
     let result = event_loop(&mut terminal, &mut app).await;
+    if keyboard_enhanced {
+        let _ = crossterm::execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    }
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
@@ -1036,17 +1048,14 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let composer_rows = composer_layout.row_count().min(max_composer_rows).max(1) as u16;
     let areas = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(3),
-            Constraint::Length(composer_rows + 2),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(frame.area());
 
-    draw_transcript(frame, app, areas[0]);
-    draw_composer(frame, app, areas[1], composer_layout);
-    draw_command_suggestions(frame, app, areas[1]);
-    draw_status(frame, app, areas[2]);
+    let composer_area = draw_content(frame, app, areas[0], composer_layout, composer_rows + 2);
+    if let Some(composer_area) = composer_area {
+        draw_command_suggestions(frame, app, composer_area);
+    }
+    draw_status(frame, app, areas[1]);
 
     if let Some(name) = &app.approval {
         let area = centered(frame.area(), 50, 5);
@@ -1058,22 +1067,29 @@ fn draw(frame: &mut Frame, app: &mut App) {
         );
     }
 
-    if let Some(picker) = &app.picker {
-        draw_picker(frame, picker, &app.catalog, areas[1]);
+    if let (Some(picker), Some(composer_area)) = (&app.picker, composer_area) {
+        draw_picker(frame, picker, &app.catalog, composer_area);
     }
 }
 
-fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
+fn draw_content(
+    frame: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    composer_layout: composer::ComposerLayout,
+    composer_height: u16,
+) -> Option<Rect> {
     let mut transcript = transcript_text(app, area.width as usize);
-    let height = area.height;
-    let padding = height.saturating_sub(transcript.lines.len() as u16) as usize;
+    let minimum_transcript_height = area.height.saturating_sub(composer_height);
+    let padding = minimum_transcript_height.saturating_sub(transcript.lines.len() as u16) as usize;
     if padding > 0 {
         let mut lines = vec![Line::raw(String::new()); padding];
         lines.extend(transcript.lines);
         transcript = Text::from(lines);
     }
-    let line_count = transcript.lines.len() as u16;
-    let max_scroll = line_count.saturating_sub(height);
+    let transcript_height = transcript.lines.len() as u16;
+    let document_height = transcript_height.saturating_add(composer_height);
+    let max_scroll = document_height.saturating_sub(area.height);
     if app.follow {
         app.scroll = max_scroll;
     } else {
@@ -1083,10 +1099,29 @@ fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     }
     frame.render_widget(Paragraph::new(transcript).scroll((app.scroll, 0)), area);
+
+    let composer_offset = transcript_height.saturating_sub(app.scroll);
+    if composer_offset >= area.height {
+        return None;
+    }
+    let composer_area = Rect {
+        x: area.x,
+        y: area.y + composer_offset,
+        width: area.width,
+        height: composer_height.min(area.height - composer_offset),
+    };
+    draw_composer(frame, app, composer_area, composer_height, composer_layout);
+    Some(composer_area)
 }
 
-fn draw_composer(frame: &mut Frame, app: &App, area: Rect, layout: composer::ComposerLayout) {
-    let visible_height = area.height.saturating_sub(2) as usize;
+fn draw_composer(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    full_height: u16,
+    layout: composer::ComposerLayout,
+) {
+    let visible_height = full_height.saturating_sub(2) as usize;
     let row_offset = layout
         .cursor_row()
         .saturating_add(1)
@@ -1096,19 +1131,30 @@ fn draw_composer(frame: &mut Frame, app: &App, area: Rect, layout: composer::Com
         .map(|row| Line::raw(row.to_owned()))
         .collect::<Vec<_>>();
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .padding(Padding::new(2, 2, 1, 1))
-                .style(Style::default().bg(Color::Rgb(30, 30, 34))),
-        ),
+        Block::default().style(Style::default().bg(Color::Rgb(30, 30, 34))),
         area,
     );
+
+    let text_height = area.height.saturating_sub(1).min(visible_height as u16);
+    if text_height > 0 {
+        frame.render_widget(
+            Paragraph::new(lines),
+            Rect {
+                x: area.x + 2,
+                y: area.y + 1,
+                width: area.width.saturating_sub(4),
+                height: text_height,
+            },
+        );
+    }
 
     if !app.composer_locked() && app.approval.is_none() && visible_height > 0 {
         let inner_width = area.width.saturating_sub(4).max(1);
         let x = area.x + 2 + (layout.cursor_column() as u16).min(inner_width.saturating_sub(1));
         let y = area.y + 1 + layout.cursor_row().saturating_sub(row_offset) as u16;
-        frame.set_cursor_position((x, y));
+        if y < area.bottom() {
+            frame.set_cursor_position((x, y));
+        }
     }
 }
 
@@ -2216,6 +2262,25 @@ mod tests {
     }
 
     #[test]
+    fn composer_scrolls_below_the_viewport_with_the_transcript() {
+        let mut app = app();
+        app.transcript.push(("phi".into(), "word ".repeat(200)));
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(
+            terminal.backend().buffer().cell((0, 6)).unwrap().bg,
+            Color::Rgb(30, 30, 34)
+        );
+
+        app.scroll_up(3);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert!((0..9).all(|y| buffer.cell((0, y)).unwrap().bg != Color::Rgb(30, 30, 34)));
+        assert!(!app.follow);
+    }
+
+    #[test]
     fn shows_provider_usage_and_cache_counts() {
         let mut app = app();
         app.on_runtime(RuntimeEvent::ContextUpdated {
@@ -2964,6 +3029,16 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
         app.on_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE));
         assert_eq!(app.composer.text, "one tw!o");
+    }
+
+    #[test]
+    fn shift_enter_inserts_a_newline_without_submitting() {
+        let mut app = app();
+        app.composer.set("first".into());
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_eq!(app.composer.text, "first\n");
+        assert!(app.handle.is_none());
+        assert!(app.transcript.is_empty());
     }
 
     #[test]
