@@ -17,9 +17,9 @@ use phi_runtime::{
 };
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::Rect,
     style::{Color, Modifier, Style},
-    text::{Line, Span, Text},
+    text::{Line, Span},
     widgets::{Block, Clear, Paragraph},
 };
 use tui_markdown::StyleSheet;
@@ -95,6 +95,8 @@ struct App {
     session_id: Option<String>,
     transcript: Vec<(String, String)>,
     current_model: String,
+    current_model_revision: u64,
+    current_model_cache: Option<RenderedLiveModel>,
     composer: Composer,
     handle: Option<Handle>,
     command_task: Option<tokio::task::JoinHandle<Result<CommandExecution>>>,
@@ -120,10 +122,14 @@ struct App {
     history_index: Option<usize>,
     history_draft: String,
     composer_width: usize,
-    scroll: u16,
+    scroll: usize,
     follow: bool,
-    transcript_revision: u64,
-    transcript_cache: Option<TranscriptCache>,
+    transcript_cache: Vec<Option<RenderedTranscriptBlock>>,
+    transcript_offsets: Vec<usize>,
+    #[cfg(test)]
+    transcript_render_count: usize,
+    #[cfg(test)]
+    current_model_render_count: usize,
     quit: bool,
 }
 
@@ -132,10 +138,14 @@ struct ShellStream {
     output: String,
 }
 
-struct TranscriptCache {
-    revision: u64,
+struct RenderedTranscriptBlock {
     width: usize,
     lines: Vec<Line<'static>>,
+}
+
+struct RenderedLiveModel {
+    revision: u64,
+    block: RenderedTranscriptBlock,
 }
 
 impl App {
@@ -152,12 +162,15 @@ impl App {
         } else {
             Vec::new()
         };
+        let transcript_cache = (0..transcript.len()).map(|_| None).collect();
         Self {
             session_id: options.session_id.clone(),
             options,
             catalog,
             transcript,
             current_model: String::new(),
+            current_model_revision: 0,
+            current_model_cache: None,
             composer: Composer::default(),
             handle: None,
             command_task: None,
@@ -185,19 +198,30 @@ impl App {
             composer_width: 80,
             scroll: 0,
             follow: true,
-            transcript_revision: 0,
-            transcript_cache: None,
+            transcript_cache,
+            transcript_offsets: Vec::new(),
+            #[cfg(test)]
+            transcript_render_count: 0,
+            #[cfg(test)]
+            current_model_render_count: 0,
             quit: false,
         }
     }
 
     fn push_transcript(&mut self, role: impl Into<String>, content: impl Into<String>) {
         self.transcript.push((role.into(), content.into()));
-        self.transcript_changed();
+        self.transcript_cache.push(None);
     }
 
-    fn transcript_changed(&mut self) {
-        self.transcript_revision = self.transcript_revision.wrapping_add(1);
+    fn transcript_changed(&mut self, index: usize) {
+        if let Some(cache) = self.transcript_cache.get_mut(index) {
+            *cache = None;
+        }
+    }
+
+    fn current_model_changed(&mut self) {
+        self.current_model_revision = self.current_model_revision.wrapping_add(1);
+        self.current_model_cache = None;
     }
 
     fn submit(&mut self) {
@@ -286,8 +310,10 @@ impl App {
 
     fn reset_chat_state(&mut self) {
         self.transcript.clear();
-        self.transcript_changed();
+        self.transcript_cache.clear();
+        self.transcript_offsets.clear();
         self.current_model.clear();
+        self.current_model_changed();
         self.approval = None;
         self.estimated_tokens = self.token_budget.map(|_| 0);
         self.input_tokens = None;
@@ -475,7 +501,10 @@ impl App {
                 _ => {}
             },
             RuntimeEvent::ToolRouteSelected { .. } => {}
-            RuntimeEvent::ModelDelta { content } => self.current_model.push_str(&content),
+            RuntimeEvent::ModelDelta { content } => {
+                self.current_model.push_str(&content);
+                self.current_model_changed();
+            }
             RuntimeEvent::ToolStarted {
                 call_id,
                 name,
@@ -533,13 +562,11 @@ impl App {
                         )
                     });
                     if let Some(rendered) = rendered
-                        && let Some((_, block)) = self
-                            .tool_blocks
-                            .get(&call_id)
-                            .and_then(|index| self.transcript.get_mut(*index))
+                        && let Some(index) = self.tool_blocks.get(&call_id).copied()
+                        && let Some((_, block)) = self.transcript.get_mut(index)
                     {
                         *block = rendered;
-                        self.transcript_changed();
+                        self.transcript_changed(index);
                     }
                 }
             }
@@ -558,8 +585,8 @@ impl App {
                     .shell_streams
                     .remove(&call_id)
                     .is_some_and(|stream| !stream.output.is_empty());
-                if let Some((role, content)) =
-                    block.and_then(|index| self.transcript.get_mut(index))
+                if let Some(index) = block
+                    && let Some((role, content)) = self.transcript.get_mut(index)
                 {
                     if name == "web_search" {
                         let action = &result["action"];
@@ -650,7 +677,7 @@ impl App {
                             content.push_str(&result);
                         }
                     }
-                    self.transcript_changed();
+                    self.transcript_changed(index);
                 }
             }
             RuntimeEvent::ApprovalRequested { name } => self.approval = Some(name),
@@ -660,6 +687,7 @@ impl App {
                     && !content.is_empty()
                 {
                     self.current_model = content;
+                    self.current_model_changed();
                 }
                 self.flush_model();
                 let elapsed = self
@@ -704,6 +732,7 @@ impl App {
     fn flush_model(&mut self) {
         if !self.current_model.is_empty() {
             let content = std::mem::take(&mut self.current_model);
+            self.current_model_changed();
             self.push_transcript("phi", content);
         }
     }
@@ -801,12 +830,12 @@ impl App {
         self.history_draft.clear();
     }
 
-    fn scroll_up(&mut self, lines: u16) {
+    fn scroll_up(&mut self, lines: usize) {
         self.scroll = self.scroll.saturating_sub(lines);
         self.follow = false;
     }
 
-    fn scroll_down(&mut self, lines: u16) {
+    fn scroll_down(&mut self, lines: usize) {
         self.scroll = self.scroll.saturating_add(lines);
         self.follow = false;
     }
@@ -1064,16 +1093,10 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let composer_layout = app.composer.layout(composer_width);
     let max_composer_rows = frame.area().height.saturating_sub(6).max(1) as usize;
     let composer_rows = composer_layout.row_count().min(max_composer_rows).max(1) as u16;
-    let areas = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(frame.area());
-
-    let composer_area = draw_content(frame, app, areas[0], composer_layout, composer_rows + 2);
+    let composer_area = draw_content(frame, app, frame.area(), composer_layout, composer_rows + 2);
     if let Some(composer_area) = composer_area {
         draw_command_suggestions(frame, app, composer_area);
     }
-    draw_status(frame, app, areas[1]);
 
     if let Some(name) = &app.approval {
         let area = centered(frame.area(), 50, 5);
@@ -1097,17 +1120,20 @@ fn draw_content(
     composer_layout: composer::ComposerLayout,
     composer_height: u16,
 ) -> Option<Rect> {
-    let mut transcript = transcript_text(app, area.width as usize);
-    let minimum_transcript_height = area.height.saturating_sub(composer_height);
-    let padding = minimum_transcript_height.saturating_sub(transcript.lines.len() as u16) as usize;
-    if padding > 0 {
-        let mut lines = vec![Line::raw(String::new()); padding];
-        lines.extend(transcript.lines);
-        transcript = Text::from(lines);
-    }
-    let transcript_height = transcript.lines.len() as u16;
-    let document_height = transcript_height.saturating_add(composer_height);
-    let max_scroll = document_height.saturating_sub(area.height);
+    let composer_height = composer_height.min(area.height.saturating_sub(1));
+    let width = area.width as usize;
+    sync_transcript_cache(app, width);
+    sync_live_model_cache(app, width);
+    let live_tail = live_transcript_tail(app, width);
+    let content_height =
+        cached_transcript_height(app) + cached_live_model_height(app) + live_tail.len();
+    let minimum_transcript_height = (area.height as usize)
+        .saturating_sub(composer_height as usize)
+        .saturating_sub(1);
+    let padding = minimum_transcript_height.saturating_sub(content_height);
+    let transcript_height = padding + content_height;
+    let document_height = transcript_height + composer_height as usize + 1;
+    let max_scroll = document_height.saturating_sub(area.height as usize);
     if app.follow {
         app.scroll = max_scroll;
     } else {
@@ -1116,20 +1142,54 @@ fn draw_content(
             app.follow = true;
         }
     }
-    frame.render_widget(Paragraph::new(transcript).scroll((app.scroll, 0)), area);
+    frame.render_widget(Clear, area);
 
-    let composer_offset = transcript_height.saturating_sub(app.scroll);
-    if composer_offset >= area.height {
-        return None;
+    let viewport_start = app.scroll;
+    let viewport_end = viewport_start + area.height as usize;
+    let visible_content_start = viewport_start.saturating_sub(padding);
+    let visible_content_end = viewport_end.saturating_sub(padding).min(content_height);
+    if visible_content_start < visible_content_end {
+        let lines = transcript_window(app, &live_tail, visible_content_start, visible_content_end);
+        let document_y = padding + visible_content_start;
+        frame.render_widget(
+            Paragraph::new(lines),
+            Rect {
+                x: area.x,
+                y: area.y + (document_y - viewport_start) as u16,
+                width: area.width,
+                height: (visible_content_end - visible_content_start) as u16,
+            },
+        );
     }
-    let composer_area = Rect {
-        x: area.x,
-        y: area.y + composer_offset,
-        width: area.width,
-        height: composer_height.min(area.height - composer_offset),
+
+    let composer_offset = transcript_height.saturating_sub(viewport_start);
+    let composer_area = if composer_offset < area.height as usize {
+        let composer_area = Rect {
+            x: area.x,
+            y: area.y + composer_offset as u16,
+            width: area.width,
+            height: composer_height.min(area.height - composer_offset as u16),
+        };
+        draw_composer(frame, app, composer_area, composer_height, composer_layout);
+        Some(composer_area)
+    } else {
+        None
     };
-    draw_composer(frame, app, composer_area, composer_height, composer_layout);
-    Some(composer_area)
+
+    let status_offset = transcript_height + composer_height as usize;
+    if status_offset >= viewport_start && status_offset < viewport_end {
+        draw_status(
+            frame,
+            app,
+            Rect {
+                x: area.x,
+                y: area.y + (status_offset - viewport_start) as u16,
+                width: area.width,
+                height: 1,
+            },
+        );
+    }
+    composer_area
 }
 
 fn draw_composer(
@@ -1397,28 +1457,88 @@ fn picker_area(composer: Rect, height: u16) -> Rect {
     }
 }
 
-fn transcript_text(app: &mut App, width: usize) -> Text<'static> {
-    let stale = app
-        .transcript_cache
-        .as_ref()
-        .is_none_or(|cache| cache.revision != app.transcript_revision || cache.width != width);
-    if stale {
-        let mut lines = Vec::new();
-        for (role, content) in &app.transcript {
+fn sync_transcript_cache(app: &mut App, width: usize) {
+    let mut first_changed = (app.transcript_offsets.len() != app.transcript.len())
+        .then_some(app.transcript_offsets.len().min(app.transcript.len()));
+    app.transcript_cache.truncate(app.transcript.len());
+    app.transcript_cache
+        .resize_with(app.transcript.len(), || None);
+    for (index, (role, content)) in app.transcript.iter().enumerate() {
+        let stale = app.transcript_cache[index]
+            .as_ref()
+            .is_none_or(|cache| cache.width != width);
+        if stale {
+            first_changed = Some(first_changed.map_or(index, |changed| changed.min(index)));
+            let mut lines = Vec::new();
             push_message(&mut lines, role, content, width);
+            app.transcript_cache[index] = Some(RenderedTranscriptBlock { width, lines });
+            #[cfg(test)]
+            {
+                app.transcript_render_count += 1;
+            }
         }
-        app.transcript_cache = Some(TranscriptCache {
-            revision: app.transcript_revision,
-            width,
-            lines,
-        });
     }
-    let mut lines = app.transcript_cache.as_ref().unwrap().lines.clone();
+    if let Some(first_changed) = first_changed {
+        app.transcript_offsets.truncate(first_changed);
+        let mut offset = app.transcript_offsets.last().copied().unwrap_or_default();
+        for block in app.transcript_cache[first_changed..]
+            .iter()
+            .filter_map(Option::as_ref)
+        {
+            offset += block.lines.len();
+            app.transcript_offsets.push(offset);
+        }
+    }
+}
+
+fn cached_transcript_height(app: &App) -> usize {
+    app.transcript_offsets.last().copied().unwrap_or_default()
+}
+
+fn sync_live_model_cache(app: &mut App, width: usize) {
     if !app.current_model.is_empty() {
-        push_message(&mut lines, "phi", &app.current_model, width);
+        let stale = app.current_model_cache.as_ref().is_none_or(|cache| {
+            cache.revision != app.current_model_revision || cache.block.width != width
+        });
+        if stale {
+            let mut model_lines = Vec::new();
+            push_message(&mut model_lines, "phi", &app.current_model, width);
+            app.current_model_cache = Some(RenderedLiveModel {
+                revision: app.current_model_revision,
+                block: RenderedTranscriptBlock {
+                    width,
+                    lines: model_lines,
+                },
+            });
+            #[cfg(test)]
+            {
+                app.current_model_render_count += 1;
+            }
+        }
     }
+}
+
+fn cached_live_model_height(app: &App) -> usize {
+    app.current_model_cache
+        .as_ref()
+        .map_or(0, |cache| cache.block.lines.len())
+}
+
+fn live_transcript_tail(app: &App, width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
     if let Some(turn_started) = app.turn_started {
-        if lines.last().is_some_and(|line| line.style.bg.is_some()) {
+        let last_line = app
+            .current_model_cache
+            .as_ref()
+            .and_then(|cache| cache.block.lines.last())
+            .or_else(|| {
+                app.transcript_cache
+                    .iter()
+                    .rev()
+                    .filter_map(Option::as_ref)
+                    .find_map(|block| block.lines.last())
+            });
+        if last_line.is_some_and(|line| line.style.bg.is_some()) {
             lines.push(Line::raw(" ".repeat(width)));
         }
         let (activity, started) = match app.status.as_str() {
@@ -1443,11 +1563,72 @@ fn transcript_text(app: &mut App, width: usize) -> Text<'static> {
     }
     if lines
         .last()
+        .or_else(|| {
+            app.current_model_cache
+                .as_ref()
+                .and_then(|cache| cache.block.lines.last())
+        })
+        .or_else(|| {
+            app.transcript_cache
+                .iter()
+                .rev()
+                .filter_map(Option::as_ref)
+                .find_map(|block| block.lines.last())
+        })
         .is_some_and(|line| !line.to_string().trim().is_empty() || line.style.bg.is_some())
     {
         lines.push(Line::raw(" ".repeat(width)));
     }
-    Text::from(lines)
+    lines
+}
+
+fn transcript_window(
+    app: &App,
+    live_tail: &[Line<'static>],
+    start: usize,
+    end: usize,
+) -> Vec<Line<'static>> {
+    let mut output = Vec::with_capacity(end.saturating_sub(start));
+    let first_block = app
+        .transcript_offsets
+        .partition_point(|offset| *offset <= start);
+    let mut offset = first_block
+        .checked_sub(1)
+        .and_then(|index| app.transcript_offsets.get(index))
+        .copied()
+        .unwrap_or_default();
+    for lines in app.transcript_cache[first_block..]
+        .iter()
+        .filter_map(Option::as_ref)
+        .map(|block| block.lines.as_slice())
+        .chain(
+            app.current_model_cache
+                .as_ref()
+                .map(|cache| cache.block.lines.as_slice()),
+        )
+        .chain(std::iter::once(live_tail))
+    {
+        let block_end = offset + lines.len();
+        if block_end > start && offset < end {
+            let local_start = start.saturating_sub(offset);
+            let local_end = (end - offset).min(lines.len());
+            output.extend(lines[local_start..local_end].iter().cloned());
+        }
+        offset = block_end;
+        if offset >= end {
+            break;
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+fn transcript_text(app: &mut App, width: usize) -> ratatui::text::Text<'static> {
+    sync_transcript_cache(app, width);
+    sync_live_model_cache(app, width);
+    let live_tail = live_transcript_tail(app, width);
+    let height = cached_transcript_height(app) + cached_live_model_height(app) + live_tail.len();
+    ratatui::text::Text::from(transcript_window(app, &live_tail, 0, height))
 }
 
 fn push_message(lines: &mut Vec<Line<'static>>, role: &str, content: &str, width: usize) {
@@ -2253,6 +2434,15 @@ mod tests {
     }
 
     #[test]
+    fn renders_one_row_terminal_without_hiding_status() {
+        let mut app = app();
+        app.push_transcript("phi", "hello");
+        let mut terminal = Terminal::new(TestBackend::new(40, 1)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(terminal.backend().to_string().contains("test/model"));
+    }
+
+    #[test]
     fn short_history_is_anchored_above_input() {
         let mut app = app();
         app.transcript.push(("phi".into(), "hello".into()));
@@ -2310,6 +2500,25 @@ mod tests {
         let buffer = terminal.backend().buffer();
         assert!((0..9).all(|y| buffer.cell((0, y)).unwrap().bg != Color::Rgb(30, 30, 34)));
         assert!(!app.follow);
+    }
+
+    #[test]
+    fn status_bar_scrolls_with_the_document() {
+        let mut app = app();
+        app.push_transcript("phi", "word ".repeat(200));
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(terminal.backend().to_string().contains("test/model"));
+
+        app.scroll_up(3);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(!terminal.backend().to_string().contains("test/model"));
+        assert!(!app.follow);
+
+        app.scroll_down(usize::MAX);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(terminal.backend().to_string().contains("test/model"));
+        assert!(app.follow);
     }
 
     #[test]
@@ -2403,6 +2612,28 @@ mod tests {
         assert_eq!(text.lines[1].to_string().trim(), "• Question?");
         assert_eq!(text.lines[2].to_string().trim(), "");
         assert_eq!(text.lines[3].to_string().trim(), "Answer.");
+    }
+
+    #[test]
+    fn live_model_only_rerenders_when_content_or_width_changes() {
+        let mut app = app();
+        app.on_runtime(RuntimeEvent::ModelDelta {
+            content: "partial".into(),
+        });
+        transcript_text(&mut app, 80);
+        let render_count = app.current_model_render_count;
+
+        transcript_text(&mut app, 80);
+        assert_eq!(app.current_model_render_count, render_count);
+
+        app.on_runtime(RuntimeEvent::ModelDelta {
+            content: " response".into(),
+        });
+        transcript_text(&mut app, 80);
+        assert_eq!(app.current_model_render_count, render_count + 1);
+
+        transcript_text(&mut app, 40);
+        assert_eq!(app.current_model_render_count, render_count + 2);
     }
 
     #[test]
@@ -2552,21 +2783,68 @@ mod tests {
         let mut app = app();
         app.push_transcript("phi", "**history**\n".repeat(10_000));
         transcript_text(&mut app, 80);
-        let rendered = app.transcript_cache.as_ref().unwrap().lines.as_ptr();
+        let rendered = app.transcript_cache[0].as_ref().unwrap().lines.as_ptr();
+        let render_count = app.transcript_render_count;
 
         app.scroll_up(3);
         transcript_text(&mut app, 80);
         assert_eq!(
-            app.transcript_cache.as_ref().unwrap().lines.as_ptr(),
+            app.transcript_cache[0].as_ref().unwrap().lines.as_ptr(),
             rendered
         );
+        assert_eq!(app.transcript_render_count, render_count);
 
         app.push_transcript("phi", "new message");
         transcript_text(&mut app, 80);
-        assert_ne!(
-            app.transcript_cache.as_ref().unwrap().lines.as_ptr(),
+        assert_eq!(
+            app.transcript_cache[0].as_ref().unwrap().lines.as_ptr(),
             rendered
         );
+        assert_eq!(app.transcript_render_count, render_count + 1);
+    }
+
+    #[test]
+    fn large_viewport_scroll_does_not_rerender_cached_blocks() {
+        let mut app = app();
+        for index in 0..500 {
+            app.push_transcript("phi", format!("**message {index}**\nbody"));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let render_count = app.transcript_render_count;
+        assert_eq!(render_count, 500);
+
+        app.scroll_up(10);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.transcript_render_count, render_count);
+
+        app.push_transcript("phi", "new message");
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.transcript_render_count, render_count + 1);
+        assert_eq!(app.transcript_offsets.len(), app.transcript.len());
+    }
+
+    #[test]
+    fn updating_one_block_only_rerenders_that_block() {
+        let mut app = app();
+        app.push_transcript("phi", "first");
+        app.push_transcript("tool", "Running");
+        transcript_text(&mut app, 80);
+        let first = app.transcript_cache[0].as_ref().unwrap().lines.as_ptr();
+        let render_count = app.transcript_render_count;
+
+        app.transcript[1].1 = "Finished\n\noutput".into();
+        app.transcript_changed(1);
+        transcript_text(&mut app, 80);
+
+        assert_eq!(
+            app.transcript_cache[0].as_ref().unwrap().lines.as_ptr(),
+            first
+        );
+        assert_eq!(app.transcript_render_count, render_count + 1);
+
+        transcript_text(&mut app, 40);
+        assert_eq!(app.transcript_render_count, render_count + 3);
     }
 
     #[test]
@@ -2574,7 +2852,7 @@ mod tests {
         let mut app = app();
         app.transcript.push(("phi".into(), "hello".into()));
         app.follow = false;
-        app.scroll = u16::MAX;
+        app.scroll = usize::MAX;
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         assert_eq!(app.scroll, 0);
@@ -2589,7 +2867,7 @@ mod tests {
             (0..30).map(|n| format!("line {n}\n")).collect(),
         ));
         app.follow = false;
-        app.scroll = u16::MAX;
+        app.scroll = usize::MAX;
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         assert!(app.follow);
