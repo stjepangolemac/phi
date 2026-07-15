@@ -11,6 +11,10 @@ use similar::TextDiff;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+mod workflow;
+
+pub use workflow::WorkflowTasks;
+
 pub use phi_core::process::ShellSessions as ProcessManager;
 pub use phi_protocol::{CommandInvocation, CommandSpec, ModelSpec, PickerOptionSpec};
 
@@ -24,6 +28,8 @@ pub struct RunOptions {
     pub interactive_approvals: bool,
     pub full_access: bool,
     pub processes: Arc<phi_core::process::ShellSessions>,
+    pub workflows: Arc<WorkflowTasks>,
+    pub output_schema: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -206,6 +212,7 @@ const OFFICIAL_PLUGINS: &[(&str, &str)] = &[
         "policy/tools/openrouter-web-search.scm",
     ),
     ("skills", "policy/tools/skills.scm"),
+    ("dynamic-workflows", "policy/tools/dynamic-workflows"),
     ("codex-patch", "policy/tools/codex-patch.scm"),
     ("simple-prompt", "policy/prompts/simple.scm"),
     ("simple-compaction", "policy/compaction/simple.scm"),
@@ -282,13 +289,19 @@ fn copy_official_plugin(
     relative: &str,
 ) -> Result<()> {
     let source = repository.join(relative);
-    if !source.is_file() {
+    if !source.exists() {
         bail!(
             "official plugin source is missing: {} (the repository used to install phi must remain available)",
             source.display()
         );
     }
     let plugin = home.builtins().join("plugins").join(name);
+    if source.is_dir() {
+        if plugin.exists() {
+            std::fs::remove_dir_all(&plugin)?;
+        }
+        return copy_tree(&source, &plugin);
+    }
     write_bundled(
         &plugin.join("plugin.json"),
         &serde_json::to_string_pretty(&serde_json::json!({
@@ -302,6 +315,20 @@ fn copy_official_plugin(
     }
     std::fs::copy(&source, plugin.join("main.scm"))
         .with_context(|| format!("copy official plugin {name} from {}", source.display()))?;
+    Ok(())
+}
+
+fn copy_tree(source: &Path, target: &Path) -> Result<()> {
+    std::fs::create_dir_all(target)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let destination = target.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &destination)?;
+        } else {
+            std::fs::copy(entry.path(), destination)?;
+        }
+    }
     Ok(())
 }
 
@@ -934,6 +961,16 @@ fn policy_config(
     user_state: &UserState,
     skills: &[phi_core::skill::SkillSpec],
 ) -> String {
+    policy_config_with_schema(capabilities, session_id, user_state, skills, None)
+}
+
+fn policy_config_with_schema(
+    capabilities: &phi_core::capability::Registry,
+    session_id: &str,
+    user_state: &UserState,
+    skills: &[phi_core::skill::SkillSpec],
+    output_schema: Option<&serde_json::Value>,
+) -> String {
     let mut tools = capabilities.specs();
     tools.push(phi_core::capability::exec_command_spec());
     tools.push(phi_core::capability::list_processes_spec());
@@ -950,6 +987,9 @@ fn policy_config(
         value["model"] = model.id.clone().into();
         value["reasoning"] = model.reasoning.clone().into();
         value["service_tier"] = model.service_tier.clone().into();
+    }
+    if let Some(schema) = output_schema {
+        value["output_schema"] = schema.clone();
     }
     value.to_string()
 }
@@ -1045,6 +1085,11 @@ async fn run(
             (session, sources, None)
         }
     };
+    let mut plugin_roots = sources
+        .plugins
+        .iter()
+        .map(|plugin| (plugin.name.clone(), plugin.root.clone()))
+        .collect::<std::collections::HashMap<_, _>>();
     let mut capabilities = Arc::new(capabilities(&home, options.full_access));
     let skills = discover_skills(&home, &workspace)?;
     send(
@@ -1064,11 +1109,12 @@ async fn run(
     let mut policy = phi_steel::Policy::load_with_state(
         &sources.config,
         &entrypoints(&sources),
-        &policy_config(
+        &policy_config_with_schema(
             &capabilities,
             session.id(),
             &load_user_state(&home)?,
             &skills,
+            options.output_schema.as_ref(),
         ),
         saved_state,
     )?;
@@ -1149,6 +1195,8 @@ async fn run(
                     events,
                     cancellation,
                     full_access: options.full_access,
+                    workflows: Arc::clone(&options.workflows),
+                    plugin_roots: &plugin_roots,
                 };
                 let (results, reloaded) = execute_tool_calls(
                     calls,
@@ -1165,17 +1213,23 @@ async fn run(
                     let sources = session
                         .composed_sources()?
                         .context("session has no composition snapshot")?;
+                    plugin_roots = sources
+                        .plugins
+                        .iter()
+                        .map(|plugin| (plugin.name.clone(), plugin.root.clone()))
+                        .collect();
                     config = load_config(&options.config_path)?;
                     capabilities = Arc::new(crate::capabilities(&home, options.full_access));
                     let skills = discover_skills(&home, &workspace)?;
                     policy = phi_steel::Policy::load_with_state(
                         &sources.config,
                         &entrypoints(&sources),
-                        &policy_config(
+                        &policy_config_with_schema(
                             &capabilities,
                             session.id(),
                             &load_user_state(&home)?,
                             &skills,
+                            options.output_schema.as_ref(),
                         ),
                         Some(state),
                     )?;
@@ -1253,6 +1307,8 @@ struct ToolBatchExecutor<'a> {
     events: &'a mpsc::UnboundedSender<RuntimeEvent>,
     cancellation: &'a CancellationToken,
     full_access: bool,
+    workflows: Arc<WorkflowTasks>,
+    plugin_roots: &'a std::collections::HashMap<String, PathBuf>,
 }
 
 async fn execute_tool_calls(
@@ -1391,6 +1447,9 @@ fn tool_call_parallel_safe(
     capabilities: &phi_core::capability::Registry,
     file_editor_tool: &str,
 ) -> bool {
+    if matches!(call.name.as_str(), "Workflow" | "TaskOutput" | "TaskStop") {
+        return false;
+    }
     match &call.execution {
         ToolExecution::Http { parallel, .. } => *parallel,
         ToolExecution::Direct => {
@@ -1545,6 +1604,49 @@ async fn execute_serial_call(
 ) -> RawToolResult {
     let index = pending.index;
     let call = pending.call;
+    if matches!(call.name.as_str(), "Workflow" | "TaskOutput" | "TaskStop") {
+        let result = cancellable(executor.cancellation, async {
+            match call.name.as_str() {
+                "Workflow" => {
+                    executor
+                        .workflows
+                        .launch(
+                            executor.workspace,
+                            &executor.home.root,
+                            executor.session.dir(),
+                            executor.plugin_roots,
+                            &call.arguments,
+                        )
+                        .await
+                }
+                "TaskOutput" => {
+                    executor
+                        .workflows
+                        .output(executor.session.dir(), &call.arguments)
+                        .await
+                }
+                "TaskStop" => {
+                    executor
+                        .workflows
+                        .stop(executor.session.dir(), &call.arguments)
+                        .await
+                }
+                _ => unreachable!(),
+            }
+        })
+        .await
+        .and_then(|result| result)
+        .unwrap_or_else(|error| serde_json::json!({ "error": error.to_string() }));
+        return RawToolResult {
+            index,
+            call_id: call.call_id,
+            name: call.name,
+            result: RawToolOutput::Value {
+                result,
+                display: None,
+            },
+        };
+    }
     if matches!(
         call.name.as_str(),
         "exec_command" | "write_stdin" | "list_processes" | "terminate_process"
@@ -1944,6 +2046,8 @@ mod tests {
             interactive_approvals: false,
             full_access: false,
             processes: Arc::new(phi_core::process::ShellSessions::default()),
+            workflows: Arc::new(WorkflowTasks::default()),
+            output_schema: None,
         };
         (workspace, options)
     }
@@ -2369,7 +2473,7 @@ mod tests {
                     && body["service_tier"] == "priority"
                     && body["prompt_cache_key"] == execution.session_id
                     && headers["session_id"] == execution.session_id
-                    && body["tools"].as_array().unwrap().len() == 9
+                    && body["tools"].as_array().unwrap().len() == 12
                     && body["tools"].as_array().unwrap().iter()
                         .any(|tool| tool["name"] == "read_file")
                     && body["tools"].as_array().unwrap().iter()
@@ -2386,6 +2490,12 @@ mod tests {
                         .any(|tool| tool["name"] == "load_skill")
                     && body["tools"].as_array().unwrap().iter()
                         .any(|tool| tool["name"] == "patch")
+                    && body["tools"].as_array().unwrap().iter()
+                        .any(|tool| tool["name"] == "Workflow" && tool["strict"] == false)
+                    && body["tools"].as_array().unwrap().iter()
+                        .any(|tool| tool["name"] == "TaskOutput")
+                    && body["tools"].as_array().unwrap().iter()
+                        .any(|tool| tool["name"] == "TaskStop")
                     && !body["tools"].as_array().unwrap().iter()
                         .any(|tool| tool["name"] == "replace_file")
                     && body["tools"].as_array().unwrap().iter()
@@ -2586,6 +2696,7 @@ mod tests {
                     })
                     .collect();
                 let cancellation = CancellationToken::new();
+                let plugin_roots = std::collections::HashMap::new();
                 let executor = ToolBatchExecutor {
                     workspace: workspace.path(),
                     home: &home,
@@ -2597,6 +2708,8 @@ mod tests {
                     events: &event_tx,
                     cancellation: &cancellation,
                     full_access: false,
+                    workflows: Arc::new(WorkflowTasks::default()),
+                    plugin_roots: &plugin_roots,
                 };
                 let (results, reloaded) = execute_tool_calls(
                     calls,
@@ -2642,7 +2755,7 @@ mod tests {
                 let mut policy = phi_steel::Policy::load_with_state(
                     &sources.config,
                     &entrypoints(&sources),
-                                        &policy_config(
+                    &policy_config(
                         &registry,
                         session.id(),
                         &load_user_state(&home).unwrap(),
@@ -2656,6 +2769,7 @@ mod tests {
                 let (event_tx, mut event_rx) = mpsc::unbounded_channel();
                 let (_command_tx, mut command_rx) = mpsc::unbounded_channel();
                 let cancellation = CancellationToken::new();
+                let plugin_roots = std::collections::HashMap::new();
                 let executor = ToolBatchExecutor {
                     workspace: workspace.path(),
                     home: &home,
@@ -2667,6 +2781,8 @@ mod tests {
                     events: &event_tx,
                     cancellation: &cancellation,
                     full_access: false,
+                    workflows: Arc::new(WorkflowTasks::default()),
+                    plugin_roots: &plugin_roots,
                 };
                 let (results, reloaded) = execute_tool_calls(
                     vec![ToolCall {

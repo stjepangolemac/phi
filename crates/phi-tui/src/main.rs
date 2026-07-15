@@ -1982,6 +1982,8 @@ mod tests {
                 interactive_approvals: true,
                 full_access: false,
                 processes: std::sync::Arc::new(phi_runtime::ProcessManager::default()),
+                workflows: std::sync::Arc::new(phi_runtime::WorkflowTasks::default()),
+                output_schema: None,
             },
             CommandCatalog {
                 commands: vec![

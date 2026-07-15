@@ -38,6 +38,8 @@ enum Command {
         session: String,
         prompt: String,
     },
+    /// Serve one-shot agent requests over line-framed JSON-RPC on stdin/stdout.
+    Rpc,
     Read {
         path: PathBuf,
     },
@@ -94,6 +96,7 @@ async fn run() -> Result<()> {
     let home = phi_runtime::initialize_home()?;
     let (allow_shell, allow_write, interactive_approvals) = approval_settings(&cli);
     let processes = std::sync::Arc::new(phi_core::process::ShellSessions::default());
+    let workflows = std::sync::Arc::new(phi_runtime::WorkflowTasks::default());
     let options = || phi_runtime::RunOptions {
         workspace: workspace.clone(),
         config_path: home.config(),
@@ -103,6 +106,8 @@ async fn run() -> Result<()> {
         interactive_approvals,
         full_access: cli.yolo,
         processes: std::sync::Arc::clone(&processes),
+        workflows: std::sync::Arc::clone(&workflows),
+        output_schema: None,
     };
     let result = async {
         match cli.command {
@@ -137,6 +142,7 @@ async fn run() -> Result<()> {
                 options.session_id = Some(session);
                 run_frontend(options, prompt, cli.json).await
             }
+            Some(Command::Rpc) => run_rpc(options()).await,
             Some(Command::Read { path }) => {
                 let mut registry = phi_core::capability::Registry::default();
                 registry.register(phi_core::capability::ReadFile {
@@ -177,8 +183,94 @@ async fn run() -> Result<()> {
         }
     }
     .await;
+    workflows.shutdown().await;
     processes.shutdown().await;
     result
+}
+
+async fn run_rpc(mut options: phi_runtime::RunOptions) -> Result<()> {
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let request: serde_json::Value = match serde_json::from_str(line.trim()) {
+        Ok(request) => request,
+        Err(error) => {
+            return rpc_error(
+                serde_json::Value::Null,
+                -32700,
+                &format!("parse error: {error}"),
+            );
+        }
+    };
+    let id = request
+        .get("id")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if request.get("jsonrpc").and_then(|value| value.as_str()) != Some("2.0") {
+        return rpc_error(id, -32600, "invalid JSON-RPC request");
+    }
+    if request.get("method").and_then(|value| value.as_str()) != Some("agent.run") {
+        return rpc_error(id, -32601, "method not found");
+    }
+    let Some(params) = request.get("params").and_then(|value| value.as_object()) else {
+        return rpc_error(id, -32602, "agent.run requires object params");
+    };
+    let Some(prompt) = params.get("prompt").and_then(|value| value.as_str()) else {
+        return rpc_error(id, -32602, "agent.run requires a string prompt");
+    };
+    let prompt = prompt.to_owned();
+    options.output_schema = params
+        .get("schema")
+        .filter(|value| !value.is_null())
+        .cloned();
+    let structured = options.output_schema.is_some();
+    let mut handle = phi_runtime::start(options, prompt);
+    let mut session_id = None;
+    while let Some(event) = handle.events.recv().await {
+        match &event {
+            phi_runtime::RuntimeEvent::Session { id } => session_id = Some(id.clone()),
+            phi_runtime::RuntimeEvent::Finished { content } => {
+                let value = if structured {
+                    match serde_json::from_str(content) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            return rpc_error(
+                                id,
+                                -32001,
+                                &format!("agent returned invalid structured output: {error}"),
+                            );
+                        }
+                    }
+                } else {
+                    serde_json::Value::String(content.clone())
+                };
+                emit_json(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "value": value, "sessionId": session_id }
+                }))?;
+                return Ok(());
+            }
+            phi_runtime::RuntimeEvent::Error { message } => {
+                return rpc_error(id, -32000, message);
+            }
+            _ => {
+                emit_json(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "agent.event",
+                    "params": event
+                }))?;
+            }
+        }
+    }
+    rpc_error(id, -32000, "agent stopped without a result")
+}
+
+fn rpc_error(id: serde_json::Value, code: i64, message: &str) -> Result<()> {
+    emit_json(&serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": code, "message": message }
+    }))
 }
 
 fn approval_settings(cli: &Cli) -> (bool, bool, bool) {

@@ -89,6 +89,10 @@ impl Session {
         &self.id
     }
 
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     pub fn append(&self, value: &impl Serialize) -> Result<()> {
         append(&self.dir.join("events.jsonl"), value)
     }

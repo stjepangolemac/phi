@@ -54,6 +54,7 @@ Phi keeps behavior in Scheme and data in JSON:
 (load-plugin! "openai-web-search")
 (load-plugin! "openrouter-web-search")
 (load-plugin! "skills")
+(load-plugin! "dynamic-workflows")
 (load-plugin! "codex-patch")
 (load-plugin! "simple-prompt")
 (load-plugin! "compaction-structured")
@@ -106,6 +107,8 @@ Provider plugins may register a useful default model catalog. Configuration is e
         'default_service_tier ""))
 ```
 
+Provider-neutral prompts contain `instructions`, `messages`, and `tools`; compactors may also attach `output_schema`. Responses-compatible providers map that schema to strict JSON-schema output.
+
 After changing `config.scm` or `config.json`, use `/reload`. The agent can call `reload_config` after reconfiguring itself. Reload validates the live composition, replaces the current session snapshot, and updates the catalog without discarding the conversation.
 
 Installed and official plugin files are implementation packages, not runtime configuration. For the current path-based Cargo installation, Phi copies official plugin sources from the repository used to build it into `~/.phi/builtins/<version>/` during home initialization; plugin source text is not embedded in the binary. The source repository must therefore remain at its build-time path. Configure providers, models, tools, prompts, compaction, and agent behavior only in the `config.scm` reported by `phi --json status`. If a plugin lacks a needed setting, extend its configuration interface instead of patching an installed copy.
@@ -125,6 +128,45 @@ Copy standard `SKILL.md` directories into `~/.phi/skills/` for personal use or `
 Workspace skills override personal skills with the same frontmatter name. Phi initially exposes only names and descriptions; the official `skills` plugin loads `SKILL.md` or a referenced file when needed. Use `/skills` to list discovered skills or mention `$skill-name` to request one explicitly.
 
 Phi also bundles an authoritative `phi-harness` skill describing its architecture, configuration, extension points, and operations. The agent loads it before inspecting or reconfiguring the harness. Use `phi status` for the human-readable active composition or `phi --json status` for machine-readable output.
+
+## Dynamic workflows
+
+The official `dynamic-workflows` plugin exposes background `Workflow`, `TaskOutput`, and `TaskStop` tools. Workflows are named JavaScript modules discovered in this order:
+
+```text
+.phi/workflows/NAME.js
+~/.phi/workflows/NAME.js
+LOADED_PLUGIN/workflows/NAME.js
+```
+
+Each module exports `meta` and a default async function. The `phi:workflow` module supplies `agent`, `parallel`, `pipeline`, `phase`, `log`, and `budget`:
+
+```js
+import { agent, parallel, phase } from "phi:workflow"
+
+export const meta = {
+  name: "review",
+  description: "Review a change from several perspectives."
+}
+
+export default async function ({ args }) {
+  phase("Review")
+  return parallel([
+    () => agent(`Review correctness:\n${args.diff}`, { label: "correctness" }),
+    () => agent(`Review tests:\n${args.diff}`, { label: "tests" })
+  ])
+}
+```
+
+`agent(prompt, { label?, schema? })` starts a fresh one-shot Phi child in the same workspace and Phi home. Child agents run with `--yolo`; workflows are therefore trusted local code. A schema requests strict JSON-schema output and makes `agent()` return the parsed JSON value. The initial runtime limits are 8 concurrent agents, 32 agents total per workflow, and 60 minutes per workflow. Workflow task files, progress, logs, and results live under the parent session's `workflows/tasks/` directory. Background tasks live for the duration of the parent Phi process and are cancelled when it exits.
+
+The public child-agent transport is one-request, line-framed JSON-RPC over stdio:
+
+```sh
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"agent.run","params":{"prompt":"Reply with ok","schema":null}}' | phi --workspace . --yolo rpc
+```
+
+Phi emits `agent.event` notifications followed by a result containing `value` and `sessionId`, or a JSON-RPC error.
 
 ## Plugins
 
@@ -166,7 +208,7 @@ These are possible extensions, not committed scope. Do not implement them withou
 - plans and task tracking
 - checkpoints and rewind
 - lifecycle hooks
-- subagents and worktrees
+- worktrees
 - durable memory
 - multimodal, editor, and browser context
 

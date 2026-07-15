@@ -38,7 +38,7 @@
 
 (define (provider-effect prompt model reasoning service-tier)
   (define history (hash-ref prompt 'messages))
-  (define body
+  (define base-body
     (hash 'model model
           'instructions (hash-ref prompt 'instructions)
           'input (map (lambda (message) (responses-message->item "openai" message))
@@ -53,6 +53,12 @@
           'stream #t
           'include (list "reasoning.encrypted_content"
                          "web_search_call.action.sources")))
+  (define output-schema (hash-try-get prompt 'output_schema))
+  (define body
+    (if output-schema
+        (hash-insert base-body 'text
+                     (responses-structured-text "phi_compaction" output-schema))
+        base-body))
   (hash 'type "http_request"
         'url "https://chatgpt.com/backend-api/codex/responses"
         'secret "openai_chatgpt"

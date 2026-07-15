@@ -180,8 +180,13 @@
           'effects (list effect))))
 
 (define (request-effect messages model reasoning service-tier)
+  (define prompt
+    (build-selected-prompt messages agent-instructions (tools-for-model model)))
+  (define output-schema (runtime-config-value 'output_schema #f))
   (provider-request
-    (build-selected-prompt messages agent-instructions (tools-for-model model))
+    (if output-schema
+        (hash-insert prompt 'output_schema output-schema)
+        prompt)
     model reasoning service-tier))
 
 (define (make-state messages compactions last-usage context-budget
@@ -209,6 +214,7 @@
 (load-plugin! "openai-web-search")
 (load-plugin! "openrouter-web-search")
 (load-plugin! "skills")
+(load-plugin! "dynamic-workflows")
 (load-plugin! "codex-patch")
 (load-plugin! "simple-prompt")
 (load-plugin! "compaction-structured")

@@ -591,6 +591,7 @@ pub fn composition_plugins(config: &Path) -> Result<Vec<String>> {
             (define (provider-request _ __ ___ ____) (hash))
             (define (build-selected-prompt _ __ ___) (hash))
             (define (tools-for-model _) '())
+            (define (runtime-config-value _ fallback) fallback)
             (define (estimated-message-tokens _) 0)
             (define (estimated-context-tokens _ __) 0)
             {}
@@ -1043,6 +1044,10 @@ mod tests {
             &output.effects[0],
             Effect::HttpRequest { body, .. }
                 if body["instructions"].as_str().unwrap().contains("Summarize")
+                    && body["text"]["format"]["type"] == "json_schema"
+                    && body["text"]["format"]["strict"] == true
+                    && body["text"]["format"]["schema"]["required"]
+                        .as_array().unwrap().len() == 5
         ));
         let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
         assert_eq!(state["activity"], "compacting");
@@ -1068,6 +1073,55 @@ mod tests {
         let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
         assert_eq!(state["activity"], "ready");
         assert_eq!(state["compactions"], 1.0);
+    }
+
+    #[test]
+    fn compaction_recovers_from_unstructured_model_output() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut policy = compact_policy(&root, 30_000);
+        policy
+            .on_event(&Event::UserMessage {
+                content: "investigate the design".into(),
+            })
+            .unwrap();
+        policy
+            .on_event(&Event::HttpCompleted {
+                success: true,
+                status: 200,
+                events: vec![serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "delta": "findings"
+                })],
+                error: String::new(),
+            })
+            .unwrap();
+        policy.on_event(&Event::CompactRequested).unwrap();
+
+        let output = policy
+            .on_event(&Event::HttpCompleted {
+                success: true,
+                status: 200,
+                events: vec![serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "delta": "# Investigation report\n\nThe model ignored the JSON request."
+                })],
+                error: String::new(),
+            })
+            .unwrap();
+        assert_eq!(
+            output.effects,
+            vec![Effect::Finish {
+                content: "Compaction complete.".into()
+            }]
+        );
+        let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
+        assert_eq!(state["compactions"], 1.0);
+        assert!(
+            state["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("The model ignored the JSON request.")
+        );
     }
 
     #[test]
@@ -1208,6 +1262,131 @@ mod tests {
         );
         assert_eq!(messages[1]["item"]["id"], "reasoning-5");
         assert_eq!(messages[16]["content"], "latest answer");
+    }
+
+    #[test]
+    fn structured_compaction_drops_tool_results_whose_calls_fall_out_of_the_tail() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut policy = compact_policy(&root, 5_000);
+        policy
+            .on_event(&Event::UserMessage {
+                content: "x".repeat(25_000),
+            })
+            .unwrap();
+        let output = policy
+            .on_event(&Event::HttpCompleted {
+                success: true,
+                status: 200,
+                events: (0..9)
+                    .map(|index| {
+                        serde_json::json!({
+                            "type": "response.output_item.done",
+                            "item": {
+                                "type": "function_call",
+                                "call_id": format!("call-{index}"),
+                                "name": "read_file",
+                                "arguments": "{}"
+                            }
+                        })
+                    })
+                    .collect(),
+                error: String::new(),
+            })
+            .unwrap();
+        let Effect::RunTools { calls } = &output.effects[0] else {
+            panic!("expected tool batch");
+        };
+        assert_eq!(calls.len(), 9);
+
+        let output = policy
+            .on_event(&Event::ToolsCompleted {
+                results: calls
+                    .iter()
+                    .map(|call| phi_protocol::ToolResult {
+                        call_id: call.call_id.clone(),
+                        name: call.name.clone(),
+                        result: serde_json::json!({ "content": "done" }),
+                    })
+                    .collect(),
+            })
+            .unwrap();
+        assert!(matches!(&output.effects[0], Effect::HttpRequest { .. }));
+
+        let output = policy
+            .on_event(&Event::HttpCompleted {
+                success: true,
+                status: 200,
+                events: vec![serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "delta": r#"{"objective":"continue","requirements":[],"current_state":["compacted"],"pending":[],"next_steps":[]}"#
+                })],
+                error: String::new(),
+            })
+            .unwrap();
+        let Effect::HttpRequest { body, .. } = &output.effects[0] else {
+            panic!("expected continuation request");
+        };
+        let input = body["input"].as_array().unwrap();
+        let call_ids = input
+            .iter()
+            .filter(|item| item["type"] == "function_call")
+            .map(|item| item["call_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        let output_ids = input
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+            .map(|item| item["call_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(call_ids, output_ids);
+        assert_eq!(call_ids.len(), 7);
+        assert!(!call_ids.contains(&"call-0"));
+        assert!(!call_ids.contains(&"call-1"));
+    }
+
+    #[test]
+    fn manual_compaction_repairs_an_existing_orphaned_tool_result() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let state = serde_json::json!({
+            "messages": [
+                { "kind": "message", "role": "user", "content": "summary" },
+                { "kind": "tool_result", "call_id": "orphan", "content": "lost call" },
+                { "kind": "tool_call", "call_id": "paired", "name": "read_file", "arguments": "{}" },
+                { "kind": "tool_result", "call_id": "paired", "content": "result" }
+            ],
+            "estimated_tokens": 10,
+            "compactions": 1,
+            "last_usage": {},
+            "model": "openai/gpt-5.6-luna",
+            "reasoning": "low",
+            "service_tier": "default",
+            "activity": "ready",
+            "pending_finish": "",
+            "context_window": 272000
+        });
+        let mut policy = Policy::load_with_state(
+            &root.join("config.scm"),
+            &plugins(&root),
+            r#"{"model":"openai/gpt-5.6-luna","reasoning":"low","service_tier":"default"}"#,
+            Some(state.to_string()),
+        )
+        .unwrap();
+
+        let output = policy.on_event(&Event::CompactRequested).unwrap();
+        let Effect::HttpRequest { body, .. } = &output.effects[0] else {
+            panic!("expected compaction request");
+        };
+        let input = body["input"].as_array().unwrap();
+        assert!(!input.iter().any(|item| item["call_id"] == "orphan"));
+        assert!(
+            input
+                .iter()
+                .any(|item| { item["type"] == "function_call" && item["call_id"] == "paired" })
+        );
+        assert!(
+            input.iter().any(|item| {
+                item["type"] == "function_call_output" && item["call_id"] == "paired"
+            })
+        );
     }
 
     #[test]

@@ -17,8 +17,15 @@
       (hash 'type "function"
             'name (hash-ref spec 'name)
             'description (hash-ref spec 'description)
-            'strict #t
+            'strict (not (equal? (hash-try-get spec 'strict_mode) "loose"))
             'parameters (hash-ref spec 'parameters))))
+
+(define (responses-structured-text name schema)
+  (hash 'format
+        (hash 'type "json_schema"
+              'name name
+              'strict #t
+              'schema schema)))
 
 (define (responses-message->item provider message)
   (define kind (hash-ref message 'kind))

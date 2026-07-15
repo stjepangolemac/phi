@@ -1954,6 +1954,7 @@ name = "phi-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "nix 0.28.0",
  "phi-core",
  "phi-protocol",
  "phi-steel",
@@ -1963,6 +1964,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "uuid",
 ]
 
 [[package]]

@@ -23,6 +23,20 @@
   "anthropic/claude-sonnet-4.6" "Claude Sonnet 4.6 through OpenRouter." "high")
 
 (define (openrouter-provider-effect prompt model reasoning _service-tier)
+  (define base-body
+    (hash 'model model
+          'instructions (hash-ref prompt 'instructions)
+          'input
+          (map (lambda (message)
+                 (responses-message->item "openrouter" message))
+               (hash-ref prompt 'messages))
+          'tools (map responses-tool (hash-ref prompt 'tools))
+          'tool_choice "auto"
+          'parallel_tool_calls #t
+          'reasoning (hash 'effort reasoning)
+          'store #f
+          'stream #t))
+  (define output-schema (hash-try-get prompt 'output_schema))
   (hash 'type "http_request"
         'url "https://openrouter.ai/api/v1/responses"
         'secret "openrouter"
@@ -30,18 +44,11 @@
         'timeout_ms 120000
         'stream responses-stream-rules
         'body
-        (hash 'model model
-              'instructions (hash-ref prompt 'instructions)
-              'input
-              (map (lambda (message)
-                     (responses-message->item "openrouter" message))
-                   (hash-ref prompt 'messages))
-              'tools (map responses-tool (hash-ref prompt 'tools))
-              'tool_choice "auto"
-              'parallel_tool_calls #t
-              'reasoning (hash 'effort reasoning)
-              'store #f
-              'stream #t)))
+        (if output-schema
+            (hash-insert base-body 'text
+                         (responses-structured-text
+                           "phi_compaction" output-schema))
+            base-body)))
 
 (register-provider!
   "openrouter" openrouter-provider-effect responses-calls responses-arguments

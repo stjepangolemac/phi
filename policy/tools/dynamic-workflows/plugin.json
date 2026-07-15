@@ -1,0 +1,5 @@
+{
+  "name": "dynamic-workflows",
+  "version": "0.1.0",
+  "entrypoint": "main.scm"
+}
