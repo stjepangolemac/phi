@@ -19,12 +19,15 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Clear, Padding, Paragraph, Wrap},
+    widgets::{Block, Clear, Padding, Paragraph},
 };
 use tui_markdown::StyleSheet;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+mod composer;
 mod diff_render;
+
+use composer::Composer;
 
 #[derive(Clone)]
 struct PhiMarkdown;
@@ -63,12 +66,6 @@ impl tui_markdown::StyleSheet for PhiMarkdown {
     }
 }
 
-#[derive(Default)]
-struct Composer {
-    text: String,
-    cursor: usize,
-}
-
 #[derive(Clone)]
 enum Picker {
     Model {
@@ -89,170 +86,6 @@ struct PickerItem {
     label: String,
     description: String,
     value: String,
-}
-
-impl Composer {
-    fn lines(&self) -> u16 {
-        self.text.lines().count().clamp(1, 5) as u16
-    }
-
-    fn take(&mut self) -> String {
-        self.cursor = 0;
-        std::mem::take(&mut self.text)
-    }
-
-    fn set(&mut self, text: String) {
-        self.cursor = text.len();
-        self.text = text;
-    }
-
-    fn insert(&mut self, character: char) {
-        self.text.insert(self.cursor, character);
-        self.cursor += character.len_utf8();
-    }
-
-    fn backspace(&mut self) {
-        if let Some(previous) = self.text[..self.cursor]
-            .char_indices()
-            .next_back()
-            .map(|(i, _)| i)
-        {
-            self.text.drain(previous..self.cursor);
-            self.cursor = previous;
-        }
-    }
-
-    fn delete(&mut self) {
-        if let Some(character) = self.text[self.cursor..].chars().next() {
-            self.text
-                .drain(self.cursor..self.cursor + character.len_utf8());
-        }
-    }
-
-    fn move_left(&mut self) {
-        if let Some((index, _)) = self.text[..self.cursor].char_indices().next_back() {
-            self.cursor = index;
-        }
-    }
-
-    fn move_right(&mut self) {
-        if let Some(character) = self.text[self.cursor..].chars().next() {
-            self.cursor += character.len_utf8();
-        }
-    }
-
-    fn move_word_left(&mut self) {
-        while self.previous_char().is_some_and(char::is_whitespace) {
-            self.move_left();
-        }
-        while self
-            .previous_char()
-            .is_some_and(|character| !character.is_whitespace())
-        {
-            self.move_left();
-        }
-    }
-
-    fn move_word_right(&mut self) {
-        while self.next_char().is_some_and(char::is_whitespace) {
-            self.move_right();
-        }
-        while self
-            .next_char()
-            .is_some_and(|character| !character.is_whitespace())
-        {
-            self.move_right();
-        }
-    }
-
-    fn delete_word_left(&mut self) {
-        let end = self.cursor;
-        self.move_word_left();
-        self.text.drain(self.cursor..end);
-    }
-
-    fn delete_to_line_start(&mut self) {
-        let end = self.cursor;
-        self.move_line_start();
-        self.text.drain(self.cursor..end);
-    }
-
-    fn move_line_start(&mut self) {
-        self.cursor = self.line_start();
-    }
-
-    fn move_line_end(&mut self) {
-        self.cursor = self.line_end();
-    }
-
-    fn move_start(&mut self) {
-        self.cursor = 0;
-    }
-
-    fn move_end(&mut self) {
-        self.cursor = self.text.len();
-    }
-
-    fn move_up(&mut self) {
-        let start = self.line_start();
-        if start == 0 {
-            return;
-        }
-        let column = self.text[start..self.cursor].chars().count();
-        let previous_end = start - 1;
-        let previous_start = self.text[..previous_end]
-            .rfind('\n')
-            .map_or(0, |index| index + 1);
-        self.cursor = byte_at_column(&self.text, previous_start, previous_end, column);
-    }
-
-    fn move_down(&mut self) {
-        let end = self.line_end();
-        if end == self.text.len() {
-            return;
-        }
-        let column = self.text[self.line_start()..self.cursor].chars().count();
-        let next_start = end + 1;
-        let next_end = self.text[next_start..]
-            .find('\n')
-            .map_or(self.text.len(), |index| next_start + index);
-        self.cursor = byte_at_column(&self.text, next_start, next_end, column);
-    }
-
-    fn on_first_line(&self) -> bool {
-        self.line_start() == 0
-    }
-
-    fn on_last_line(&self) -> bool {
-        self.line_end() == self.text.len()
-    }
-
-    fn line_start(&self) -> usize {
-        self.text[..self.cursor]
-            .rfind('\n')
-            .map_or(0, |index| index + 1)
-    }
-
-    fn line_end(&self) -> usize {
-        self.text[self.cursor..]
-            .find('\n')
-            .map_or(self.text.len(), |index| self.cursor + index)
-    }
-
-    fn previous_char(&self) -> Option<char> {
-        self.text[..self.cursor].chars().next_back()
-    }
-
-    fn next_char(&self) -> Option<char> {
-        self.text[self.cursor..].chars().next()
-    }
-}
-
-fn byte_at_column(text: &str, start: usize, end: usize, column: usize) -> usize {
-    text[start..end]
-        .char_indices()
-        .nth(column)
-        .map_or(end, |(index, _)| start + index)
 }
 
 struct App {
@@ -285,6 +118,7 @@ struct App {
     message_history: Vec<String>,
     history_index: Option<usize>,
     history_draft: String,
+    composer_width: usize,
     scroll: u16,
     follow: bool,
     quit: bool,
@@ -339,6 +173,7 @@ impl App {
             message_history: Vec::new(),
             history_index: None,
             history_draft: String::new(),
+            composer_width: 80,
             scroll: 0,
             follow: true,
             quit: false,
@@ -1093,13 +928,21 @@ impl App {
             KeyCode::End if !self.composer_locked() => self.composer.move_line_end(),
             KeyCode::Left if !self.composer_locked() => self.composer.move_left(),
             KeyCode::Right if !self.composer_locked() => self.composer.move_right(),
-            KeyCode::Up if !self.composer_locked() && self.composer.on_first_line() => {
+            KeyCode::Up
+                if !self.composer_locked()
+                    && self.composer.on_first_visual_row(self.composer_width) =>
+            {
                 self.previous_message();
             }
             KeyCode::Down if !self.composer_locked() && self.next_message() => {}
-            KeyCode::Up if !self.composer_locked() => self.composer.move_up(),
-            KeyCode::Down if !self.composer_locked() && !self.composer.on_last_line() => {
-                self.composer.move_down();
+            KeyCode::Up if !self.composer_locked() => {
+                self.composer.move_up(self.composer_width);
+            }
+            KeyCode::Down
+                if !self.composer_locked()
+                    && !self.composer.on_last_visual_row(self.composer_width) =>
+            {
+                self.composer.move_down(self.composer_width);
             }
             KeyCode::PageUp => {
                 self.scroll_up(10);
@@ -1186,18 +1029,43 @@ async fn next_runtime(handle: &mut Option<Handle>) -> Option<RuntimeEvent> {
 }
 
 fn draw(frame: &mut Frame, app: &mut App) {
-    let composer_height = app.composer.lines() + 2;
+    let composer_width = frame.area().width.saturating_sub(4).max(1) as usize;
+    app.composer_width = composer_width;
+    let composer_layout = app.composer.layout(composer_width);
+    let max_composer_rows = frame.area().height.saturating_sub(6).max(1) as usize;
+    let composer_rows = composer_layout.row_count().min(max_composer_rows).max(1) as u16;
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(3),
-            Constraint::Length(composer_height),
+            Constraint::Length(composer_rows + 2),
             Constraint::Length(1),
         ])
         .split(frame.area());
 
-    let mut transcript = transcript_text(app, areas[0].width as usize);
-    let height = areas[0].height;
+    draw_transcript(frame, app, areas[0]);
+    draw_composer(frame, app, areas[1], composer_layout);
+    draw_command_suggestions(frame, app, areas[1]);
+    draw_status(frame, app, areas[2]);
+
+    if let Some(name) = &app.approval {
+        let area = centered(frame.area(), 50, 5);
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(format!("Allow {name} once?\n\n[y] yes   [n] no"))
+                .style(Style::default().bg(Color::Rgb(45, 40, 25))),
+            area,
+        );
+    }
+
+    if let Some(picker) = &app.picker {
+        draw_picker(frame, picker, &app.catalog, areas[1]);
+    }
+}
+
+fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
+    let mut transcript = transcript_text(app, area.width as usize);
+    let height = area.height;
     let padding = height.saturating_sub(transcript.lines.len() as u16) as usize;
     if padding > 0 {
         let mut lines = vec![Line::raw(String::new()); padding];
@@ -1214,28 +1082,48 @@ fn draw(frame: &mut Frame, app: &mut App) {
             app.follow = true;
         }
     }
-    frame.render_widget(Paragraph::new(transcript).scroll((app.scroll, 0)), areas[0]);
+    frame.render_widget(Paragraph::new(transcript).scroll((app.scroll, 0)), area);
+}
+
+fn draw_composer(frame: &mut Frame, app: &App, area: Rect, layout: composer::ComposerLayout) {
+    let visible_height = area.height.saturating_sub(2) as usize;
+    let row_offset = layout
+        .cursor_row()
+        .saturating_add(1)
+        .saturating_sub(visible_height);
+    let lines = layout
+        .visible_rows(&app.composer.text, row_offset, visible_height)
+        .map(|row| Line::raw(row.to_owned()))
+        .collect::<Vec<_>>();
     frame.render_widget(
-        Paragraph::new(app.composer.text.as_str())
-            .block(
-                Block::default()
-                    .padding(Padding::new(2, 2, 1, 1))
-                    .style(Style::default().bg(Color::Rgb(30, 30, 34))),
-            )
-            .wrap(Wrap { trim: false }),
-        areas[1],
+        Paragraph::new(lines).block(
+            Block::default()
+                .padding(Padding::new(2, 2, 1, 1))
+                .style(Style::default().bg(Color::Rgb(30, 30, 34))),
+        ),
+        area,
     );
+
+    if !app.composer_locked() && app.approval.is_none() && visible_height > 0 {
+        let inner_width = area.width.saturating_sub(4).max(1);
+        let x = area.x + 2 + (layout.cursor_column() as u16).min(inner_width.saturating_sub(1));
+        let y = area.y + 1 + layout.cursor_row().saturating_sub(row_offset) as u16;
+        frame.set_cursor_position((x, y));
+    }
+}
+
+fn draw_command_suggestions(frame: &mut Frame, app: &App, composer: Rect) {
     let suggestions = if app.picker.is_none() {
         app.command_suggestions()
     } else {
         Vec::new()
     };
     if !suggestions.is_empty() {
-        let height = suggestions.len() as u16;
+        let height = (suggestions.len() as u16).min(composer.y);
         let area = Rect {
-            x: areas[1].x,
-            y: areas[1].y.saturating_sub(height),
-            width: areas[1].width,
+            x: composer.x,
+            y: composer.y.saturating_sub(height),
+            width: composer.width,
             height,
         };
         let content = suggestions
@@ -1259,18 +1147,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
             area,
         );
     }
-    if !app.composer_locked() && app.approval.is_none() {
-        let before_cursor = &app.composer.text[..app.composer.cursor];
-        let last_line = before_cursor.rsplit('\n').next().unwrap_or("");
-        let x = areas[1].x
-            + 2
-            + (last_line.chars().count() as u16).min(areas[1].width.saturating_sub(5));
-        let y = areas[1].y
-            + 1
-            + (before_cursor.lines().count().saturating_sub(1) as u16)
-                .min(areas[1].height.saturating_sub(3));
-        frame.set_cursor_position((x, y));
-    }
+}
+
+fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let context = match (app.estimated_tokens, app.token_budget) {
         (Some(used), Some(budget)) => {
             format!(
@@ -1307,22 +1186,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
     ]);
     frame.render_widget(
         Paragraph::new(status.join(" · ")).style(Style::default().fg(Color::DarkGray)),
-        areas[2],
+        area,
     );
-
-    if let Some(name) = &app.approval {
-        let area = centered(frame.area(), 50, 5);
-        frame.render_widget(Clear, area);
-        frame.render_widget(
-            Paragraph::new(format!("Allow {name} once?\n\n[y] yes   [n] no"))
-                .style(Style::default().bg(Color::Rgb(45, 40, 25))),
-            area,
-        );
-    }
-
-    if let Some(picker) = &app.picker {
-        draw_picker(frame, picker, &app.catalog, areas[1]);
-    }
 }
 
 fn picker_options(picker: &Picker, catalog: &CommandCatalog) -> Vec<PickerItem> {
@@ -2058,7 +1923,7 @@ fn centered(area: Rect, percent: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{Terminal, backend::TestBackend, layout::Position};
 
     fn app() -> App {
         App::new(
@@ -2319,6 +2184,35 @@ mod tests {
         assert_eq!(buffer.cell((2, 4)).unwrap().symbol(), "h");
         assert_eq!(buffer.cell((0, 5)).unwrap().symbol(), " ");
         assert_eq!(buffer.cell((0, 6)).unwrap().bg, Color::Rgb(30, 30, 34));
+    }
+
+    #[test]
+    fn composer_grows_upward_for_soft_wrapped_input() {
+        let mut app = app();
+        app.composer.set("alpha beta gamma delta".into());
+        let mut terminal = Terminal::new(TestBackend::new(20, 12)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer.cell((0, 7)).unwrap().bg, Color::Rgb(30, 30, 34));
+        assert_eq!(buffer.cell((2, 8)).unwrap().symbol(), "a");
+        assert_eq!(buffer.cell((3, 9)).unwrap().symbol(), "d");
+        assert_eq!(terminal.backend().cursor_position(), Position::new(8, 9));
+    }
+
+    #[test]
+    fn tall_composer_scrolls_internally_to_keep_cursor_visible() {
+        let mut app = app();
+        app.composer.set("one\ntwo\nthree\nfour\nfive\nsix".into());
+        let mut terminal = Terminal::new(TestBackend::new(20, 10)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer.cell((2, 4)).unwrap().symbol(), "t");
+        assert_eq!(buffer.cell((2, 5)).unwrap().symbol(), "f");
+        assert_eq!(buffer.cell((2, 6)).unwrap().symbol(), "f");
+        assert_eq!(buffer.cell((2, 7)).unwrap().symbol(), "s");
+        assert_eq!(terminal.backend().cursor_position(), Position::new(5, 7));
     }
 
     #[test]
@@ -3119,7 +3013,7 @@ mod tests {
 
         app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.composer.text, "top\nbottom");
-        assert!(app.composer.on_first_line());
+        assert!(app.composer.on_first_visual_row(app.composer_width));
         app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.composer.text, "previous");
     }
