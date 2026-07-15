@@ -90,7 +90,7 @@ fn parse_changes(content: &str) -> Option<Vec<Change<'_>>> {
         return Some(vec![Change {
             action,
             path,
-            diff: details.trim(),
+            diff: details.trim_matches(['\r', '\n']),
         }]);
     }
 
@@ -104,7 +104,7 @@ fn parse_changes(content: &str) -> Option<Vec<Change<'_>>> {
                 changes.push(Change {
                     action,
                     path,
-                    diff: details[start..offset].trim(),
+                    diff: details[start..offset].trim_matches(['\r', '\n']),
                 });
             }
             current = Some((action, path, offset + line.len()));
@@ -115,7 +115,7 @@ fn parse_changes(content: &str) -> Option<Vec<Change<'_>>> {
         changes.push(Change {
             action,
             path,
-            diff: details[start..].trim(),
+            diff: details[start..].trim_matches(['\r', '\n']),
         });
     }
     (!changes.is_empty()).then_some(changes)
@@ -366,6 +366,19 @@ mod tests {
         assert!(removed.to_string().starts_with("    9 − "));
         assert!(added.to_string().starts_with("    9 + "));
         assert_eq!(UnicodeWidthStr::width(removed.to_string().as_str()), 60);
+    }
+
+    #[test]
+    fn preserves_trailing_blank_context_lines() {
+        let mut lines = Vec::new();
+        push(
+            &mut lines,
+            "Updated `/tmp/main.scm` · 1s\n\n--- /tmp/main.scm\n+++ /tmp/main.scm\n@@ -1,2 +1,2 @@\n-old\n+new\n ",
+            40,
+        );
+
+        assert!(lines.iter().any(|line| line.style.bg == Some(REMOVED_BG)));
+        assert!(lines.iter().any(|line| line.style.bg == Some(ADDED_BG)));
     }
 
     #[test]

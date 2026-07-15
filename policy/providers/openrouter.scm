@@ -1,9 +1,8 @@
 ;; OpenRouter provider over its Responses-compatible endpoint.
 
 (define openrouter-reasoning-options
-  (list (hash 'id "low" 'description "Fast responses with lighter reasoning.")
-        (hash 'id "medium" 'description "Balanced reasoning depth.")
-        (hash 'id "high" 'description "Greater reasoning depth.")))
+  (list (hash 'id "high" 'description "Greater reasoning depth.")
+        (hash 'id "xhigh" 'description "Extra high reasoning depth; maps to maximum effort.")))
 
 (define (register-openrouter-model! id description default-reasoning)
   (register-model!
@@ -11,7 +10,7 @@
     (hash 'id id
           'label id
           'description description
-          'context_window 500000
+          'context_window 1000000
           'compaction_token_limit 180000
           'function_tools #t
           'hosted_tools (list "openrouter/hosted-web-search")
@@ -21,7 +20,7 @@
           'default_service_tier "")))
 
 (register-openrouter-model!
-  "x-ai/grok-4.5" "Grok 4.5 through OpenRouter." "medium")
+  "anthropic/claude-sonnet-4.6" "Claude Sonnet 4.6 through OpenRouter." "high")
 
 (define (openrouter-provider-effect prompt model reasoning _service-tier)
   (hash 'type "http_request"

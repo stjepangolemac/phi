@@ -1942,18 +1942,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "phi-eval"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "phi-core",
- "phi-steel",
- "serde_json",
- "similar",
- "tempfile",
-]
-
-[[package]]
 name = "phi-protocol"
 version = "0.1.0"
 dependencies = [
@@ -1967,7 +1955,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "phi-core",
- "phi-eval",
  "phi-protocol",
  "phi-steel",
  "serde",

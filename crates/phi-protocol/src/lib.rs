@@ -6,6 +6,7 @@ pub enum Event {
     UserMessage {
         content: String,
     },
+    CompactRequested,
     ModelSelected {
         model: String,
         reasoning: String,
@@ -60,9 +61,22 @@ pub enum Effect {
 pub struct ToolCall {
     pub call_id: String,
     pub name: String,
+    #[serde(deserialize_with = "deserialize_tool_arguments")]
     pub arguments: serde_json::Value,
     #[serde(flatten)]
     pub execution: ToolExecution,
+}
+
+fn deserialize_tool_arguments<'de, D>(deserializer: D) -> Result<serde_json::Value, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let serde_json::Value::String(raw) = value else {
+        return Ok(value);
+    };
+    Ok(serde_json::from_str(&raw)
+        .unwrap_or_else(|_| serde_json::json!({ "malformed_arguments": raw })))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

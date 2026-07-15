@@ -67,7 +67,7 @@ pub async fn run(
 }
 
 const DEFAULT_YIELD_MS: u64 = 10_000;
-const DEFAULT_POLL_MS: u64 = 5_000;
+const DEFAULT_POLL_MS: u64 = 15_000;
 const DEFAULT_OUTPUT_TOKENS: u64 = 10_000;
 const BYTES_PER_TOKEN: usize = 4;
 const TERMINATION_GRACE: Duration = Duration::from_millis(500);
@@ -240,11 +240,25 @@ impl ShellSessions {
     where
         F: FnMut(&str),
     {
+        self.exec_with_access(workspace, arguments, false, on_output)
+            .await
+    }
+
+    pub async fn exec_with_access<F>(
+        &self,
+        workspace: &Path,
+        arguments: &serde_json::Value,
+        full_access: bool,
+        on_output: F,
+    ) -> Result<serde_json::Value>
+    where
+        F: FnMut(&str),
+    {
         let command = arguments
             .get("cmd")
             .and_then(serde_json::Value::as_str)
             .context("exec_command requires cmd")?;
-        let workdir = resolve_workdir(workspace, arguments.get("workdir"))?;
+        let workdir = resolve_workdir(workspace, arguments.get("workdir"), full_access)?;
         let shell = arguments
             .get("shell")
             .and_then(serde_json::Value::as_str)
@@ -810,7 +824,11 @@ async fn read_async<R>(
     readers_done.fetch_add(1, Ordering::Relaxed);
 }
 
-fn resolve_workdir(workspace: &Path, value: Option<&serde_json::Value>) -> Result<PathBuf> {
+fn resolve_workdir(
+    workspace: &Path,
+    value: Option<&serde_json::Value>,
+    full_access: bool,
+) -> Result<PathBuf> {
     let root = std::fs::canonicalize(workspace)?;
     let requested = value
         .and_then(serde_json::Value::as_str)
@@ -822,7 +840,7 @@ fn resolve_workdir(workspace: &Path, value: Option<&serde_json::Value>) -> Resul
         root.join(requested)
     };
     let path = std::fs::canonicalize(path).context("command workdir does not exist")?;
-    if !path.starts_with(&root) {
+    if !full_access && !path.starts_with(&root) {
         bail!("command workdir is outside workspace");
     }
     Ok(path)
@@ -1271,6 +1289,30 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(error.to_string().contains("outside workspace"));
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unrestricted_exec_accepts_a_workdir_outside_the_workspace() {
+        local(async {
+            let workspace = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let sessions = ShellSessions::default();
+            let result = sessions
+                .exec_with_access(
+                    workspace.path(),
+                    &json!({ "cmd": "pwd", "workdir": outside.path() }),
+                    true,
+                    |_| {},
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                result["stdout"].as_str().unwrap().trim(),
+                outside.path().canonicalize().unwrap().display().to_string()
+            );
         })
         .await;
     }

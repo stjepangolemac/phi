@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 pub use phi_protocol::ToolSpec;
@@ -64,7 +68,10 @@ impl Registry {
     }
 }
 
-pub struct ReadFile;
+pub struct ReadFile {
+    pub full_access: bool,
+    pub additional_root: Option<PathBuf>,
+}
 
 const DEFAULT_READ_LINES: usize = 200;
 const MAX_READ_LINES: usize = 1_000;
@@ -72,18 +79,43 @@ const MAX_READ_BYTES: usize = 16 * 1024;
 
 impl Tool for ReadFile {
     fn spec(&self) -> ToolSpec {
-        Self::spec()
+        ToolSpec {
+            name: "read_file".into(),
+            description: if self.full_access {
+                "Read a bounded range of complete UTF-8 lines from any file. Use next_line to continue."
+            } else if self.additional_root.is_some() {
+                "Read a bounded range of complete UTF-8 lines inside the workspace or Phi home. Use next_line to continue."
+            } else {
+                "Read a bounded range of complete UTF-8 lines inside the workspace. Use next_line to continue."
+            }
+            .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "start_line": { "type": ["integer", "null"], "minimum": 1, "description": "First line to read. Use null for line 1." },
+                    "line_count": { "type": ["integer", "null"], "minimum": 1, "maximum": 1000, "description": "Maximum lines to read. Use null for 200." }
+                },
+                "required": ["path", "start_line", "line_count"],
+                "additionalProperties": false
+            }),
+        }
     }
 
     fn execute(&self, workspace: &Path, arguments: Value) -> Result<Value> {
-        let relative = arguments
+        let requested = arguments
             .get("path")
             .and_then(Value::as_str)
             .context("read_file requires a path")?;
         let root = fs::canonicalize(workspace)?;
-        let path = fs::canonicalize(root.join(relative))?;
-        if !path.starts_with(&root) {
-            bail!("path is outside workspace");
+        let path = fs::canonicalize(root.join(requested))?;
+        let in_additional_root = self
+            .additional_root
+            .as_ref()
+            .and_then(|root| fs::canonicalize(root).ok())
+            .is_some_and(|root| path.starts_with(root));
+        if !self.full_access && !path.starts_with(&root) && !in_additional_root {
+            bail!("path is outside allowed roots");
         }
 
         let start_line = arguments
@@ -132,8 +164,12 @@ impl Tool for ReadFile {
         let end_index = first + lines_read;
         let end_line = (lines_read > 0).then_some(end_index);
         let next_line = (end_index < lines.len()).then_some(end_index + 1);
+        let display_path = path.strip_prefix(&root).map_or_else(
+            |_| path.display().to_string(),
+            |path| path.display().to_string(),
+        );
         Ok(json!({
-            "path": path.strip_prefix(&root)?.display().to_string(),
+            "path": display_path,
             "content": selected,
             "start_line": start_line,
             "end_line": end_line,
@@ -148,25 +184,6 @@ impl Tool for ReadFile {
     }
 }
 
-impl ReadFile {
-    pub fn spec() -> ToolSpec {
-        ToolSpec {
-            name: "read_file".into(),
-            description: "Read a bounded range of complete UTF-8 lines inside the workspace. Use next_line to continue.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "start_line": { "type": ["integer", "null"], "minimum": 1, "description": "First line to read. Use null for line 1." },
-                    "line_count": { "type": ["integer", "null"], "minimum": 1, "maximum": 1000, "description": "Maximum lines to read. Use null for 200." }
-                },
-                "required": ["path", "start_line", "line_count"],
-                "additionalProperties": false
-            }),
-        }
-    }
-}
-
 pub fn exec_command_spec() -> ToolSpec {
     ToolSpec {
         name: "exec_command".into(),
@@ -175,7 +192,7 @@ pub fn exec_command_spec() -> ToolSpec {
             "type": "object",
             "properties": {
                 "cmd": { "type": "string", "description": "Shell command to execute." },
-                "workdir": { "type": ["string", "null"], "description": "Working directory relative to the workspace. Use null for the workspace root." },
+                "workdir": { "type": ["string", "null"], "description": "Working directory relative to the workspace, or an absolute path in --yolo mode. Use null for the workspace root." },
                 "shell": { "type": ["string", "null"], "description": "Shell binary. Use null for the user's shell." },
                 "login": { "type": ["boolean", "null"], "description": "Use login-shell semantics. Use null for false." },
                 "tty": { "type": ["boolean", "null"], "description": "Allocate a pseudo-terminal only for genuinely interactive programs. Use null for false." },
@@ -183,6 +200,19 @@ pub fn exec_command_spec() -> ToolSpec {
                 "max_output_tokens": { "type": ["integer", "null"], "minimum": 1, "maximum": 100000, "description": "Approximate output token budget. Use null for 10000." }
             },
             "required": ["cmd", "workdir", "shell", "login", "tty", "yield_time_ms", "max_output_tokens"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+pub fn reload_config_spec() -> ToolSpec {
+    ToolSpec {
+        name: "reload_config".into(),
+        description: "Reload Phi's current configuration and plugins into this conversation after changing them. The reload is validated before it becomes active.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
             "additionalProperties": false
         }),
     }
@@ -197,7 +227,7 @@ pub fn write_stdin_spec() -> ToolSpec {
             "properties": {
                 "session_id": { "type": "integer", "minimum": 1 },
                 "chars": { "type": ["string", "null"], "description": "Characters to write. Use null or an empty string to poll." },
-                "yield_time_ms": { "type": ["integer", "null"], "minimum": 1, "maximum": 300000 },
+                "yield_time_ms": { "type": ["integer", "null"], "minimum": 1, "maximum": 300000, "description": "Milliseconds to wait for output or process completion. Use null for 15000 when polling, or 250 after sending input." },
                 "max_output_tokens": { "type": ["integer", "null"], "minimum": 1, "maximum": 100000 }
             },
             "required": ["session_id", "chars", "yield_time_ms", "max_output_tokens"],
@@ -243,7 +273,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), "hello").unwrap();
         let mut registry = Registry::default();
-        registry.register(ReadFile);
+        registry.register(ReadFile {
+            full_access: false,
+            additional_root: None,
+        });
         let result = registry
             .execute(dir.path(), "read_file", json!({ "path": "a.txt" }))
             .unwrap();
@@ -264,7 +297,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let content: String = (1..=250).map(|line| format!("line {line}\n")).collect();
         fs::write(dir.path().join("lines.txt"), content).unwrap();
-        let tool = ReadFile;
+        let tool = ReadFile {
+            full_access: false,
+            additional_root: None,
+        };
 
         let first = tool
             .execute(dir.path(), json!({ "path": "lines.txt" }))
@@ -294,7 +330,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let line = format!("{}\n", "x".repeat(8_191));
         fs::write(dir.path().join("large.txt"), line.repeat(3)).unwrap();
-        let tool = ReadFile;
+        let tool = ReadFile {
+            full_access: false,
+            additional_root: None,
+        };
 
         let result = tool
             .execute(dir.path(), json!({ "path": "large.txt", "line_count": 3 }))
@@ -314,6 +353,36 @@ mod tests {
         assert!(
             tool.execute(dir.path(), json!({ "path": "wide.txt" }))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn unrestricted_read_file_accepts_absolute_paths_outside_the_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let path = outside.path().join("outside.txt");
+        fs::write(&path, "outside\n").unwrap();
+
+        let restricted = ReadFile {
+            full_access: false,
+            additional_root: None,
+        };
+        assert!(
+            restricted
+                .execute(workspace.path(), json!({ "path": path }))
+                .is_err()
+        );
+        let unrestricted = ReadFile {
+            full_access: true,
+            additional_root: None,
+        };
+        let result = unrestricted
+            .execute(workspace.path(), json!({ "path": path }))
+            .unwrap();
+        assert_eq!(result["content"], "outside\n");
+        assert_eq!(
+            result["path"],
+            fs::canonicalize(path).unwrap().display().to_string()
         );
     }
 }

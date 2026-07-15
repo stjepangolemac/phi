@@ -1,5 +1,5 @@
 (set-agent-instructions!
-  "You are a coding agent running inside a Phi harness in the user's current workspace. Work directly on the user's requests using the available tools. Inspect before editing, verify changes, and continue until the requested outcome is complete. Keep responses concise. The user can already see tool calls and their output, so do not repeat them verbatim; state only the conclusion or necessary interpretation. Only when the user explicitly asks you to improve Phi's policy: inspect the active policy, make one small measurable improvement, submit the complete replacement with a concise hypothesis, and report the candidate id, validation, and diff for human approval. Never claim activation.")
+  "You are a coding agent running inside a Phi harness in the user's current workspace. Work directly on the user's requests using the available tools. Inspect before editing, verify changes, and continue until the requested outcome is complete. Keep responses concise. When working on or reconfiguring the Phi harness itself, load the phi-harness skill before acting. The user can already see tool calls and their output, so do not repeat them verbatim; state only the conclusion or necessary interpretation. When reconfiguring Phi, edit the active config.scm, validate the change, and reload it into the current conversation.")
 
 (define (init encoded-config)
   (define config (string->jsexpr encoded-config))
@@ -14,11 +14,11 @@
                 "ready" "")))
 
 (define (tool-call-execution model call)
-  (define arguments (provider-arguments-for model call))
   (define implementation
     (callable-tool-for model (hash-ref call 'name)))
   (if implementation
-      (let ([request (start-callable-tool implementation arguments)])
+      (let* ([arguments (provider-arguments-for model call)]
+             [request (start-callable-tool implementation arguments)])
         (hash-insert
           (hash-insert
             (hash-insert
@@ -33,7 +33,7 @@
       (hash 'mode "direct"
             'call_id (hash-ref call 'call_id)
             'name (hash-ref call 'name)
-            'arguments arguments)))
+            'arguments (hash-ref call 'arguments))))
 
 (define (tool-result-message result)
   (hash 'kind "tool_result"
@@ -66,6 +66,19 @@
              (make-state messages compactions last-usage context-budget
                          model reasoning service-tier "working" ""))
        (request-effect messages model reasoning service-tier)]
+      [(equal? event-type "compact_requested")
+       (if (null? messages)
+           (begin
+             (set! next-state
+                   (make-state messages compactions last-usage context-budget
+                               model reasoning service-tier "ready" ""))
+             (hash 'type "finish" 'content "Nothing to compact."))
+           (begin
+             (set! next-state
+                   (make-state messages compactions last-usage context-budget
+                               model reasoning service-tier "compacting"
+                               "Compaction complete."))
+             (start-selected-compaction messages context-budget)))]
       [(equal? event-type "model_selected")
        (set! model (hash-ref event 'model))
        (set! context-budget
@@ -189,3 +202,37 @@
         'activity activity
         'pending_finish pending-finish
         'context_window (hash-ref (model-spec model) 'context_window)))
+
+(load-plugin! "responses")
+(load-plugin! "openai")
+(load-plugin! "openrouter")
+(load-plugin! "openai-web-search")
+(load-plugin! "openrouter-web-search")
+(load-plugin! "skills")
+(load-plugin! "codex-patch")
+(load-plugin! "simple-prompt")
+(load-plugin! "compaction-structured")
+
+(select-prompt-builder! "simple")
+(select-file-editor! "codex-patch")
+(configure-tool! "openai/hosted-web-search" (hash))
+(configure-tool!
+  "openai/callable-web-search"
+  (hash 'model "openai/gpt-5.6-luna"
+        'reasoning "low"
+        'service_tier "default"
+        'search (hash)))
+(configure-tool!
+  "openrouter/hosted-web-search"
+  (hash 'engine "native"))
+(select-tool!
+  "web_search"
+  (list (hash 'prefer "same-route-hosted")
+        (hash 'use "openai/callable-web-search")))
+(select-compactor!
+  "structured"
+  (hash 'model "openai/gpt-5.6-luna"
+        'reasoning "low"
+        'service_tier "default"
+        'retain_messages 16
+        'retain_token_limit 24000))

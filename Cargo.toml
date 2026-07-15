@@ -2,7 +2,6 @@
 members = [
   "crates/phi-cli",
   "crates/phi-core",
-  "crates/phi-eval",
   "crates/phi-protocol",
   "crates/phi-runtime",
   "crates/phi-steel",

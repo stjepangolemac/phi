@@ -23,14 +23,19 @@ struct Skill {
     root: PathBuf,
 }
 
-pub fn discover(personal_root: &Path, workspace: &Path) -> Result<Vec<SkillSpec>> {
-    Ok(index(personal_root, workspace)?
+pub fn discover(
+    system_root: &Path,
+    personal_root: &Path,
+    workspace: &Path,
+) -> Result<Vec<SkillSpec>> {
+    Ok(index(system_root, personal_root, workspace)?
         .into_values()
         .map(|skill| skill.spec)
         .collect())
 }
 
 pub struct LoadSkill {
+    pub system_root: PathBuf,
     pub personal_root: PathBuf,
 }
 
@@ -60,7 +65,7 @@ impl Tool for LoadSkill {
             .get("path")
             .and_then(Value::as_str)
             .unwrap_or("SKILL.md");
-        let skills = index(&self.personal_root, workspace)?;
+        let skills = index(&self.system_root, &self.personal_root, workspace)?;
         let skill = skills
             .get(name)
             .with_context(|| format!("skill not found: {name}"))?;
@@ -83,10 +88,15 @@ impl Tool for LoadSkill {
     }
 }
 
-fn index(personal_root: &Path, workspace: &Path) -> Result<BTreeMap<String, Skill>> {
+fn index(
+    system_root: &Path,
+    personal_root: &Path,
+    workspace: &Path,
+) -> Result<BTreeMap<String, Skill>> {
     let mut skills = BTreeMap::new();
     add_root(&mut skills, personal_root)?;
     add_root(&mut skills, &workspace.join(".phi/skills"))?;
+    add_root(&mut skills, system_root)?;
     Ok(skills)
 }
 
@@ -209,6 +219,7 @@ mod tests {
     fn workspace_skills_override_personal_skills() {
         let temp = tempfile::tempdir().unwrap();
         let personal = temp.path().join("personal");
+        let system = temp.path().join("system");
         let workspace = temp.path().join("workspace");
         skill(&personal, "review", "review", "Personal review.");
         skill(
@@ -219,7 +230,7 @@ mod tests {
         );
 
         assert_eq!(
-            discover(&personal, &workspace).unwrap(),
+            discover(&system, &personal, &workspace).unwrap(),
             vec![SkillSpec {
                 name: "review".into(),
                 description: "Workspace review.".into(),
@@ -228,6 +239,7 @@ mod tests {
 
         let mut registry = Registry::default();
         registry.register_hidden(LoadSkill {
+            system_root: system,
             personal_root: personal,
         });
         let result = registry
@@ -245,10 +257,12 @@ mod tests {
     fn skill_reads_cannot_escape_the_skill_directory() {
         let temp = tempfile::tempdir().unwrap();
         let personal = temp.path().join("personal");
+        let system = temp.path().join("system");
         let workspace = temp.path().join("workspace");
         skill(&personal, "review", "review", "Review code.");
         fs::write(personal.join("secret"), "nope").unwrap();
         let tool = LoadSkill {
+            system_root: system,
             personal_root: personal,
         };
         assert!(
@@ -256,6 +270,29 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("outside skill")
+        );
+    }
+
+    #[test]
+    fn system_skills_cannot_be_shadowed() {
+        let temp = tempfile::tempdir().unwrap();
+        let system = temp.path().join("system");
+        let personal = temp.path().join("personal");
+        let workspace = temp.path().join("workspace");
+        skill(&system, "phi-harness", "phi-harness", "System manual.");
+        skill(
+            &workspace.join(".phi/skills"),
+            "phi-harness",
+            "phi-harness",
+            "Shadow manual.",
+        );
+
+        assert_eq!(
+            discover(&system, &personal, &workspace).unwrap(),
+            vec![SkillSpec {
+                name: "phi-harness".into(),
+                description: "System manual.".into(),
+            }]
         );
     }
 

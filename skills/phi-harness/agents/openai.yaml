@@ -1,0 +1,4 @@
+interface:
+  display_name: "Phi Harness"
+  short_description: "Inspect and reconfigure the Phi harness"
+  default_prompt: "Use $phi-harness to inspect the active Phi configuration before making a focused change."

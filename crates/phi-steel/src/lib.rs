@@ -5,11 +5,19 @@ use std::{
 
 use anyhow::{Context, Result};
 use phi_protocol::{CommandSpec, Event, ModelSpec, PolicyOutput};
+use serde::{Deserialize, Serialize};
 use steel::{rvals::FromSteelVal, steel_vm::engine::Engine};
 
 pub struct Policy {
     vm: Engine,
     state: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CompositionStatus {
+    pub prompt_builder: String,
+    pub file_editor: String,
+    pub compactor: String,
 }
 
 const PLUGIN_PRELUDE: &str = r#"
@@ -58,15 +66,25 @@ const PLUGIN_PRELUDE: &str = r#"
                             'arguments arguments 'output output 'usage usage
                             'preserved preserved 'phase phase)))))
 
+(define (remove-model-by-id models id)
+  (cond [(null? models) '()]
+        [(equal? id (hash-ref (car models) 'id))
+         (remove-model-by-id (cdr models) id)]
+        [else (cons (car models) (remove-model-by-id (cdr models) id))]))
+
 (define (register-model! provider spec)
   (define model (hash-ref spec 'id))
+  (define id (string-append provider "/" model))
   (set! model-registry
-        (append model-registry
+        (append (remove-model-by-id model-registry id)
                 (list (hash-insert
                         (hash-insert
                           (hash-insert spec 'provider provider)
                           'model model)
-                        'id (string-append provider "/" model))))))
+                        'id id)))))
+
+(define (unregister-model! id)
+  (set! model-registry (remove-model-by-id model-registry id)))
 
 (define (register-hosted-tool! name capability provider build)
   (set! tool-implementation-registry
@@ -111,6 +129,11 @@ const PLUGIN_PRELUDE: &str = r#"
   (set! selected-compactor name)
   (set! selected-compactor-config config))
 (define (select-file-editor! name) (set! selected-file-editor name))
+
+(define (composition-status)
+  (hash 'prompt_builder selected-prompt-builder
+        'file_editor selected-file-editor
+        'compactor selected-compactor))
 (define (load-plugin! _) #t)
 
 (define (registered-command-specs)
@@ -365,20 +388,18 @@ const PLUGIN_PRELUDE: &str = r#"
 "#;
 
 impl Policy {
-    pub fn load(agent: &Path, plugins: &[PathBuf], main: &Path) -> Result<Self> {
+    pub fn load(config: &Path, plugins: &[PathBuf]) -> Result<Self> {
         Self::load_with_state(
-            agent,
+            config,
             plugins,
-            main,
             r#"{"model":"openai/gpt-5.6-luna","reasoning":"low","service_tier":"default"}"#,
             None,
         )
     }
 
     pub fn load_with_state(
-        agent: &Path,
+        config_file: &Path,
         plugins: &[PathBuf],
-        main: &Path,
         config: &str,
         state: Option<String>,
     ) -> Result<Self> {
@@ -389,9 +410,7 @@ impl Policy {
             source.push_str(&fs::read_to_string(plugin)?);
         }
         source.push('\n');
-        source.push_str(&fs::read_to_string(main)?);
-        source.push('\n');
-        source.push_str(&fs::read_to_string(agent)?);
+        source.push_str(&fs::read_to_string(config_file)?);
         vm.compile_and_run_raw_program(source)
             .context("load Steel policy")?;
         eval_string(
@@ -466,6 +485,11 @@ impl Policy {
         eval_string(&mut self.vm, "(selected-file-editor-tool-name)")
     }
 
+    pub fn composition_status(&mut self) -> Result<CompositionStatus> {
+        let encoded = eval_string(&mut self.vm, "(value->jsexpr-string (composition-status))")?;
+        serde_json::from_str(&encoded).context("decode composition status")
+    }
+
     pub fn prepare_file_edit(
         &mut self,
         name: &str,
@@ -535,7 +559,7 @@ impl Policy {
     }
 }
 
-pub fn composition_plugins(main: &Path) -> Result<Vec<String>> {
+pub fn composition_plugins(config: &Path) -> Result<Vec<String>> {
     let mut vm = Engine::new_sandboxed();
     let source = format!(
         r#"(require-builtin steel/json)
@@ -547,9 +571,31 @@ pub fn composition_plugins(main: &Path) -> Result<Vec<String>> {
             (define (configure-tool! _ __) #t)
             (define (select-tool! _ __) #t)
             (define (select-file-editor! _) #t)
+            (define (register-model! _ __) #t)
+            (define (unregister-model! _) #t)
+            (define agent-instructions "")
+            (define (set-agent-instructions! value)
+              (set! agent-instructions value))
+            (define (model-spec _) (hash))
+            (define (callable-tool-for _ __) #f)
+            (define (provider-arguments-for _ __) (hash))
+            (define (start-callable-tool _ __) (hash))
+            (define (provider-calls-for _ __) '())
+            (define (provider-usage-for _ __) #f)
+            (define (provider-preserved-items-for _ __) '())
+            (define (provider-output-for _ __) "")
+            (define (provider-message-phase-for _ __) #f)
+            (define (selected-compaction-needed? _ __ ___) #f)
+            (define (start-selected-compaction _ __) (hash))
+            (define (complete-selected-compaction _ __ ___ ____) '())
+            (define (provider-request _ __ ___ ____) (hash))
+            (define (build-selected-prompt _ __ ___) (hash))
+            (define (tools-for-model _) '())
+            (define (estimated-message-tokens _) 0)
+            (define (estimated-context-tokens _ __) 0)
             {}
         "#,
-        fs::read_to_string(main)?
+        fs::read_to_string(config)?
     );
     vm.compile_and_run_raw_program(source)
         .context("load Steel composition")?;
@@ -592,16 +638,15 @@ fn scheme_string(value: &str) -> String {
     serde_json::to_string(value).expect("string serialization cannot fail")
 }
 
-pub fn check(agent: &Path, plugins: &[PathBuf], main: &Path) -> Result<()> {
-    let _ = Policy::load(agent, plugins, main)?;
+pub fn check(config: &Path, plugins: &[PathBuf]) -> Result<()> {
+    let _ = Policy::load(config, plugins)?;
     Ok(())
 }
 
-pub fn replay_smoke(agent: &Path, plugins: &[PathBuf], main: &Path) -> Result<()> {
+pub fn replay_smoke(config: &Path, plugins: &[PathBuf]) -> Result<()> {
     let mut policy = Policy::load_with_state(
-        agent,
+        config,
         plugins,
-        main,
         r#"{"model":"openai/gpt-5.6-luna","reasoning":"low","service_tier":"default"}"#,
         None,
     )?;
@@ -609,7 +654,7 @@ pub fn replay_smoke(agent: &Path, plugins: &[PathBuf], main: &Path) -> Result<()
         content: "replay fixture".into(),
     })?;
     if output.effects.is_empty() {
-        anyhow::bail!("candidate replay emitted no effects");
+        anyhow::bail!("configuration replay emitted no effects");
     }
     Ok(())
 }
@@ -629,17 +674,12 @@ mod tests {
             root.join("policy/tools/skills.scm"),
             root.join("policy/tools/codex-patch.scm"),
             root.join("policy/prompts/simple.scm"),
-            root.join("policy/compaction/simple.scm"),
+            root.join("policy/compaction/structured.scm"),
         ]
     }
 
     fn policy(root: &Path) -> Policy {
-        Policy::load(
-            &root.join("policy/agent.scm"),
-            &plugins(root),
-            &root.join("main.scm"),
-        )
-        .unwrap()
+        Policy::load(&root.join("config.scm"), &plugins(root)).unwrap()
     }
 
     fn compact_policy(root: &Path, limit: u64) -> Policy {
@@ -654,12 +694,7 @@ mod tests {
         fs::write(&provider, source).unwrap();
         let mut sources = plugins(root);
         sources[1] = provider;
-        Policy::load(
-            &root.join("policy/agent.scm"),
-            &sources,
-            &root.join("main.scm"),
-        )
-        .unwrap()
+        Policy::load(&root.join("config.scm"), &sources).unwrap()
     }
 
     #[test]
@@ -800,14 +835,9 @@ mod tests {
             root.join("policy/tools/openrouter-web-search.scm"),
             root.join("policy/tools/codex-patch.scm"),
             prompt,
-            root.join("policy/compaction/simple.scm"),
+            root.join("policy/compaction/structured.scm"),
         ];
-        let mut policy = Policy::load(
-            &root.join("policy/agent.scm"),
-            &custom,
-            &root.join("main.scm"),
-        )
-        .unwrap();
+        let mut policy = Policy::load(&root.join("config.scm"), &custom).unwrap();
         let output = policy
             .on_event(&Event::UserMessage {
                 content: "ignored by prompt".into(),
@@ -841,7 +871,7 @@ mod tests {
                         "type": "function_call",
                         "call_id": "call-1",
                         "name": "read_file",
-                        "arguments": "{\"path\":\"policy/agent.scm\"}"
+                        "arguments": "{\"path\":\"config.scm\"}"
                     }
                 })],
                 error: String::new(),
@@ -982,6 +1012,65 @@ mod tests {
     }
 
     #[test]
+    fn manual_compaction_runs_below_the_automatic_threshold() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut policy = compact_policy(&root, 30_000);
+        policy
+            .on_event(&Event::UserMessage {
+                content: "short conversation".into(),
+            })
+            .unwrap();
+        let output = policy
+            .on_event(&Event::HttpCompleted {
+                success: true,
+                status: 200,
+                events: vec![serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "delta": "short answer"
+                })],
+                error: String::new(),
+            })
+            .unwrap();
+        assert_eq!(
+            output.effects,
+            vec![Effect::Finish {
+                content: "short answer".into()
+            }]
+        );
+
+        let output = policy.on_event(&Event::CompactRequested).unwrap();
+        assert!(matches!(
+            &output.effects[0],
+            Effect::HttpRequest { body, .. }
+                if body["instructions"].as_str().unwrap().contains("Summarize")
+        ));
+        let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
+        assert_eq!(state["activity"], "compacting");
+        assert_eq!(state["compactions"], 0.0);
+
+        let output = policy
+            .on_event(&Event::HttpCompleted {
+                success: true,
+                status: 200,
+                events: vec![serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "delta": r#"{"objective":"continue","requirements":[],"current_state":["manually compacted"],"pending":[],"next_steps":[]}"#
+                })],
+                error: String::new(),
+            })
+            .unwrap();
+        assert_eq!(
+            output.effects,
+            vec![Effect::Finish {
+                content: "Compaction complete.".into()
+            }]
+        );
+        let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
+        assert_eq!(state["activity"], "ready");
+        assert_eq!(state["compactions"], 1.0);
+    }
+
+    #[test]
     fn compaction_bounds_large_context() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut policy = compact_policy(&root, 1_000);
@@ -994,10 +1083,20 @@ mod tests {
             .on_event(&Event::HttpCompleted {
                 success: true,
                 status: 200,
-                events: vec![serde_json::json!({
-                    "type": "response.output_text.delta",
-                    "delta": "y".repeat(3_000)
-                })],
+                events: vec![
+                    serde_json::json!({
+                        "type": "response.output_item.done",
+                        "item": {
+                            "type": "reasoning",
+                            "id": "reasoning-before-compaction",
+                            "encrypted_content": "opaque"
+                        }
+                    }),
+                    serde_json::json!({
+                        "type": "response.output_text.delta",
+                        "delta": "y".repeat(3_000)
+                    }),
+                ],
                 error: String::new(),
             })
             .unwrap();
@@ -1008,6 +1107,10 @@ mod tests {
                     && body["reasoning"]["effort"] == "low"
                     && body["tools"].as_array().unwrap().is_empty()
                     && body["instructions"].as_str().unwrap().contains("Summarize")
+                    && body["instructions"].as_str().unwrap().contains("current_state")
+                    && body["input"].as_array().unwrap().iter()
+                        .any(|item| item["type"] == "reasoning"
+                            && item["encrypted_content"] == "opaque")
         ));
         let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
         assert_eq!(state["activity"], "compacting");
@@ -1019,7 +1122,7 @@ mod tests {
                 status: 200,
                 events: vec![serde_json::json!({
                     "type": "response.output_text.delta",
-                    "delta": "short summary"
+                    "delta": r#"{"objective":"continue","requirements":[],"current_state":["context compacted"],"pending":[],"next_steps":[]}"#
                 })],
                 error: String::new(),
             })
@@ -1033,8 +1136,124 @@ mod tests {
         let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
         assert_eq!(state["compactions"], 1.0);
         assert_eq!(state["activity"], "ready");
+        assert!(
+            state["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("Conversation state (JSON):\n{")
+        );
         assert!(serde_json::to_string(&state["messages"]).unwrap().len() <= 4_000);
         assert!(state["estimated_tokens"].as_f64().unwrap() <= 1_000.0);
+    }
+
+    #[test]
+    fn structured_compaction_retains_the_last_sixteen_messages() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut policy = compact_policy(&root, 30_000);
+        policy
+            .on_event(&Event::UserMessage {
+                content: "old".repeat(50_000),
+            })
+            .unwrap();
+        let mut events = (0..20)
+            .map(|index| {
+                serde_json::json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "reasoning",
+                        "id": format!("reasoning-{index}"),
+                        "encrypted_content": format!("opaque-{index}")
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        events.push(serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": "latest answer"
+        }));
+        let output = policy
+            .on_event(&Event::HttpCompleted {
+                success: true,
+                status: 200,
+                events,
+                error: String::new(),
+            })
+            .unwrap();
+        assert!(matches!(
+            &output.effects[0],
+            Effect::HttpRequest { body, .. }
+                if body["instructions"].as_str().unwrap().contains("current_state")
+        ));
+
+        policy
+            .on_event(&Event::HttpCompleted {
+                success: true,
+                status: 200,
+                events: vec![serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "delta": r#"{"objective":"continue","requirements":[],"current_state":["compacted"],"pending":[],"next_steps":[]}"#
+                })],
+                error: String::new(),
+            })
+            .unwrap();
+
+        let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
+        let messages = state["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 17);
+        assert!(
+            messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("Conversation state (JSON):\n{")
+        );
+        assert_eq!(messages[1]["item"]["id"], "reasoning-5");
+        assert_eq!(messages[16]["content"], "latest answer");
+    }
+
+    #[test]
+    fn structured_compaction_stops_before_the_twenty_four_thousand_token_tail_cap() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut policy = compact_policy(&root, 30_000);
+        policy
+            .on_event(&Event::UserMessage {
+                content: "oversized recent message ".repeat(10_000),
+            })
+            .unwrap();
+        let output = policy
+            .on_event(&Event::HttpCompleted {
+                success: true,
+                status: 200,
+                events: vec![serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "delta": "latest answer"
+                })],
+                error: String::new(),
+            })
+            .unwrap();
+        assert!(matches!(&output.effects[0], Effect::HttpRequest { .. }));
+
+        policy
+            .on_event(&Event::HttpCompleted {
+                success: true,
+                status: 200,
+                events: vec![serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "delta": r#"{"objective":"continue","requirements":[],"current_state":["compacted"],"pending":[],"next_steps":[]}"#
+                })],
+                error: String::new(),
+            })
+            .unwrap();
+
+        let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
+        let messages = state["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(
+            messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("Conversation state (JSON):\n{")
+        );
+        assert_eq!(messages[1]["content"], "latest answer");
     }
 
     #[test]
@@ -1081,7 +1300,7 @@ mod tests {
                 status: 200,
                 events: vec![serde_json::json!({
                     "type": "response.output_text.delta",
-                    "delta": "short summary"
+                    "delta": r#"{"objective":"continue","requirements":[],"current_state":["context compacted"],"pending":[],"next_steps":[]}"#
                 })],
                 error: String::new(),
             })
@@ -1136,7 +1355,7 @@ mod tests {
                 status: 200,
                 events: vec![serde_json::json!({
                     "type": "response.output_text.delta",
-                    "delta": "The shell returned a large listing."
+                    "delta": r#"{"objective":"list files","requirements":[],"current_state":["The shell returned a large listing."],"pending":[],"next_steps":[]}"#
                 })],
                 error: String::new(),
             })
@@ -1179,6 +1398,62 @@ mod tests {
     }
 
     #[test]
+    fn config_can_replace_remove_and_add_provider_models() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config.scm");
+        let mut source = fs::read_to_string(root.join("config.scm")).unwrap();
+        source.push_str(
+            r#"
+(register-model!
+  "openai"
+  (hash 'id "gpt-5.6-luna" 'label "Configured Luna" 'description ""
+        'context_window 1000 'compaction_token_limit 900
+        'function_tools #t 'hosted_tools '()
+        'reasoning '() 'default_reasoning ""
+        'service_tiers '() 'default_service_tier ""))
+(unregister-model! "openrouter/anthropic/claude-sonnet-4.6")
+(register-model!
+  "openrouter"
+  (hash 'id "minimax/minimax-m3" 'label "MiniMax M3" 'description ""
+        'context_window 1000 'compaction_token_limit 900
+        'function_tools #t 'hosted_tools '()
+        'reasoning '() 'default_reasoning ""
+        'service_tiers '() 'default_service_tier ""))
+"#,
+        );
+        fs::write(&config, source).unwrap();
+
+        let mut policy = Policy::load(&config, &plugins(&root)).unwrap();
+        let models = policy.models().unwrap();
+        assert_eq!(
+            models
+                .iter()
+                .filter(|model| model.id == "openai/gpt-5.6-luna")
+                .count(),
+            1
+        );
+        assert_eq!(
+            models
+                .iter()
+                .find(|model| model.id == "openai/gpt-5.6-luna")
+                .unwrap()
+                .label,
+            "Configured Luna"
+        );
+        assert!(
+            models
+                .iter()
+                .all(|model| model.id != "openrouter/anthropic/claude-sonnet-4.6")
+        );
+        assert!(
+            models
+                .iter()
+                .any(|model| model.id == "openrouter/minimax/minimax-m3")
+        );
+    }
+
+    #[test]
     fn skills_plugin_exposes_only_discovered_skills() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let config = serde_json::json!({
@@ -1188,9 +1463,8 @@ mod tests {
             "skills": [{ "name": "review", "description": "Review code." }]
         });
         let mut policy = Policy::load_with_state(
-            &root.join("policy/agent.scm"),
+            &root.join("config.scm"),
             &plugins(&root),
-            &root.join("main.scm"),
             &config.to_string(),
             None,
         )
@@ -1231,19 +1505,16 @@ mod tests {
         .unwrap();
         let mut sources = plugins(&root);
         sources.push(fallback);
-        let mut policy = Policy::load(
-            &root.join("policy/agent.scm"),
-            &sources,
-            &root.join("main.scm"),
-        )
-        .unwrap();
+        let mut policy = Policy::load(&root.join("config.scm"), &sources).unwrap();
 
         assert_eq!(
             policy.resolved_tools("openai/gpt-5.6-sol").unwrap(),
             vec!["openai/hosted-web-search"]
         );
         assert_eq!(
-            policy.resolved_tools("openrouter/x-ai/grok-4.5").unwrap(),
+            policy
+                .resolved_tools("openrouter/anthropic/claude-sonnet-4.6")
+                .unwrap(),
             vec!["openrouter/hosted-web-search"]
         );
         assert_eq!(
@@ -1278,12 +1549,7 @@ mod tests {
         .unwrap();
         let mut sources = plugins(&root);
         sources.push(fallback);
-        let mut policy = Policy::load(
-            &root.join("policy/agent.scm"),
-            &sources,
-            &root.join("main.scm"),
-        )
-        .unwrap();
+        let mut policy = Policy::load(&root.join("config.scm"), &sources).unwrap();
         policy
             .on_event(&Event::ModelSelected {
                 model: "other/gpt-5.6-luna".into(),
@@ -1377,14 +1643,9 @@ mod tests {
             root.join("policy/tools/openrouter-web-search.scm"),
             root.join("policy/tools/codex-patch.scm"),
             root.join("policy/prompts/simple.scm"),
-            root.join("policy/compaction/simple.scm"),
+            root.join("policy/compaction/structured.scm"),
         ];
-        let mut policy = Policy::load(
-            &root.join("policy/agent.scm"),
-            &custom,
-            &root.join("main.scm"),
-        )
-        .unwrap();
+        let mut policy = Policy::load(&root.join("config.scm"), &custom).unwrap();
         assert_eq!(policy.commands().unwrap()[0].name, "echo");
         assert_eq!(policy.run_command("echo", "hello").unwrap(), "hello");
     }
@@ -1419,5 +1680,37 @@ mod tests {
             Effect::RunTools { calls }
                 if calls[0].arguments.get("malformed_arguments").is_some()
         ));
+    }
+
+    #[test]
+    fn direct_tool_arguments_preserve_json_integers() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut policy = policy(&root);
+        policy
+            .on_event(&Event::UserMessage {
+                content: "inspect".into(),
+            })
+            .unwrap();
+        let output = policy
+            .on_event(&Event::HttpCompleted {
+                success: true,
+                status: 200,
+                events: vec![serde_json::json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "call-1",
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"config.scm\",\"start_line\":1,\"line_count\":200}"
+                    }
+                })],
+                error: String::new(),
+            })
+            .unwrap();
+        let Effect::RunTools { calls } = &output.effects[0] else {
+            panic!("expected direct tool call");
+        };
+        assert_eq!(calls[0].arguments["start_line"].as_u64(), Some(1));
+        assert_eq!(calls[0].arguments["line_count"].as_u64(), Some(200));
     }
 }

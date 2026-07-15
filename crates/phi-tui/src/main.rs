@@ -11,8 +11,8 @@ use crossterm::event::{
 };
 use futures_util::{FutureExt, StreamExt, future::pending};
 use phi_runtime::{
-    CommandCatalog, CommandExecution, CommandInvocation, Handle, RunOptions, RuntimeCommand,
-    RuntimeEvent,
+    CommandAction, CommandCatalog, CommandExecution, CommandInvocation, Handle, RunOptions,
+    RuntimeCommand, RuntimeEvent,
 };
 use ratatui::{
     Frame,
@@ -278,6 +278,7 @@ struct App {
     compaction_started: Option<Instant>,
     tool_started: HashMap<String, (String, Instant)>,
     tool_blocks: HashMap<String, usize>,
+    shell_streams: HashMap<String, ShellStream>,
     final_response_rendered: bool,
     command_filter: Option<String>,
     command_selected: usize,
@@ -287,6 +288,11 @@ struct App {
     scroll: u16,
     follow: bool,
     quit: bool,
+}
+
+struct ShellStream {
+    heading: String,
+    output: String,
 }
 
 impl App {
@@ -326,6 +332,7 @@ impl App {
             compaction_started: None,
             tool_started: HashMap::new(),
             tool_blocks: HashMap::new(),
+            shell_streams: HashMap::new(),
             final_response_rendered: false,
             command_filter: None,
             command_selected: 0,
@@ -354,6 +361,10 @@ impl App {
                 "help" if invocation.arguments.is_empty() => {
                     self.transcript.push(("note".into(), self.help()));
                 }
+                "compact" if invocation.arguments.is_empty() => self.start_compaction(),
+                "compact" => self
+                    .transcript
+                    .push(("error".into(), "usage: /compact".into())),
                 "model" if invocation.arguments.is_empty() => self.open_model_picker(),
                 _ => self.start_command(invocation),
             }
@@ -396,6 +407,13 @@ impl App {
         self.status = "command".into();
     }
 
+    fn start_compaction(&mut self) {
+        self.handle = Some(phi_runtime::compact(self.options.clone()));
+        self.turn_started = Some(Instant::now());
+        self.final_response_rendered = false;
+        self.status = "compacting".into();
+    }
+
     fn on_command(&mut self, result: Result<CommandExecution>) {
         match result {
             Ok(execution) => {
@@ -403,11 +421,39 @@ impl App {
                 self.options.session_id = self.session_id.clone();
                 self.catalog = execution.catalog;
                 self.token_budget = selected_context_window(&self.catalog);
+                if execution.action == CommandAction::NewSession {
+                    self.reset_chat_state();
+                }
                 self.transcript.push((execution.role, execution.content));
             }
             Err(error) => self.transcript.push(("error".into(), error.to_string())),
         }
         self.status = "ready".into();
+    }
+
+    fn reset_chat_state(&mut self) {
+        self.transcript.clear();
+        self.current_model.clear();
+        self.approval = None;
+        self.estimated_tokens = self.token_budget.map(|_| 0);
+        self.input_tokens = None;
+        self.cached_tokens = None;
+        self.cache_write_tokens = None;
+        self.output_tokens = None;
+        self.compactions = 0;
+        self.turn_started = None;
+        self.compaction_started = None;
+        self.tool_started.clear();
+        self.tool_blocks.clear();
+        self.shell_streams.clear();
+        self.final_response_rendered = false;
+        self.command_filter = None;
+        self.command_selected = 0;
+        self.message_history.clear();
+        self.history_index = None;
+        self.history_draft.clear();
+        self.scroll = 0;
+        self.follow = true;
     }
 
     fn open_model_picker(&mut self) {
@@ -558,6 +604,10 @@ impl App {
                 self.output_tokens = output_tokens;
                 self.compactions = compactions;
             }
+            RuntimeEvent::CatalogUpdated { catalog } => {
+                self.catalog = catalog;
+                self.token_budget = selected_context_window(&self.catalog);
+            }
             RuntimeEvent::ActivityChanged { activity } => match activity.as_str() {
                 "compacting" => {
                     self.final_response_rendered = !self.current_model.is_empty();
@@ -585,30 +635,35 @@ impl App {
                 if name == "web_search" {
                     self.status = "searching".into();
                 }
+                let content = match name.as_str() {
+                    "exec_command" => format!("Ran `{}`", display_command(&arguments)),
+                    "write_stdin" => "Checked background process".into(),
+                    "list_processes" => "Checking background processes".into(),
+                    "terminate_process" => "Stopping background process".into(),
+                    "read_file" => format!(
+                        "Read {}",
+                        display_relative_path(
+                            &self.options.workspace,
+                            arguments["path"].as_str().unwrap_or("file")
+                        )
+                    ),
+                    "web_search" => "Searching the web".into(),
+                    "load_skill" => skill_resource_label("Loading", &arguments),
+                    "patch" => "Applying patch".into(),
+                    "reload_config" => "Reloading configuration".into(),
+                    _ => format!("Ran `{name}`"),
+                };
+                if matches!(name.as_str(), "exec_command" | "write_stdin") {
+                    self.shell_streams.insert(
+                        call_id.clone(),
+                        ShellStream {
+                            heading: content.clone(),
+                            output: String::new(),
+                        },
+                    );
+                }
                 let block = self.transcript.len();
-                self.transcript.push((
-                    "tool".into(),
-                    match name.as_str() {
-                        "exec_command" => format!("Ran `{}`", display_command(&arguments)),
-                        "write_stdin" => "Checked background process".into(),
-                        "list_processes" => "Checking background processes".into(),
-                        "terminate_process" => "Stopping background process".into(),
-                        "read_file" => format!(
-                            "Read {}",
-                            display_relative_path(
-                                &self.options.workspace,
-                                arguments["path"].as_str().unwrap_or("file")
-                            )
-                        ),
-                        "web_search" => "Searching the web".into(),
-                        "load_skill" => format!(
-                            "Loading skill `{}`",
-                            arguments["name"].as_str().unwrap_or("unknown")
-                        ),
-                        "patch" => "Applying patch".into(),
-                        _ => format!("Ran `{name}`"),
-                    },
-                ));
+                self.transcript.push(("tool".into(), content));
                 self.tool_blocks.insert(call_id, block);
             }
             RuntimeEvent::ToolOutput {
@@ -616,16 +671,23 @@ impl App {
                 name,
                 content,
             } => {
-                if matches!(name.as_str(), "exec_command" | "write_stdin")
-                    && let Some((_, block)) = self
-                        .tool_blocks
-                        .get(&call_id)
-                        .and_then(|index| self.transcript.get_mut(*index))
-                {
-                    if !block.contains("\n\n") {
-                        block.push_str("\n\n");
+                if matches!(name.as_str(), "exec_command" | "write_stdin") {
+                    let rendered = self.shell_streams.get_mut(&call_id).map(|stream| {
+                        stream.output.push_str(&content);
+                        format!(
+                            "{}\n\n{}",
+                            stream.heading,
+                            compact_shell_output(&stream.output)
+                        )
+                    });
+                    if let Some(rendered) = rendered
+                        && let Some((_, block)) = self
+                            .tool_blocks
+                            .get(&call_id)
+                            .and_then(|index| self.transcript.get_mut(*index))
+                    {
+                        *block = rendered;
                     }
-                    block.push_str(&content.replace("\r\n", "\n"));
                 }
             }
             RuntimeEvent::ToolCompleted {
@@ -639,6 +701,10 @@ impl App {
                     .filter(|(started_name, _)| started_name == &name)
                     .map_or(Duration::ZERO, |(_, started)| started.elapsed());
                 let block = self.tool_blocks.remove(&call_id);
+                let streamed = self
+                    .shell_streams
+                    .remove(&call_id)
+                    .is_some_and(|stream| !stream.output.is_empty());
                 if let Some((role, content)) =
                     block.and_then(|index| self.transcript.get_mut(index))
                 {
@@ -670,8 +736,8 @@ impl App {
                             *content = format!("Failed to load skill\n\n{error}");
                         } else {
                             *content = format!(
-                                "Loaded skill `{}` · {}",
-                                result["name"].as_str().unwrap_or("unknown"),
+                                "{} · {}",
+                                skill_resource_label("Loaded", &result),
                                 human_duration(elapsed)
                             );
                         }
@@ -679,8 +745,7 @@ impl App {
                         *role = "patch".into();
                         *content = patch_result(&result, elapsed);
                     } else if matches!(name.as_str(), "exec_command" | "write_stdin") {
-                        let streamed = content.contains("\n\n");
-                        let result_text = tool_result(&result);
+                        let result_text = shell_result(&result);
                         if !result_text.is_empty() && (!streamed || result.get("error").is_some()) {
                             content.push_str("\n\n");
                             content.push_str(&result_text);
@@ -715,6 +780,16 @@ impl App {
                                 result["signal"].as_str().unwrap_or("terminated")
                             );
                         }
+                    } else if name == "reload_config" {
+                        if let Some(error) = result["error"].as_str() {
+                            *content = format!("Failed to reload configuration\n\n{error}");
+                        } else {
+                            *content = format!(
+                                "Reloaded configuration · {} models · {} commands",
+                                result["models"].as_u64().unwrap_or_default(),
+                                result["commands"].as_u64().unwrap_or_default()
+                            );
+                        }
                     } else {
                         let result = tool_result(&result);
                         if !result.is_empty() {
@@ -745,18 +820,27 @@ impl App {
                 self.compaction_started = None;
                 self.tool_started.clear();
                 self.tool_blocks.clear();
+                self.shell_streams.clear();
                 self.final_response_rendered = false;
                 self.status = "ready".into();
             }
             RuntimeEvent::Error { message } => {
                 self.flush_model();
-                self.transcript.push(("error".into(), message));
+                self.transcript.push((
+                    "error".into(),
+                    if message == "cancelled" {
+                        "Cancelled by user".into()
+                    } else {
+                        message
+                    },
+                ));
                 self.handle = None;
                 self.approval = None;
                 self.turn_started = None;
                 self.compaction_started = None;
                 self.tool_started.clear();
                 self.tool_blocks.clear();
+                self.shell_streams.clear();
                 self.final_response_rendered = false;
                 self.status = "ready".into();
             }
@@ -1651,11 +1735,11 @@ fn push_tool(lines: &mut Vec<Line<'static>>, content: &str, width: usize) {
     }
     if let Some(output) = output {
         lines.push(Line::styled(String::new(), output_style));
-        let wrapped = output
+        let output = output
             .split('\n')
-            .flat_map(|line| wrap_line(line, width.saturating_sub(4).max(1)))
+            .map(|line| truncate_middle_width(line, width.saturating_sub(4).max(1)))
             .collect::<Vec<_>>();
-        for (index, output) in wrapped.iter().enumerate() {
+        for (index, output) in output.iter().enumerate() {
             let prefix = if index == 0 { "  └ " } else { "    " };
             lines.push(Line::styled(format!("{prefix}{output}"), output_style));
         }
@@ -1693,6 +1777,35 @@ fn wrap_line(line: &str, width: usize) -> Vec<String> {
     }
     lines.push(current);
     lines
+}
+
+fn truncate_middle_width(value: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(value) <= width {
+        return value.to_owned();
+    }
+    if width <= 1 {
+        return "…".chars().take(width).collect();
+    }
+    let available = width - 1;
+    let left_width = available.div_ceil(2);
+    let right_width = available / 2;
+    let left = value
+        .chars()
+        .scan(0, |used, character| {
+            *used += character.width().unwrap_or_default();
+            (*used <= left_width).then_some(character)
+        })
+        .collect::<String>();
+    let mut right = value
+        .chars()
+        .rev()
+        .scan(0, |used, character| {
+            *used += character.width().unwrap_or_default();
+            (*used <= right_width).then_some(character)
+        })
+        .collect::<String>();
+    right = right.chars().rev().collect();
+    format!("{left}…{right}")
 }
 
 fn display_command(arguments: &serde_json::Value) -> String {
@@ -1778,7 +1891,10 @@ fn patch_result(result: &serde_json::Value, elapsed: Duration) -> String {
             };
             (
                 description,
-                change["diff"].as_str().unwrap_or("").trim_end(),
+                change["diff"]
+                    .as_str()
+                    .unwrap_or("")
+                    .trim_end_matches(['\r', '\n']),
             )
         })
         .collect::<Vec<_>>();
@@ -1803,6 +1919,16 @@ fn patch_result(result: &serde_json::Value, elapsed: Duration) -> String {
     )
 }
 
+fn skill_resource_label(action: &str, value: &serde_json::Value) -> String {
+    let name = value["name"].as_str().unwrap_or("unknown");
+    let path = value["path"].as_str().unwrap_or("SKILL.md");
+    if path == "SKILL.md" {
+        format!("{action} skill `{name}`")
+    } else {
+        format!("{action} `{name}/{path}`")
+    }
+}
+
 fn tool_result(result: &serde_json::Value) -> String {
     if let Some(error) = result.get("error").and_then(serde_json::Value::as_str) {
         return truncate_display(error, 2_000);
@@ -1824,6 +1950,49 @@ fn tool_result(result: &serde_json::Value) -> String {
         output = format!("Exited with code {code}");
     }
     truncate_display(&output, 2_000)
+}
+
+fn shell_result(result: &serde_json::Value) -> String {
+    if let Some(error) = result.get("error").and_then(serde_json::Value::as_str) {
+        return truncate_display(error, 2_000);
+    }
+    let mut output = String::new();
+    for field in ["stdout", "stderr"] {
+        if let Some(value) = result.get(field).and_then(serde_json::Value::as_str)
+            && !value.trim().is_empty()
+        {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str(value.trim_end());
+        }
+    }
+    if output.is_empty()
+        && let Some(code) = result.get("exit_code").and_then(serde_json::Value::as_i64)
+    {
+        output = format!("Exited with code {code}");
+    }
+    compact_shell_output(&output)
+}
+
+fn compact_shell_output(value: &str) -> String {
+    let normalized = value.replace("\r\n", "\n");
+    let mut lines = normalized.split('\n').collect::<Vec<_>>();
+    if normalized.ends_with('\n') {
+        lines.pop();
+    }
+    if lines.len() <= 4 {
+        return lines.join("\n");
+    }
+    let omitted = lines.len() - 4;
+    let unit = if omitted == 1 { "line" } else { "lines" };
+    format!(
+        "{}\n{}\n… (+ {omitted} {unit})\n{}\n{}",
+        lines[0],
+        lines[1],
+        lines[lines.len() - 2],
+        lines[lines.len() - 1]
+    )
 }
 
 fn truncate_display(value: &str, max_chars: usize) -> String {
@@ -1900,6 +2069,7 @@ mod tests {
                 allow_shell: false,
                 allow_write: false,
                 interactive_approvals: true,
+                full_access: false,
                 processes: std::sync::Arc::new(phi_runtime::ProcessManager::default()),
             },
             CommandCatalog {
@@ -1973,6 +2143,18 @@ mod tests {
     }
 
     #[test]
+    fn labels_user_cancellation_clearly() {
+        let mut app = app();
+        app.on_runtime(RuntimeEvent::Error {
+            message: "cancelled".into(),
+        });
+        assert_eq!(
+            app.transcript[0],
+            ("error".into(), "Cancelled by user".into())
+        );
+    }
+
+    #[test]
     fn shows_search_while_running_and_retains_completion() {
         let mut app = app();
         app.turn_started = Some(Instant::now());
@@ -2020,6 +2202,28 @@ mod tests {
         });
         assert_eq!(app.transcript[0].1, "Loaded skill `review` · 0s");
         assert!(!app.transcript[0].1.contains("secret instructions"));
+
+        app.on_runtime(RuntimeEvent::ToolStarted {
+            call_id: "reference".into(),
+            name: "load_skill".into(),
+            arguments: serde_json::json!({
+                "name": "review",
+                "path": "references/details.md"
+            }),
+        });
+        app.on_runtime(RuntimeEvent::ToolCompleted {
+            call_id: "reference".into(),
+            name: "load_skill".into(),
+            result: serde_json::json!({
+                "name": "review",
+                "path": "references/details.md",
+                "content": "more secret instructions"
+            }),
+        });
+        assert_eq!(
+            app.transcript[1].1,
+            "Loaded `review/references/details.md` · 0s"
+        );
     }
 
     #[test]
@@ -2428,6 +2632,112 @@ mod tests {
     }
 
     #[test]
+    fn compacts_shell_output_to_its_first_and_last_two_lines() {
+        assert_eq!(
+            compact_shell_output("one\ntwo\nthree\nfour"),
+            "one\ntwo\nthree\nfour"
+        );
+        assert_eq!(
+            compact_shell_output("one\ntwo\nthree\nfour\nfive\n"),
+            "one\ntwo\n… (+ 1 line)\nfour\nfive"
+        );
+
+        let mut rendered = Vec::new();
+        push_tool(
+            &mut rendered,
+            "Ran `many-lines`\n\none\ntwo\n… (+ 2 lines)\nfive\nsix",
+            40,
+        );
+        assert_eq!(rendered[5].to_string(), "    … (+ 2 lines)");
+        assert_eq!(rendered[5].style.fg, Some(Color::Rgb(125, 125, 122)));
+
+        assert_eq!(truncate_middle_width("abcdefghijk", 5), "ab…jk");
+        let mut single_long_line = Vec::new();
+        push_tool(
+            &mut single_long_line,
+            &format!("Ran `json`\n\n{}", "x".repeat(200)),
+            40,
+        );
+        assert_eq!(single_long_line.len(), 5);
+        assert_eq!(
+            UnicodeWidthStr::width(single_long_line[3].to_string().as_str()),
+            40
+        );
+        assert!(single_long_line[3].to_string().contains('…'));
+    }
+
+    #[test]
+    fn compacts_streaming_exec_and_process_poll_output_incrementally() {
+        for (name, arguments, heading) in [
+            (
+                "exec_command",
+                serde_json::json!({ "cmd": "many-lines" }),
+                "Ran `many-lines`",
+            ),
+            (
+                "write_stdin",
+                serde_json::json!({ "session_id": 7, "chars": "" }),
+                "Checked background process",
+            ),
+        ] {
+            let mut app = app();
+            app.on_runtime(RuntimeEvent::ToolStarted {
+                call_id: name.into(),
+                name: name.into(),
+                arguments,
+            });
+            app.on_runtime(RuntimeEvent::ToolOutput {
+                call_id: name.into(),
+                name: name.into(),
+                content: "one\ntwo\nthree\n".into(),
+            });
+            app.on_runtime(RuntimeEvent::ToolOutput {
+                call_id: name.into(),
+                name: name.into(),
+                content: "four\nfive\nsix".into(),
+            });
+            assert_eq!(
+                app.transcript[0].1,
+                format!("{heading}\n\none\ntwo\n… (+ 2 lines)\nfive\nsix")
+            );
+
+            app.on_runtime(RuntimeEvent::ToolOutput {
+                call_id: name.into(),
+                name: name.into(),
+                content: " continued\nseven".into(),
+            });
+            assert_eq!(
+                app.transcript[0].1,
+                format!("{heading}\n\none\ntwo\n… (+ 3 lines)\nsix continued\nseven")
+            );
+        }
+    }
+
+    #[test]
+    fn compacts_shell_output_that_arrives_only_on_completion() {
+        let mut app = app();
+        app.on_runtime(RuntimeEvent::ToolStarted {
+            call_id: "shell".into(),
+            name: "exec_command".into(),
+            arguments: serde_json::json!({ "cmd": "many-lines" }),
+        });
+        app.on_runtime(RuntimeEvent::ToolCompleted {
+            call_id: "shell".into(),
+            name: "exec_command".into(),
+            result: serde_json::json!({
+                "exit_code": 0,
+                "stdout": "one\ntwo\nthree\nfour\nfive\nsix\n",
+                "stderr": "",
+                "session_id": null
+            }),
+        });
+        assert_eq!(
+            app.transcript[0].1,
+            "Ran `many-lines`\n\none\ntwo\n… (+ 2 lines)\nfive\nsix"
+        );
+    }
+
+    #[test]
     fn routes_concurrent_shell_output_to_its_own_block() {
         let mut app = app();
         for (call_id, cmd) in [("first", "printf first"), ("second", "printf second")] {
@@ -2600,6 +2910,82 @@ mod tests {
                 assert_eq!(app.transcript, vec![("you".into(), "hello".into())]);
             })
             .await;
+    }
+
+    #[tokio::test]
+    async fn compact_command_starts_runtime_compaction() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut app = app();
+                app.composer.text = "/compact".into();
+                app.submit();
+                assert!(app.handle.is_some());
+                assert!(app.command_task.is_none());
+                assert_eq!(app.status, "compacting");
+                assert!(!app.transcript.iter().any(|(role, _)| role == "you"));
+            })
+            .await;
+    }
+
+    #[test]
+    fn compact_command_rejects_arguments_locally() {
+        let mut app = app();
+        app.composer.text = "/compact now".into();
+        app.submit();
+        assert!(app.handle.is_none());
+        assert_eq!(
+            app.transcript.last().unwrap(),
+            &("error".into(), "usage: /compact".into())
+        );
+    }
+
+    #[test]
+    fn new_session_command_clears_chat_state() {
+        let mut app = app();
+        app.transcript.push(("you".into(), "old message".into()));
+        app.current_model = "partial response".into();
+        app.estimated_tokens = Some(700);
+        app.input_tokens = Some(600);
+        app.cached_tokens = Some(500);
+        app.cache_write_tokens = Some(400);
+        app.output_tokens = Some(300);
+        app.compactions = 2;
+        app.message_history.push("old message".into());
+        app.history_index = Some(0);
+        app.history_draft = "draft".into();
+        app.scroll = 12;
+        app.follow = false;
+        let catalog = app.catalog.clone();
+
+        app.on_command(Ok(CommandExecution {
+            session_id: "11111111-1111-4111-8111-111111111111".into(),
+            content: "Started a new chat.".into(),
+            role: "note".into(),
+            catalog,
+            action: CommandAction::NewSession,
+        }));
+
+        assert_eq!(
+            app.session_id.as_deref(),
+            Some("11111111-1111-4111-8111-111111111111")
+        );
+        assert_eq!(
+            app.transcript,
+            vec![("note".into(), "Started a new chat.".into())]
+        );
+        assert!(app.current_model.is_empty());
+        assert_eq!(app.estimated_tokens, Some(0));
+        assert_eq!(app.input_tokens, None);
+        assert_eq!(app.cached_tokens, None);
+        assert_eq!(app.cache_write_tokens, None);
+        assert_eq!(app.output_tokens, None);
+        assert_eq!(app.compactions, 0);
+        assert!(app.message_history.is_empty());
+        assert_eq!(app.history_index, None);
+        assert!(app.history_draft.is_empty());
+        assert_eq!(app.scroll, 0);
+        assert!(app.follow);
+        assert_eq!(app.status, "ready");
     }
 
     #[test]

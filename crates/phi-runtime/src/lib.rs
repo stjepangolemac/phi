@@ -22,6 +22,7 @@ pub struct RunOptions {
     pub allow_shell: bool,
     pub allow_write: bool,
     pub interactive_approvals: bool,
+    pub full_access: bool,
     pub processes: Arc<phi_core::process::ShellSessions>,
 }
 
@@ -42,6 +43,9 @@ pub enum RuntimeEvent {
         cached_tokens: Option<u64>,
         cache_write_tokens: Option<u64>,
         output_tokens: Option<u64>,
+    },
+    CatalogUpdated {
+        catalog: CommandCatalog,
     },
     ActivityChanged {
         activity: String,
@@ -91,7 +95,7 @@ pub struct Handle {
     cancellation: CancellationToken,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CommandCatalog {
     pub commands: Vec<CommandSpec>,
     pub models: Vec<ModelSpec>,
@@ -100,11 +104,44 @@ pub struct CommandCatalog {
     pub selected_service_tier: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct HarnessStatus {
+    pub version: String,
+    pub workspace: String,
+    pub home: String,
+    pub model: Option<String>,
+    pub reasoning: Option<String>,
+    pub service_tier: Option<String>,
+    pub config: SchemeConfigStatus,
+    pub plugins: Vec<PluginStatus>,
+    pub composition: phi_steel::CompositionStatus,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SchemeConfigStatus {
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PluginStatus {
+    pub name: String,
+    pub source: String,
+    pub revision: String,
+}
+
+#[derive(Debug)]
 pub struct CommandExecution {
     pub session_id: String,
     pub content: String,
     pub role: String,
     pub catalog: CommandCatalog,
+    pub action: CommandAction,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandAction {
+    Display,
+    NewSession,
 }
 
 impl Handle {
@@ -158,18 +195,44 @@ const DEFAULT_CONFIG: &str = r#"{
   }
 }"#;
 
-const DEFAULT_MAIN: &str = include_str!("../../../main.scm");
-const DEFAULT_AGENT: &str = include_str!("../../../policy/agent.scm");
-const RESPONSES_PLUGIN: &str = include_str!("../../../policy/providers/responses.scm");
-const OPENAI_PLUGIN: &str = include_str!("../../../policy/providers/openai.scm");
-const OPENROUTER_PLUGIN: &str = include_str!("../../../policy/providers/openrouter.scm");
-const OPENAI_WEB_SEARCH_PLUGIN: &str = include_str!("../../../policy/tools/openai-web-search.scm");
-const OPENROUTER_WEB_SEARCH_PLUGIN: &str =
-    include_str!("../../../policy/tools/openrouter-web-search.scm");
-const SKILLS_PLUGIN: &str = include_str!("../../../policy/tools/skills.scm");
-const CODEX_PATCH_PLUGIN: &str = include_str!("../../../policy/tools/codex-patch.scm");
-const PROMPT_PLUGIN: &str = include_str!("../../../policy/prompts/simple.scm");
-const COMPACTION_PLUGIN: &str = include_str!("../../../policy/compaction/simple.scm");
+const DEFAULT_SCHEME_CONFIG: &str = include_str!("../../../config.scm");
+const OFFICIAL_PLUGINS: &[(&str, &str)] = &[
+    ("responses", "policy/providers/responses.scm"),
+    ("openai", "policy/providers/openai.scm"),
+    ("openrouter", "policy/providers/openrouter.scm"),
+    ("openai-web-search", "policy/tools/openai-web-search.scm"),
+    (
+        "openrouter-web-search",
+        "policy/tools/openrouter-web-search.scm",
+    ),
+    ("skills", "policy/tools/skills.scm"),
+    ("codex-patch", "policy/tools/codex-patch.scm"),
+    ("simple-prompt", "policy/prompts/simple.scm"),
+    ("simple-compaction", "policy/compaction/simple.scm"),
+    ("compaction-structured", "policy/compaction/structured.scm"),
+];
+const PHI_HARNESS_SKILL: &[(&str, &str)] = &[
+    (
+        "SKILL.md",
+        include_str!("../../../skills/phi-harness/SKILL.md"),
+    ),
+    (
+        "references/architecture.md",
+        include_str!("../../../skills/phi-harness/references/architecture.md"),
+    ),
+    (
+        "references/configuration.md",
+        include_str!("../../../skills/phi-harness/references/configuration.md"),
+    ),
+    (
+        "references/extensions.md",
+        include_str!("../../../skills/phi-harness/references/extensions.md"),
+    ),
+    (
+        "references/operations.md",
+        include_str!("../../../skills/phi-harness/references/operations.md"),
+    ),
+];
 
 pub fn initialize_home() -> Result<phi_core::home::PhiHome> {
     let home = phi_core::home::PhiHome::discover()?;
@@ -181,7 +244,7 @@ pub fn initialize_at(home: &phi_core::home::PhiHome) -> Result<()> {
     std::fs::create_dir_all(&home.root)?;
     std::fs::create_dir_all(home.skills())?;
     write_if_missing(&home.config(), DEFAULT_CONFIG)?;
-    write_if_missing(&home.main(), DEFAULT_MAIN)?;
+    initialize_scheme_config(home)?;
     write_if_missing(
         &home.state(),
         r#"{
@@ -195,26 +258,37 @@ pub fn initialize_at(home: &phi_core::home::PhiHome) -> Result<()> {
 "#,
     )?;
     write_if_missing(&home.plugin_lock(), "{\n  \"plugins\": []\n}\n")?;
-    let builtins = home.builtins();
-    write_bundled(&builtins.join("agent.scm"), DEFAULT_AGENT)?;
-    write_builtin(&builtins, "responses", RESPONSES_PLUGIN)?;
-    write_builtin(&builtins, "openai", OPENAI_PLUGIN)?;
-    write_builtin(&builtins, "openrouter", OPENROUTER_PLUGIN)?;
-    write_builtin(&builtins, "openai-web-search", OPENAI_WEB_SEARCH_PLUGIN)?;
-    write_builtin(
-        &builtins,
-        "openrouter-web-search",
-        OPENROUTER_WEB_SEARCH_PLUGIN,
-    )?;
-    write_builtin(&builtins, "skills", SKILLS_PLUGIN)?;
-    write_builtin(&builtins, "codex-patch", CODEX_PATCH_PLUGIN)?;
-    write_builtin(&builtins, "simple-prompt", PROMPT_PLUGIN)?;
-    write_builtin(&builtins, "simple-compaction", COMPACTION_PLUGIN)?;
+    let repository = repository_root();
+    for (name, relative) in OFFICIAL_PLUGINS {
+        copy_official_plugin(home, &repository, name, relative)?;
+    }
+    for (relative, content) in PHI_HARNESS_SKILL {
+        write_bundled(
+            &home.builtin_skills().join("phi-harness").join(relative),
+            content,
+        )?;
+    }
     Ok(())
 }
 
-fn write_builtin(root: &Path, name: &str, source: &str) -> Result<()> {
-    let plugin = root.join("plugins").join(name);
+fn repository_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn copy_official_plugin(
+    home: &phi_core::home::PhiHome,
+    repository: &Path,
+    name: &str,
+    relative: &str,
+) -> Result<()> {
+    let source = repository.join(relative);
+    if !source.is_file() {
+        bail!(
+            "official plugin source is missing: {} (the repository used to install phi must remain available)",
+            source.display()
+        );
+    }
+    let plugin = home.builtins().join("plugins").join(name);
     write_bundled(
         &plugin.join("plugin.json"),
         &serde_json::to_string_pretty(&serde_json::json!({
@@ -223,7 +297,12 @@ fn write_builtin(root: &Path, name: &str, source: &str) -> Result<()> {
             "entrypoint": "main.scm"
         }))?,
     )?;
-    write_bundled(&plugin.join("main.scm"), source)
+    if let Some(parent) = plugin.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(&source, plugin.join("main.scm"))
+        .with_context(|| format!("copy official plugin {name} from {}", source.display()))?;
+    Ok(())
 }
 
 fn write_bundled(path: &Path, content: &str) -> Result<()> {
@@ -245,6 +324,22 @@ fn write_if_missing(path: &Path, content: &str) -> Result<()> {
     Ok(())
 }
 
+fn initialize_scheme_config(home: &phi_core::home::PhiHome) -> Result<()> {
+    let target = home.scheme_config();
+    if target.exists() {
+        return Ok(());
+    }
+    let legacy = home.root.join("main.scm");
+    if legacy.is_file() {
+        let (agent, _) = DEFAULT_SCHEME_CONFIG
+            .split_once("(load-plugin!")
+            .context("default config has no plugin composition")?;
+        let composition = std::fs::read_to_string(legacy)?;
+        return write_if_missing(&target, &format!("{}{}", agent, composition));
+    }
+    write_if_missing(&target, DEFAULT_SCHEME_CONFIG)
+}
+
 fn home_for_config(path: &Path) -> Result<phi_core::home::PhiHome> {
     Ok(phi_core::home::PhiHome {
         root: path.parent().context("config has no parent")?.to_owned(),
@@ -253,12 +348,12 @@ fn home_for_config(path: &Path) -> Result<phi_core::home::PhiHome> {
 
 fn resolve_sources(
     home: &phi_core::home::PhiHome,
-    workspace: &Path,
+    _workspace: &Path,
 ) -> Result<phi_core::session::ComposedSources> {
-    let main = home.main();
+    let config = home.scheme_config();
     let lock = phi_core::plugin::read_lock(home)?;
     let mut plugins = Vec::new();
-    for name in phi_steel::composition_plugins(&main)? {
+    for name in phi_steel::composition_plugins(&config)? {
         let (root, manifest) =
             if let Some(locked) = lock.plugins.iter().find(|item| item.name == name) {
                 let root = phi_core::plugin::install_root(home, &name, &locked.commit);
@@ -285,13 +380,7 @@ fn resolve_sources(
             entrypoint,
         });
     }
-    let fallback = home.builtins().join("agent.scm");
-    let policy = phi_core::policy_store::active(&workspace.join(".phi/policies"), &fallback)?;
-    Ok(phi_core::session::ComposedSources {
-        policy,
-        main,
-        plugins,
-    })
+    Ok(phi_core::session::ComposedSources { config, plugins })
 }
 
 fn entrypoints(sources: &phi_core::session::ComposedSources) -> Vec<PathBuf> {
@@ -302,20 +391,38 @@ fn entrypoints(sources: &phi_core::session::ComposedSources) -> Vec<PathBuf> {
         .collect()
 }
 
-pub fn check_policy(home: &phi_core::home::PhiHome, workspace: &Path) -> Result<()> {
+fn reload_composition(
+    home: &phi_core::home::PhiHome,
+    config_path: &Path,
+    workspace: &Path,
+    session: &phi_core::session::Session,
+    state: Option<String>,
+    full_access: bool,
+) -> Result<(phi_steel::Policy, CommandCatalog)> {
+    let _config = load_config(config_path)?;
     let sources = resolve_sources(home, workspace)?;
-    phi_steel::check(&sources.policy, &entrypoints(&sources), &sources.main)
+    let capabilities = capabilities(home, full_access);
+    let skills = discover_skills(home, workspace)?;
+    let mut policy = phi_steel::Policy::load_with_state(
+        &sources.config,
+        &entrypoints(&sources),
+        &policy_config(
+            &capabilities,
+            session.id(),
+            &load_user_state(home)?,
+            &skills,
+        ),
+        state,
+    )?;
+    let catalog = catalog(&mut policy)?;
+    session.replace_composition(&sources.config, &sources.plugins)?;
+    Ok((policy, catalog))
 }
 
-pub fn check_policy_candidate(
-    home: &phi_core::home::PhiHome,
-    workspace: &Path,
-    candidate: &Path,
-) -> Result<()> {
+pub fn check_scheme_config(home: &phi_core::home::PhiHome, workspace: &Path) -> Result<()> {
     let sources = resolve_sources(home, workspace)?;
-    let plugins = entrypoints(&sources);
-    phi_steel::check(candidate, &plugins, &sources.main)?;
-    phi_steel::replay_smoke(candidate, &plugins, &sources.main)
+    phi_steel::check(&sources.config, &entrypoints(&sources))?;
+    phi_steel::replay_smoke(&sources.config, &entrypoints(&sources))
 }
 
 fn load_user_state(home: &phi_core::home::PhiHome) -> Result<UserState> {
@@ -344,12 +451,11 @@ pub fn command_catalog(options: &RunOptions) -> Result<CommandCatalog> {
         }
         None => (resolve_sources(&home, &workspace)?, None),
     };
-    let capabilities = capabilities(&sources, &home);
-    let skills = phi_core::skill::discover(&home.skills(), &workspace)?;
+    let capabilities = capabilities(&home, options.full_access);
+    let skills = discover_skills(&home, &workspace)?;
     let mut policy = phi_steel::Policy::load_with_state(
-        &sources.policy,
+        &sources.config,
         &entrypoints(&sources),
-        &sources.main,
         &policy_config(
             &capabilities,
             options.session_id.as_deref().unwrap_or("catalog"),
@@ -361,6 +467,60 @@ pub fn command_catalog(options: &RunOptions) -> Result<CommandCatalog> {
     catalog(&mut policy)
 }
 
+pub fn harness_status(options: &RunOptions) -> Result<HarnessStatus> {
+    let workspace = options.workspace.canonicalize()?;
+    let _config = load_config(&options.config_path)?;
+    let home = home_for_config(&options.config_path)?;
+    let sources = resolve_sources(&home, &workspace)?;
+    let capabilities = capabilities(&home, options.full_access);
+    let skills = discover_skills(&home, &workspace)?;
+    let user_state = load_user_state(&home)?;
+    let mut policy = phi_steel::Policy::load_with_state(
+        &sources.config,
+        &entrypoints(&sources),
+        &policy_config(&capabilities, "status", &user_state, &skills),
+        None,
+    )?;
+    let composition = policy.composition_status()?;
+    let lock = phi_core::plugin::read_lock(&home)?;
+    let plugins = sources
+        .plugins
+        .iter()
+        .map(|plugin| {
+            lock.plugins
+                .iter()
+                .find(|locked| locked.name == plugin.name)
+                .map_or_else(
+                    || PluginStatus {
+                        name: plugin.name.clone(),
+                        source: "builtin".into(),
+                        revision: env!("CARGO_PKG_VERSION").into(),
+                    },
+                    |locked| PluginStatus {
+                        name: plugin.name.clone(),
+                        source: "git".into(),
+                        revision: locked.commit.clone(),
+                    },
+                )
+        })
+        .collect();
+    let selection = user_state.model;
+
+    Ok(HarnessStatus {
+        version: env!("CARGO_PKG_VERSION").into(),
+        workspace: workspace.display().to_string(),
+        home: home.root.display().to_string(),
+        model: selection.as_ref().map(|model| model.id.clone()),
+        reasoning: selection.as_ref().map(|model| model.reasoning.clone()),
+        service_tier: selection.as_ref().map(|model| model.service_tier.clone()),
+        config: SchemeConfigStatus {
+            path: sources.config.display().to_string(),
+        },
+        plugins,
+        composition,
+    })
+}
+
 pub fn execute_command(
     options: &RunOptions,
     invocation: &CommandInvocation,
@@ -369,6 +529,41 @@ pub fn execute_command(
     let _config = load_config(&options.config_path)?;
     let home = home_for_config(&options.config_path)?;
     let sessions = workspace.join(".phi/sessions");
+    if invocation.name == "new" {
+        if !invocation.arguments.is_empty() {
+            bail!("usage: /new");
+        }
+        let current = resolve_sources(&home, &workspace)?;
+        let session = phi_core::session::Session::create_composed(
+            &sessions,
+            &current.config,
+            &current.plugins,
+        )?;
+        let sources = session
+            .composed_sources()?
+            .context("missing composition snapshot")?;
+        let capabilities = capabilities(&home, options.full_access);
+        let skills = discover_skills(&home, &workspace)?;
+        let mut policy = phi_steel::Policy::load_with_state(
+            &sources.config,
+            &entrypoints(&sources),
+            &policy_config(
+                &capabilities,
+                session.id(),
+                &load_user_state(&home)?,
+                &skills,
+            ),
+            None,
+        )?;
+        session.save_state(policy.state())?;
+        return Ok(CommandExecution {
+            session_id: session.id().into(),
+            content: "Started a new chat.".into(),
+            role: "note".into(),
+            catalog: catalog(&mut policy)?,
+            action: CommandAction::NewSession,
+        });
+    }
     let (session, sources, saved_state) = match &options.session_id {
         Some(id) => {
             let session = phi_core::session::Session::open(&sessions, id)?;
@@ -382,8 +577,7 @@ pub fn execute_command(
             let current = resolve_sources(&home, &workspace)?;
             let session = phi_core::session::Session::create_composed(
                 &sessions,
-                &current.policy,
-                &current.main,
+                &current.config,
                 &current.plugins,
             )?;
             let sources = session
@@ -392,12 +586,36 @@ pub fn execute_command(
             (session, sources, None)
         }
     };
-    let capabilities = capabilities(&sources, &home);
-    let skills = phi_core::skill::discover(&home.skills(), &workspace)?;
+    if invocation.name == "reload" {
+        if !invocation.arguments.is_empty() {
+            bail!("usage: /reload");
+        }
+        let (mut policy, reloaded_catalog) = reload_composition(
+            &home,
+            &options.config_path,
+            &workspace,
+            &session,
+            saved_state,
+            options.full_access,
+        )?;
+        session.save_state(policy.state())?;
+        return Ok(CommandExecution {
+            session_id: session.id().into(),
+            content: format!(
+                "Reloaded configuration · {} models · {} commands",
+                reloaded_catalog.models.len(),
+                reloaded_catalog.commands.len()
+            ),
+            role: "note".into(),
+            catalog: catalog(&mut policy)?,
+            action: CommandAction::Display,
+        });
+    }
+    let capabilities = capabilities(&home, options.full_access);
+    let skills = discover_skills(&home, &workspace)?;
     let mut policy = phi_steel::Policy::load_with_state(
-        &sources.policy,
+        &sources.config,
         &entrypoints(&sources),
-        &sources.main,
         &policy_config(
             &capabilities,
             session.id(),
@@ -450,11 +668,18 @@ pub fn execute_command(
         content,
         role: role.into(),
         catalog: catalog(&mut policy)?,
+        action: CommandAction::Display,
     })
 }
 
 fn catalog(policy: &mut phi_steel::Policy) -> Result<CommandCatalog> {
     let mut commands = vec![
+        CommandSpec {
+            name: "compact".into(),
+            usage: "/compact".into(),
+            description: "Compact the current conversation now.".into(),
+            source: "core".into(),
+        },
         CommandSpec {
             name: "help".into(),
             usage: "/help".into(),
@@ -468,9 +693,21 @@ fn catalog(policy: &mut phi_steel::Policy) -> Result<CommandCatalog> {
             source: "core".into(),
         },
         CommandSpec {
+            name: "new".into(),
+            usage: "/new".into(),
+            description: "Start a new chat.".into(),
+            source: "core".into(),
+        },
+        CommandSpec {
             name: "ps".into(),
             usage: "/ps".into(),
             description: "Show managed background processes.".into(),
+            source: "core".into(),
+        },
+        CommandSpec {
+            name: "reload".into(),
+            usage: "/reload".into(),
+            description: "Reload configuration and plugins.".into(),
             source: "core".into(),
         },
         CommandSpec {
@@ -700,6 +937,7 @@ fn policy_config(
     let mut tools = capabilities.specs();
     tools.push(phi_core::capability::exec_command_spec());
     tools.push(phi_core::capability::list_processes_spec());
+    tools.push(phi_core::capability::reload_config_spec());
     tools.push(phi_core::capability::terminate_process_spec());
     tools.push(phi_core::capability::write_stdin_spec());
     tools.sort_by(|left, right| left.name.cmp(&right.name));
@@ -717,29 +955,51 @@ fn policy_config(
 }
 
 fn capabilities(
-    sources: &phi_core::session::ComposedSources,
     home: &phi_core::home::PhiHome,
+    full_access: bool,
 ) -> phi_core::capability::Registry {
     let mut capabilities = phi_core::capability::Registry::default();
-    capabilities.register(phi_core::capability::ReadFile);
-    capabilities.register_hidden(phi_core::skill::LoadSkill {
-        personal_root: home.skills(),
+    capabilities.register(phi_core::capability::ReadFile {
+        full_access,
+        additional_root: Some(home.root.clone()),
     });
-    capabilities.register(phi_eval::SubmitPolicyCandidate {
-        active_policy: sources.policy.clone(),
-        main: sources.main.clone(),
-        plugins: entrypoints(sources),
+    capabilities.register_hidden(phi_core::skill::LoadSkill {
+        system_root: home.builtin_skills(),
+        personal_root: home.skills(),
     });
     capabilities
 }
 
+fn discover_skills(
+    home: &phi_core::home::PhiHome,
+    workspace: &Path,
+) -> Result<Vec<phi_core::skill::SkillSpec>> {
+    phi_core::skill::discover(&home.builtin_skills(), &home.skills(), workspace)
+}
+
 pub fn start(options: RunOptions, prompt: String) -> Handle {
+    start_event(options, Event::UserMessage { content: prompt })
+}
+
+pub fn compact(options: RunOptions) -> Handle {
+    start_event(options, Event::CompactRequested)
+}
+
+fn start_event(options: RunOptions, initial_event: Event) -> Handle {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let cancellation = CancellationToken::new();
     let run_cancellation = cancellation.clone();
     tokio::task::spawn_local(async move {
-        if let Err(error) = run(options, prompt, &event_tx, command_rx, &run_cancellation).await {
+        if let Err(error) = run(
+            options,
+            initial_event,
+            &event_tx,
+            command_rx,
+            &run_cancellation,
+        )
+        .await
+        {
             let _ = event_tx.send(RuntimeEvent::Error {
                 message: format!("{error:#}"),
             });
@@ -754,13 +1014,13 @@ pub fn start(options: RunOptions, prompt: String) -> Handle {
 
 async fn run(
     options: RunOptions,
-    prompt: String,
+    initial_event: Event,
     events: &mpsc::UnboundedSender<RuntimeEvent>,
     mut commands: mpsc::UnboundedReceiver<RuntimeCommand>,
     cancellation: &CancellationToken,
 ) -> Result<()> {
     let workspace = options.workspace.canonicalize()?;
-    let config = load_config(&options.config_path)?;
+    let mut config = load_config(&options.config_path)?;
     let home = home_for_config(&options.config_path)?;
     let sessions = workspace.join(".phi/sessions");
     let (session, sources, saved_state) = match options.session_id {
@@ -776,8 +1036,7 @@ async fn run(
             let current = resolve_sources(&home, &workspace)?;
             let session = phi_core::session::Session::create_composed(
                 &sessions,
-                &current.policy,
-                &current.main,
+                &current.config,
                 &current.plugins,
             )?;
             let sources = session
@@ -786,24 +1045,25 @@ async fn run(
             (session, sources, None)
         }
     };
-    let capabilities = Arc::new(capabilities(&sources, &home));
-    let skills = phi_core::skill::discover(&home.skills(), &workspace)?;
+    let mut capabilities = Arc::new(capabilities(&home, options.full_access));
+    let skills = discover_skills(&home, &workspace)?;
     send(
         events,
         RuntimeEvent::Session {
             id: session.id().into(),
         },
     )?;
-    send(
-        events,
-        RuntimeEvent::UserMessage {
-            content: prompt.clone(),
-        },
-    )?;
+    if let Event::UserMessage { content } = &initial_event {
+        send(
+            events,
+            RuntimeEvent::UserMessage {
+                content: content.clone(),
+            },
+        )?;
+    }
     let mut policy = phi_steel::Policy::load_with_state(
-        &sources.policy,
+        &sources.config,
         &entrypoints(&sources),
-        &sources.main,
         &policy_config(
             &capabilities,
             session.id(),
@@ -812,7 +1072,7 @@ async fn run(
         ),
         saved_state,
     )?;
-    let file_editor_tool = policy.file_editor_tool_name()?;
+    let mut file_editor_tool = policy.file_editor_tool_name()?;
     let selected_model = state_string(policy.state(), "model")?;
     let tool_routes = policy.resolved_tool_routes(&selected_model)?;
     for route in tool_routes {
@@ -824,7 +1084,7 @@ async fn run(
             },
         )?;
     }
-    let mut event = Event::UserMessage { content: prompt };
+    let mut event = initial_event;
     let mut activity = "ready".to_owned();
     let permissions = phi_core::permissions::Permissions {
         allow_shell: options.allow_shell,
@@ -832,7 +1092,7 @@ async fn run(
     };
     let shell_sessions = Arc::clone(&options.processes);
 
-    for _ in 0..16 {
+    loop {
         if cancellation.is_cancelled() {
             bail!("cancelled");
         }
@@ -880,13 +1140,17 @@ async fn run(
             Effect::RunTools { calls } => {
                 let executor = ToolBatchExecutor {
                     workspace: &workspace,
+                    home: &home,
+                    config_path: &options.config_path,
+                    session: &session,
                     capabilities: Arc::clone(&capabilities),
                     config: Arc::new(config.clone()),
                     file_editor_tool: &file_editor_tool,
                     events,
                     cancellation,
+                    full_access: options.full_access,
                 };
-                let results = execute_tool_calls(
+                let (results, reloaded) = execute_tool_calls(
                     calls,
                     &executor,
                     &permissions,
@@ -896,6 +1160,27 @@ async fn run(
                     &shell_sessions,
                 )
                 .await?;
+                if reloaded {
+                    let state = policy.state().to_owned();
+                    let sources = session
+                        .composed_sources()?
+                        .context("session has no composition snapshot")?;
+                    config = load_config(&options.config_path)?;
+                    capabilities = Arc::new(crate::capabilities(&home, options.full_access));
+                    let skills = discover_skills(&home, &workspace)?;
+                    policy = phi_steel::Policy::load_with_state(
+                        &sources.config,
+                        &entrypoints(&sources),
+                        &policy_config(
+                            &capabilities,
+                            session.id(),
+                            &load_user_state(&home)?,
+                            &skills,
+                        ),
+                        Some(state),
+                    )?;
+                    file_editor_tool = policy.file_editor_tool_name()?;
+                }
                 event = Event::ToolsCompleted { results };
             }
             Effect::HttpRequest {
@@ -932,7 +1217,6 @@ async fn run(
             }
         }
     }
-    bail!("effect limit reached")
 }
 
 struct PendingToolCall {
@@ -960,11 +1244,15 @@ enum RawToolOutput {
 
 struct ToolBatchExecutor<'a> {
     workspace: &'a Path,
+    home: &'a phi_core::home::PhiHome,
+    config_path: &'a Path,
+    session: &'a phi_core::session::Session,
     capabilities: Arc<phi_core::capability::Registry>,
     config: Arc<Config>,
     file_editor_tool: &'a str,
     events: &'a mpsc::UnboundedSender<RuntimeEvent>,
     cancellation: &'a CancellationToken,
+    full_access: bool,
 }
 
 async fn execute_tool_calls(
@@ -975,9 +1263,10 @@ async fn execute_tool_calls(
     commands: &mut mpsc::UnboundedReceiver<RuntimeCommand>,
     policy: &mut phi_steel::Policy,
     shell_sessions: &Arc<phi_core::process::ShellSessions>,
-) -> Result<Vec<ToolResult>> {
+) -> Result<(Vec<ToolResult>, bool)> {
     let mut completed = Vec::new();
     let mut parallel = Vec::new();
+    let mut reloaded = false;
     for (index, call) in calls.into_iter().enumerate() {
         let parallel_safe =
             tool_call_parallel_safe(&call, &executor.capabilities, executor.file_editor_tool);
@@ -1015,7 +1304,44 @@ async fn execute_tool_calls(
             }
             Err(_) => false,
         };
-        if approved {
+        if approved && call.name == "reload_config" {
+            let result = reload_composition(
+                executor.home,
+                executor.config_path,
+                executor.workspace,
+                executor.session,
+                Some(policy.state().to_owned()),
+                executor.full_access,
+            )
+            .map(|(_, catalog)| {
+                let _ = executor.events.send(RuntimeEvent::CatalogUpdated {
+                    catalog: catalog.clone(),
+                });
+                reloaded = true;
+                serde_json::json!({
+                    "reloaded": true,
+                    "models": catalog.models.len(),
+                    "commands": catalog.commands.len()
+                })
+            })
+            .unwrap_or_else(|error| serde_json::json!({ "error": format!("{error:#}") }));
+            send(
+                executor.events,
+                RuntimeEvent::ToolCompleted {
+                    call_id: call.call_id.clone(),
+                    name: call.name.clone(),
+                    result: result.clone(),
+                },
+            )?;
+            completed.push((
+                index,
+                ToolResult {
+                    call_id: call.call_id,
+                    name: call.name,
+                    result,
+                },
+            ));
+        } else if approved {
             let pending = PendingToolCall { index, call };
             if parallel_safe {
                 parallel.push(pending);
@@ -1054,7 +1380,10 @@ async fn execute_tool_calls(
     )
     .await?;
     completed.sort_by_key(|(index, _)| *index);
-    Ok(completed.into_iter().map(|(_, result)| result).collect())
+    Ok((
+        completed.into_iter().map(|(_, result)| result).collect(),
+        reloaded,
+    ))
 }
 
 fn tool_call_parallel_safe(
@@ -1088,6 +1417,7 @@ async fn flush_parallel_calls(
         let config = Arc::clone(&executor.config);
         let shell_sessions = Arc::clone(shell_sessions);
         let events = executor.events.clone();
+        let full_access = executor.full_access;
         tasks.spawn_local(async move {
             execute_parallel_call(
                 call,
@@ -1096,6 +1426,7 @@ async fn flush_parallel_calls(
                 config,
                 shell_sessions,
                 events,
+                full_access,
             )
             .await
         });
@@ -1117,6 +1448,7 @@ async fn execute_parallel_call(
     config: Arc<Config>,
     shell_sessions: Arc<phi_core::process::ShellSessions>,
     events: mpsc::UnboundedSender<RuntimeEvent>,
+    full_access: bool,
 ) -> RawToolResult {
     let PendingToolCall { index, call } = pending;
     let ToolCall {
@@ -1129,7 +1461,7 @@ async fn execute_parallel_call(
         let event_name = name.clone();
         let event_call_id = call_id.clone();
         let result = shell_sessions
-            .exec(&workspace, &arguments, move |content| {
+            .exec_with_access(&workspace, &arguments, full_access, move |content| {
                 let _ = events.send(RuntimeEvent::ToolOutput {
                     call_id: event_call_id.clone(),
                     name: event_name.clone(),
@@ -1230,7 +1562,12 @@ async fn execute_serial_call(
             };
             if call.name == "exec_command" {
                 shell_sessions
-                    .exec(executor.workspace, &call.arguments, emit)
+                    .exec_with_access(
+                        executor.workspace,
+                        &call.arguments,
+                        executor.full_access,
+                        emit,
+                    )
                     .await
             } else if call.name == "write_stdin" {
                 shell_sessions.write_stdin(&call.arguments, emit).await
@@ -1256,10 +1593,16 @@ async fn execute_serial_call(
         };
     }
     if call.name == executor.file_editor_tool {
-        let (result, display) =
-            execute_file_edit(executor.workspace, policy, &call.name, &call.arguments)
-                .map(|(result, display)| (result, Some(display)))
-                .unwrap_or_else(|error| (serde_json::json!({ "error": error.to_string() }), None));
+        let (result, display) = execute_file_edit(
+            executor.workspace,
+            &executor.home.root,
+            policy,
+            &call.name,
+            &call.arguments,
+            executor.full_access,
+        )
+        .map(|(result, display)| (result, Some(display)))
+        .unwrap_or_else(|error| (serde_json::json!({ "error": error.to_string() }), None));
         return RawToolResult {
             index,
             call_id: call.call_id,
@@ -1274,6 +1617,7 @@ async fn execute_serial_call(
         Arc::clone(&executor.config),
         Arc::clone(shell_sessions),
         executor.events.clone(),
+        executor.full_access,
     )
     .await
 }
@@ -1428,13 +1772,20 @@ fn load_config(path: &Path) -> Result<Config> {
 
 fn execute_file_edit(
     workspace: &Path,
+    config_root: &Path,
     policy: &mut phi_steel::Policy,
     name: &str,
     arguments: &serde_json::Value,
+    full_access: bool,
 ) -> Result<(serde_json::Value, serde_json::Value)> {
     let preparation: phi_core::file_edit::EditPreparation =
         serde_json::from_value(policy.prepare_file_edit(name, arguments)?)?;
-    let snapshots = phi_core::file_edit::snapshots(workspace, &preparation.targets)?;
+    let snapshots = phi_core::file_edit::snapshots(
+        workspace,
+        &preparation.targets,
+        full_access,
+        Some(config_root),
+    )?;
     let changes: Vec<phi_core::file_edit::FileChange> = serde_json::from_value(
         policy.propose_file_edit(name, &preparation.plan, &serde_json::to_value(&snapshots)?)?,
     )?;
@@ -1443,7 +1794,13 @@ fn execute_file_edit(
         .iter()
         .map(|change| file_change_display(change, &snapshots))
         .collect::<Result<Vec<_>>>()?;
-    phi_core::file_edit::apply(workspace, &snapshots, &changes)?;
+    phi_core::file_edit::apply(
+        workspace,
+        &snapshots,
+        &changes,
+        full_access,
+        Some(config_root),
+    )?;
     Ok((
         serde_json::json!({ "changes": summaries }),
         serde_json::json!({ "changes": display }),
@@ -1585,9 +1942,26 @@ mod tests {
             allow_shell: false,
             allow_write: false,
             interactive_approvals: false,
+            full_access: false,
             processes: Arc::new(phi_core::process::ShellSessions::default()),
         };
         (workspace, options)
+    }
+
+    fn add_reloaded_model(home: &phi_core::home::PhiHome) {
+        let mut main = std::fs::read_to_string(home.scheme_config()).unwrap();
+        main.push_str(
+            r#"
+(register-model!
+  "openrouter"
+  (hash 'id "example/reloaded"
+        'label "example/reloaded"
+        'description "Added during a running conversation."
+        'context_window 100000
+        'compaction_token_limit 90000))
+"#,
+        );
+        std::fs::write(home.scheme_config(), main).unwrap();
     }
 
     #[test]
@@ -1600,7 +1974,20 @@ mod tests {
                 .iter()
                 .any(|command| command.name == "model")
         );
+        assert!(catalog.commands.iter().any(|command| command.name == "new"));
+        assert!(
+            catalog
+                .commands
+                .iter()
+                .any(|command| command.name == "compact")
+        );
         assert!(catalog.commands.iter().any(|command| command.name == "ps"));
+        assert!(
+            catalog
+                .commands
+                .iter()
+                .any(|command| command.name == "reload")
+        );
         assert!(
             catalog
                 .commands
@@ -1608,6 +1995,107 @@ mod tests {
                 .any(|command| command.name == "stop")
         );
         assert_eq!(catalog.models[0].id, "openai/gpt-5.6-luna");
+    }
+
+    #[test]
+    fn new_command_creates_a_fresh_session_and_preserves_the_old_one() {
+        let (workspace, mut options) = options();
+        let created = execute_command(
+            &options,
+            &CommandInvocation {
+                name: "help".into(),
+                arguments: String::new(),
+            },
+        )
+        .unwrap();
+        options.session_id = Some(created.session_id.clone());
+
+        let fresh = execute_command(
+            &options,
+            &CommandInvocation {
+                name: "new".into(),
+                arguments: String::new(),
+            },
+        )
+        .unwrap();
+
+        assert_ne!(fresh.session_id, created.session_id);
+        assert_eq!(fresh.action, CommandAction::NewSession);
+        assert_eq!(fresh.content, "Started a new chat.");
+        assert!(
+            fresh
+                .catalog
+                .commands
+                .iter()
+                .any(|command| command.name == "new")
+        );
+        phi_core::session::Session::open(
+            &workspace.path().join(".phi/sessions"),
+            &created.session_id,
+        )
+        .unwrap();
+        let fresh_session = phi_core::session::Session::open(
+            &workspace.path().join(".phi/sessions"),
+            &fresh.session_id,
+        )
+        .unwrap();
+        fresh_session.load_state().unwrap();
+    }
+
+    #[test]
+    fn new_command_rejects_arguments() {
+        let (_workspace, options) = options();
+        let error = execute_command(
+            &options,
+            &CommandInvocation {
+                name: "new".into(),
+                arguments: "now".into(),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "usage: /new");
+    }
+
+    #[test]
+    fn reload_adds_an_openrouter_model_without_restarting_the_session() {
+        let (_workspace, mut options) = options();
+        let created = execute_command(
+            &options,
+            &CommandInvocation {
+                name: "help".into(),
+                arguments: String::new(),
+            },
+        )
+        .unwrap();
+        options.session_id = Some(created.session_id.clone());
+        let home = home_for_config(&options.config_path).unwrap();
+        add_reloaded_model(&home);
+
+        assert!(
+            !command_catalog(&options)
+                .unwrap()
+                .models
+                .iter()
+                .any(|model| model.id == "openrouter/example/reloaded")
+        );
+        let reloaded = execute_command(
+            &options,
+            &CommandInvocation {
+                name: "reload".into(),
+                arguments: String::new(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(reloaded.session_id, created.session_id);
+        assert!(
+            reloaded
+                .catalog
+                .models
+                .iter()
+                .any(|model| model.id == "openrouter/example/reloaded")
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1680,6 +2168,37 @@ mod tests {
     }
 
     #[test]
+    fn invalid_reload_keeps_the_previous_session_composition() {
+        let (_workspace, mut options) = options();
+        let created = execute_command(
+            &options,
+            &CommandInvocation {
+                name: "help".into(),
+                arguments: String::new(),
+            },
+        )
+        .unwrap();
+        options.session_id = Some(created.session_id);
+        let home = home_for_config(&options.config_path).unwrap();
+        std::fs::write(home.scheme_config(), "(this is not valid configuration").unwrap();
+
+        assert!(
+            execute_command(
+                &options,
+                &CommandInvocation {
+                    name: "reload".into(),
+                    arguments: String::new(),
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(
+            command_catalog(&options).unwrap().models[0].id,
+            "openai/gpt-5.6-luna"
+        );
+    }
+
+    #[test]
     fn discovers_manually_copied_skills() {
         let (_workspace, options) = options();
         let home = home_for_config(&options.config_path).unwrap();
@@ -1706,7 +2225,42 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(execution.content, "- review: Review code.");
+        assert!(execution.content.contains("- review: Review code."));
+        assert!(execution.content.contains("- phi-harness:"));
+    }
+
+    #[test]
+    fn reports_the_resolved_harness_status() {
+        let (workspace, options) = options();
+        let status = harness_status(&options).unwrap();
+
+        assert_eq!(
+            status.workspace,
+            workspace
+                .path()
+                .canonicalize()
+                .unwrap()
+                .display()
+                .to_string()
+        );
+        assert_eq!(status.model.as_deref(), Some("openai/gpt-5.6-luna"));
+        assert_eq!(
+            status.config.path,
+            options
+                .config_path
+                .with_file_name("config.scm")
+                .display()
+                .to_string()
+        );
+        assert_eq!(status.composition.prompt_builder, "simple");
+        assert_eq!(status.composition.file_editor, "codex-patch");
+        assert_eq!(status.composition.compactor, "structured");
+        assert!(
+            status
+                .plugins
+                .iter()
+                .all(|plugin| plugin.source == "builtin")
+        );
     }
 
     #[test]
@@ -1792,13 +2346,12 @@ mod tests {
         .unwrap();
         let home = home_for_config(&options.config_path).unwrap();
         let sources = session.composed_sources().unwrap().unwrap();
-        let capabilities = capabilities(&sources, &home);
-        let skills = phi_core::skill::discover(&home.skills(), &options.workspace).unwrap();
+        let capabilities = capabilities(&home, false);
+        let skills = discover_skills(&home, &options.workspace).unwrap();
         let plugins = entrypoints(&sources);
         let mut policy = phi_steel::Policy::load_with_state(
-            &sources.policy,
+            &sources.config,
             &plugins,
-            &sources.main,
             &policy_config(&capabilities, session.id(), &UserState::default(), &skills),
             Some(session.load_state().unwrap()),
         )
@@ -1816,7 +2369,7 @@ mod tests {
                     && body["service_tier"] == "priority"
                     && body["prompt_cache_key"] == execution.session_id
                     && headers["session_id"] == execution.session_id
-                    && body["tools"].as_array().unwrap().len() == 8
+                    && body["tools"].as_array().unwrap().len() == 9
                     && body["tools"].as_array().unwrap().iter()
                         .any(|tool| tool["name"] == "read_file")
                     && body["tools"].as_array().unwrap().iter()
@@ -1827,6 +2380,10 @@ mod tests {
                         .any(|tool| tool["name"] == "list_processes")
                     && body["tools"].as_array().unwrap().iter()
                         .any(|tool| tool["name"] == "terminate_process")
+                    && body["tools"].as_array().unwrap().iter()
+                        .any(|tool| tool["name"] == "reload_config")
+                    && body["tools"].as_array().unwrap().iter()
+                        .any(|tool| tool["name"] == "load_skill")
                     && body["tools"].as_array().unwrap().iter()
                         .any(|tool| tool["name"] == "patch")
                     && !body["tools"].as_array().unwrap().iter()
@@ -1857,11 +2414,10 @@ mod tests {
         std::fs::write(workspace.path().join("src/move.rs"), "pub fn before() {}\n").unwrap();
         let home = home_for_config(&options.config_path).unwrap();
         let sources = resolve_sources(&home, workspace.path()).unwrap();
-        let capabilities = capabilities(&sources, &home);
+        let capabilities = capabilities(&home, false);
         let mut policy = phi_steel::Policy::load_with_state(
-            &sources.policy,
+            &sources.config,
             &entrypoints(&sources),
-            &sources.main,
             &policy_config(&capabilities, "test", &load_user_state(&home).unwrap(), &[]),
             None,
         )
@@ -1869,6 +2425,7 @@ mod tests {
 
         let (result, display) = execute_file_edit(
             workspace.path(),
+            &home.root,
             &mut policy,
             "patch",
             &serde_json::json!({
@@ -1889,6 +2446,7 @@ mod tests {
                     "*** End Patch\n"
                 )
             }),
+            false,
         )
         .unwrap();
 
@@ -1916,6 +2474,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unrestricted_editor_applies_a_patch_outside_the_workspace() {
+        let (workspace, options) = options();
+        let outside = tempfile::tempdir().unwrap();
+        let path = outside.path().join("outside.txt");
+        std::fs::write(&path, "old\n").unwrap();
+        let home = home_for_config(&options.config_path).unwrap();
+        let sources = resolve_sources(&home, workspace.path()).unwrap();
+        let capabilities = capabilities(&home, true);
+        let mut policy = phi_steel::Policy::load_with_state(
+            &sources.config,
+            &entrypoints(&sources),
+            &policy_config(&capabilities, "test", &load_user_state(&home).unwrap(), &[]),
+            None,
+        )
+        .unwrap();
+        execute_file_edit(
+            workspace.path(),
+            &home.root,
+            &mut policy,
+            "patch",
+            &serde_json::json!({
+                "patch": format!(
+                    "*** Begin Patch\n*** Update File: {}\n@@\n-old\n+new\n*** End Patch\n",
+                    path.display()
+                )
+            }),
+            true,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "new\n");
+    }
+
+    #[test]
+    fn editor_can_reconfigure_phi_home_without_full_access() {
+        let (workspace, options) = options();
+        let home = home_for_config(&options.config_path).unwrap();
+        let sources = resolve_sources(&home, workspace.path()).unwrap();
+        let capabilities = capabilities(&home, false);
+        let mut policy = phi_steel::Policy::load_with_state(
+            &sources.config,
+            &entrypoints(&sources),
+            &policy_config(&capabilities, "test", &load_user_state(&home).unwrap(), &[]),
+            None,
+        )
+        .unwrap();
+        let path = home.root.join("reconfigured.scm");
+
+        execute_file_edit(
+            workspace.path(),
+            &home.root,
+            &mut policy,
+            "patch",
+            &serde_json::json!({
+                "patch": format!(
+                    "*** Begin Patch\n*** Add File: {}\n+(configured #t)\n*** End Patch\n",
+                    path.display()
+                )
+            }),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "(configured #t)\n");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn executes_parallel_safe_calls_concurrently() {
         tokio::task::LocalSet::new()
@@ -1923,12 +2547,17 @@ mod tests {
                 let (workspace, options) = options();
                 let home = home_for_config(&options.config_path).unwrap();
                 let sources = resolve_sources(&home, workspace.path()).unwrap();
+                let session = phi_core::session::Session::create_composed(
+                    &workspace.path().join(".phi/sessions"),
+                    &sources.config,
+                    &sources.plugins,
+                )
+                .unwrap();
                 let mut policy = phi_steel::Policy::load_with_state(
-                    &sources.policy,
+                    &sources.config,
                     &entrypoints(&sources),
-                    &sources.main,
                     &policy_config(
-                        &capabilities(&sources, &home),
+                        &capabilities(&home, false),
                         "test",
                         &load_user_state(&home).unwrap(),
                         &[],
@@ -1959,13 +2588,17 @@ mod tests {
                 let cancellation = CancellationToken::new();
                 let executor = ToolBatchExecutor {
                     workspace: workspace.path(),
+                    home: &home,
+                    config_path: &options.config_path,
+                    session: &session,
                     capabilities: registry,
                     config,
                     file_editor_tool: "patch",
                     events: &event_tx,
                     cancellation: &cancellation,
+                    full_access: false,
                 };
-                let results = execute_tool_calls(
+                let (results, reloaded) = execute_tool_calls(
                     calls,
                     &executor,
                     &phi_core::permissions::Permissions {
@@ -1979,6 +2612,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
+                assert!(!reloaded);
                 assert_eq!(results.len(), 2);
                 assert_eq!(results[0].call_id, "first");
                 assert_eq!(results[1].call_id, "second");
@@ -1991,6 +2625,100 @@ mod tests {
             .await;
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_reload_tool_updates_the_current_session_catalog() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (workspace, options) = options();
+                let home = home_for_config(&options.config_path).unwrap();
+                let sources = resolve_sources(&home, workspace.path()).unwrap();
+                let session = phi_core::session::Session::create_composed(
+                    &workspace.path().join(".phi/sessions"),
+                    &sources.config,
+                                        &sources.plugins,
+                )
+                .unwrap();
+                let registry = Arc::new(capabilities(&home, false));
+                let mut policy = phi_steel::Policy::load_with_state(
+                    &sources.config,
+                    &entrypoints(&sources),
+                                        &policy_config(
+                        &registry,
+                        session.id(),
+                        &load_user_state(&home).unwrap(),
+                        &[],
+                    ),
+                    None,
+                )
+                .unwrap();
+                session.save_state(policy.state()).unwrap();
+                add_reloaded_model(&home);
+                let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+                let (_command_tx, mut command_rx) = mpsc::unbounded_channel();
+                let cancellation = CancellationToken::new();
+                let executor = ToolBatchExecutor {
+                    workspace: workspace.path(),
+                    home: &home,
+                    config_path: &options.config_path,
+                    session: &session,
+                    capabilities: registry,
+                    config: Arc::new(load_config(&options.config_path).unwrap()),
+                    file_editor_tool: "patch",
+                    events: &event_tx,
+                    cancellation: &cancellation,
+                    full_access: false,
+                };
+                let (results, reloaded) = execute_tool_calls(
+                    vec![ToolCall {
+                        call_id: "reload".into(),
+                        name: "reload_config".into(),
+                        arguments: serde_json::json!({}),
+                        execution: ToolExecution::Direct,
+                    }],
+                    &executor,
+                    &phi_core::permissions::Permissions {
+                        allow_shell: false,
+                        allow_write: false,
+                    },
+                    false,
+                    &mut command_rx,
+                    &mut policy,
+                    &Arc::new(phi_core::process::ShellSessions::default()),
+                )
+                .await
+                .unwrap();
+
+                assert!(reloaded);
+                assert_eq!(results[0].result["reloaded"], true);
+                let mut updated = false;
+                while let Ok(event) = event_rx.try_recv() {
+                    updated |= matches!(
+                        event,
+                        RuntimeEvent::CatalogUpdated { catalog }
+                            if catalog.models.iter().any(|model| model.id == "openrouter/example/reloaded")
+                    );
+                }
+                assert!(updated);
+            })
+            .await;
+    }
+
+    #[test]
+    fn migrates_legacy_main_into_the_single_scheme_config() {
+        let root = tempfile::tempdir().unwrap();
+        let home = phi_core::home::PhiHome {
+            root: root.path().join("home"),
+        };
+        std::fs::create_dir_all(&home.root).unwrap();
+        std::fs::write(home.root.join("main.scm"), "(load-plugin! \"legacy\")\n").unwrap();
+
+        initialize_at(&home).unwrap();
+
+        let migrated = std::fs::read_to_string(home.scheme_config()).unwrap();
+        assert!(migrated.contains("(define (on-event"));
+        assert!(migrated.ends_with("(load-plugin! \"legacy\")\n"));
+    }
+
     #[test]
     fn refreshes_versioned_builtins_without_overwriting_user_config() {
         let root = tempfile::tempdir().unwrap();
@@ -1998,16 +2726,30 @@ mod tests {
             root: root.path().join("home"),
         };
         initialize_at(&home).unwrap();
-        std::fs::write(home.builtins().join("agent.scm"), "stale").unwrap();
-        std::fs::write(home.main(), "user composition").unwrap();
+        std::fs::write(home.builtins().join("plugins/responses/main.scm"), "stale").unwrap();
+        std::fs::write(home.scheme_config(), "user composition").unwrap();
         initialize_at(&home).unwrap();
         assert_eq!(
-            std::fs::read_to_string(home.builtins().join("agent.scm")).unwrap(),
-            DEFAULT_AGENT
+            std::fs::read_to_string(home.builtins().join("plugins/responses/main.scm")).unwrap(),
+            std::fs::read_to_string(repository_root().join("policy/providers/responses.scm"))
+                .unwrap()
         );
         assert_eq!(
-            std::fs::read_to_string(home.main()).unwrap(),
+            std::fs::read_to_string(
+                home.builtins()
+                    .join("plugins/compaction-structured/main.scm")
+            )
+            .unwrap(),
+            std::fs::read_to_string(repository_root().join("policy/compaction/structured.scm"))
+                .unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.scheme_config()).unwrap(),
             "user composition"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.builtin_skills().join("phi-harness/SKILL.md")).unwrap(),
+            PHI_HARNESS_SKILL[0].1
         );
     }
 }

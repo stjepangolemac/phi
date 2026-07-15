@@ -48,7 +48,12 @@ pub enum FileChange {
     },
 }
 
-pub fn snapshots(workspace: &Path, targets: &[EditTarget]) -> Result<Vec<FileSnapshot>> {
+pub fn snapshots(
+    workspace: &Path,
+    targets: &[EditTarget],
+    full_access: bool,
+    additional_root: Option<&Path>,
+) -> Result<Vec<FileSnapshot>> {
     let root = fs::canonicalize(workspace)?;
     let mut seen = BTreeSet::new();
     targets
@@ -57,7 +62,7 @@ pub fn snapshots(workspace: &Path, targets: &[EditTarget]) -> Result<Vec<FileSna
             if !seen.insert(target.path.clone()) {
                 bail!("duplicate file edit target: {}", target.path);
             }
-            let path = resolve(&root, &target.path)?;
+            let path = resolve(&root, &target.path, full_access, additional_root)?;
             if path.exists() {
                 let metadata = fs::symlink_metadata(&path)?;
                 if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -74,7 +79,10 @@ pub fn snapshots(workspace: &Path, targets: &[EditTarget]) -> Result<Vec<FileSna
             } else {
                 let parent = path.parent().context("file edit target has no parent")?;
                 let parent = fs::canonicalize(parent)?;
-                if !parent.starts_with(&root) {
+                if !full_access
+                    && !parent.starts_with(&root)
+                    && !additional_root.is_some_and(|root| parent.starts_with(root))
+                {
                     bail!("file edit target is outside workspace: {}", target.path);
                 }
                 Ok(FileSnapshot {
@@ -88,7 +96,13 @@ pub fn snapshots(workspace: &Path, targets: &[EditTarget]) -> Result<Vec<FileSna
         .collect()
 }
 
-pub fn apply(workspace: &Path, snapshots: &[FileSnapshot], changes: &[FileChange]) -> Result<()> {
+pub fn apply(
+    workspace: &Path,
+    snapshots: &[FileSnapshot],
+    changes: &[FileChange],
+    full_access: bool,
+    additional_root: Option<&Path>,
+) -> Result<()> {
     let root = fs::canonicalize(workspace)?;
     let originals = snapshots
         .iter()
@@ -116,7 +130,7 @@ pub fn apply(workspace: &Path, snapshots: &[FileSnapshot], changes: &[FileChange
     }
 
     for snapshot in snapshots {
-        let path = resolve(&root, &snapshot.path)?;
+        let path = resolve(&root, &snapshot.path, full_access, additional_root)?;
         if snapshot.exists {
             let bytes = fs::read(&path)
                 .with_context(|| format!("file changed after preparation: {}", snapshot.path))?;
@@ -151,25 +165,30 @@ pub fn apply(workspace: &Path, snapshots: &[FileSnapshot], changes: &[FileChange
     for change in changes {
         match change {
             FileChange::Create { path, content } => {
-                persist(&resolve(&root, path)?, content, None, false)?;
+                persist(
+                    &resolve(&root, path, full_access, additional_root)?,
+                    content,
+                    None,
+                    false,
+                )?;
             }
             FileChange::Replace { path, content } => {
-                let target = resolve(&root, path)?;
+                let target = resolve(&root, path, full_access, additional_root)?;
                 let permissions = fs::metadata(&target)?.permissions();
                 persist(&target, content, Some(permissions), true)?;
             }
             FileChange::Delete { path } => {
-                fs::remove_file(resolve(&root, path)?)?;
+                fs::remove_file(resolve(&root, path, full_access, additional_root)?)?;
             }
             FileChange::Move {
                 path,
                 destination,
                 content,
             } => {
-                let source_path = resolve(&root, path)?;
+                let source_path = resolve(&root, path, full_access, additional_root)?;
                 let permissions = fs::metadata(&source_path)?.permissions();
                 persist(
-                    &resolve(&root, destination)?,
+                    &resolve(&root, destination, full_access, additional_root)?,
                     content,
                     Some(permissions),
                     false,
@@ -181,10 +200,27 @@ pub fn apply(workspace: &Path, snapshots: &[FileSnapshot], changes: &[FileChange
     Ok(())
 }
 
-fn resolve(root: &Path, relative: &str) -> Result<PathBuf> {
+fn resolve(
+    root: &Path,
+    relative: &str,
+    full_access: bool,
+    additional_root: Option<&Path>,
+) -> Result<PathBuf> {
     let relative = Path::new(relative);
-    if relative.as_os_str().is_empty()
-        || relative.is_absolute()
+    if relative.as_os_str().is_empty() {
+        bail!("file path is empty");
+    }
+    if full_access {
+        return Ok(if relative.is_absolute() {
+            relative.to_owned()
+        } else {
+            root.join(relative)
+        });
+    }
+    if relative.is_absolute() && additional_root.is_some_and(|root| relative.starts_with(root)) {
+        return Ok(relative.to_owned());
+    }
+    if relative.is_absolute()
         || relative.components().any(|component| {
             matches!(
                 component,
@@ -237,7 +273,7 @@ mod tests {
                 path: "new.txt".into(),
             },
         ];
-        let snapshots = snapshots(workspace.path(), &targets).unwrap();
+        let snapshots = snapshots(workspace.path(), &targets, false, None).unwrap();
         apply(
             workspace.path(),
             &snapshots,
@@ -251,6 +287,8 @@ mod tests {
                     content: "new\n".into(),
                 },
             ],
+            false,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -263,7 +301,7 @@ mod tests {
         );
 
         assert!(
-            apply(workspace.path(), &snapshots, &[])
+            apply(workspace.path(), &snapshots, &[], false, None)
                 .unwrap_err()
                 .to_string()
                 .contains("stale")
@@ -278,9 +316,34 @@ mod tests {
                 workspace.path(),
                 &[EditTarget {
                     path: "../outside".into()
-                }]
+                }],
+                false,
+                None,
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn unrestricted_edits_accept_absolute_paths_outside_the_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let path = outside.path().join("outside.txt");
+        fs::write(&path, "old\n").unwrap();
+        let path = path.display().to_string();
+        let targets = vec![EditTarget { path: path.clone() }];
+        let snapshots = snapshots(workspace.path(), &targets, true, None).unwrap();
+        apply(
+            workspace.path(),
+            &snapshots,
+            &[FileChange::Replace {
+                path: path.clone(),
+                content: "new\n".into(),
+            }],
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), "new\n");
     }
 }

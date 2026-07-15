@@ -30,6 +30,7 @@ struct Cli {
 enum Command {
     Init,
     Doctor,
+    Status,
     Run {
         prompt: String,
     },
@@ -52,13 +53,7 @@ enum Command {
         #[command(subcommand)]
         command: PluginCommand,
     },
-    CheckPolicy,
-    PolicyCandidate {
-        path: PathBuf,
-    },
-    PolicyActivate {
-        id: String,
-    },
+    CheckConfig,
 }
 
 #[derive(Subcommand)]
@@ -106,6 +101,7 @@ async fn run() -> Result<()> {
         allow_shell,
         allow_write,
         interactive_approvals,
+        full_access: cli.yolo,
         processes: std::sync::Arc::clone(&processes),
     };
     let result = async {
@@ -126,6 +122,15 @@ async fn run() -> Result<()> {
                 println!("ok");
                 Ok(())
             }
+            Some(Command::Status) => {
+                let status = phi_runtime::harness_status(&options())?;
+                if cli.json {
+                    print_json(&status)
+                } else {
+                    print_status(&status);
+                    Ok(())
+                }
+            }
             Some(Command::Run { prompt }) => run_frontend(options(), prompt, cli.json).await,
             Some(Command::Resume { session, prompt }) => {
                 let mut options = options();
@@ -134,7 +139,10 @@ async fn run() -> Result<()> {
             }
             Some(Command::Read { path }) => {
                 let mut registry = phi_core::capability::Registry::default();
-                registry.register(phi_core::capability::ReadFile);
+                registry.register(phi_core::capability::ReadFile {
+                    full_access: cli.yolo,
+                    additional_root: Some(home.root.clone()),
+                });
                 print_json(&registry.execute(
                     &workspace,
                     "read_file",
@@ -161,20 +169,9 @@ async fn run() -> Result<()> {
                 )
             }
             Some(Command::Plugin { command }) => plugin(&home, command),
-            Some(Command::CheckPolicy) => {
-                phi_runtime::check_policy(&home, &workspace)?;
-                println!("policy ok");
-                Ok(())
-            }
-            Some(Command::PolicyCandidate { path }) => {
-                phi_runtime::check_policy_candidate(&home, &workspace, &path)?;
-                let id = phi_core::policy_store::submit(&workspace.join(".phi/policies"), &path)?;
-                println!("{id}");
-                Ok(())
-            }
-            Some(Command::PolicyActivate { id }) => {
-                phi_core::policy_store::activate(&workspace.join(".phi/policies"), &id)?;
-                println!("activated {id}");
+            Some(Command::CheckConfig) => {
+                phi_runtime::check_scheme_config(&home, &workspace)?;
+                println!("config ok");
                 Ok(())
             }
         }
@@ -283,6 +280,29 @@ async fn run_frontend(
 fn print_json(value: &impl serde::Serialize) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+fn print_status(status: &phi_runtime::HarnessStatus) {
+    println!("version: {}", status.version);
+    println!("workspace: {}", status.workspace);
+    println!("home: {}", status.home);
+    println!(
+        "model: {} · {} · {}",
+        status.model.as_deref().unwrap_or("none"),
+        status.reasoning.as_deref().unwrap_or("none"),
+        status.service_tier.as_deref().unwrap_or("none")
+    );
+    println!("config: {}", status.config.path);
+    println!("prompt builder: {}", status.composition.prompt_builder);
+    println!("file editor: {}", status.composition.file_editor);
+    println!("compactor: {}", status.composition.compactor);
+    println!("plugins:");
+    for plugin in &status.plugins {
+        println!(
+            "  {} · {} · {}",
+            plugin.name, plugin.source, plugin.revision
+        );
+    }
 }
 
 fn emit_json(value: &impl serde::Serialize) -> Result<()> {
