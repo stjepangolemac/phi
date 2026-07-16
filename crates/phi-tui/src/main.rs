@@ -22,7 +22,6 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Clear, Paragraph},
 };
-use tui_markdown::StyleSheet;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 mod composer;
@@ -1688,8 +1687,6 @@ fn push_markdown(lines: &mut Vec<Line<'static>>, role: &str, content: &str, widt
     } else {
         Style::default()
     };
-    let code_style = PhiMarkdown.code();
-    let code_background = Style::default().bg(code_style.bg.unwrap());
     let code_inset = usize::from(role == "processes") * 2;
     let code_padding = code_inset;
     let marker = if role == "you" { "‣ " } else { "• " };
@@ -1703,27 +1700,12 @@ fn push_markdown(lines: &mut Vec<Line<'static>>, role: &str, content: &str, widt
     for line in markdown.lines {
         let plain = line.to_string();
         if plain.trim_start().starts_with("```") {
-            let padding = || {
-                if code_inset == 0 {
-                    Line::styled(" ".repeat(width), block_style.patch(code_style))
-                } else {
-                    Line::from(vec![
-                        Span::styled(" ".repeat(code_inset), block_style),
-                        Span::styled(
-                            " ".repeat(width.saturating_sub(code_inset * 2)),
-                            block_style.patch(code_style),
-                        ),
-                        Span::styled(" ".repeat(code_inset), block_style),
-                    ])
-                    .style(block_style)
-                }
-            };
             if in_code {
-                lines.push(padding());
+                lines.push(Line::styled(" ".repeat(width), block_style));
                 in_code = false;
             } else {
                 in_code = true;
-                lines.push(padding());
+                lines.push(Line::styled(" ".repeat(width), block_style));
             }
             continue;
         }
@@ -1742,21 +1724,11 @@ fn push_markdown(lines: &mut Vec<Line<'static>>, role: &str, content: &str, widt
             } else {
                 "  "
             };
-            let extra_style = if in_code {
-                code_background
-            } else {
-                Style::default()
-            };
-            let inherited = wrapped.style.fg.unwrap_or(if in_code {
-                code_style.fg.unwrap()
-            } else {
-                normal
-            });
+            let inherited = wrapped.style.fg.unwrap_or(normal);
             let style = Style::default()
                 .fg(inherited)
                 .patch(block_style)
-                .patch(wrapped.style)
-                .patch(extra_style);
+                .patch(wrapped.style);
             let prefix_style = if in_code && code_inset > 0 {
                 block_style
             } else {
@@ -1775,8 +1747,7 @@ fn push_markdown(lines: &mut Vec<Line<'static>>, role: &str, content: &str, widt
                 let mut span_style = Style::default()
                     .fg(inherited)
                     .patch(block_style)
-                    .patch(span.style)
-                    .patch(extra_style);
+                    .patch(span.style);
                 if span_style.add_modifier.contains(Modifier::BOLD) {
                     span_style = span_style.fg(strong);
                 }
@@ -2696,14 +2667,36 @@ mod tests {
             .iter()
             .find(|line| line.to_string().contains("fn main"))
             .unwrap();
-        assert_eq!(code.style.bg, Some(Color::Rgb(27, 28, 31)));
-        assert!(code.spans.iter().any(|span| span.style.fg.is_some()));
+        assert_eq!(code.style.bg, None);
+        assert!(code.spans.iter().all(|span| span.style.bg.is_none()));
+        assert!(code.spans.iter().any(|span| {
+            !span.content.trim().is_empty() && span.style.fg != Some(Color::Rgb(190, 190, 185))
+        }));
         let code_index = lines
             .iter()
             .position(|line| line.to_string().contains("fn main"))
             .unwrap();
-        assert_eq!(lines[code_index - 1].style.bg, Some(Color::Rgb(27, 28, 31)));
-        assert_eq!(lines[code_index + 1].style.bg, Some(Color::Rgb(27, 28, 31)));
+        assert_eq!(lines[code_index - 1].style.bg, None);
+        assert_eq!(lines[code_index + 1].style.bg, None);
+    }
+
+    #[test]
+    fn renders_untagged_code_with_normal_text_color_and_background() {
+        let mut lines = Vec::new();
+        push_message(&mut lines, "phi", "```\nlet value = mystery();\n```", 80);
+
+        let code = lines
+            .iter()
+            .find(|line| line.to_string().contains("let value"))
+            .unwrap();
+        assert_eq!(code.style.bg, None);
+        assert!(code.spans.iter().all(|span| span.style.bg.is_none()));
+        let content = code
+            .spans
+            .iter()
+            .find(|span| span.content.contains("let value"))
+            .unwrap();
+        assert_eq!(content.style.fg, Some(Color::Rgb(190, 190, 185)));
     }
 
     #[test]
@@ -2741,14 +2734,9 @@ mod tests {
         assert_eq!(command.spans.first().unwrap().content, "  ");
         assert_eq!(command.spans.last().unwrap().content, "  ");
         assert_eq!(command.spans[1].content, "  ");
-        assert_eq!(command.spans[1].style.bg, Some(Color::Rgb(27, 28, 31)));
+        assert_eq!(command.spans[1].style.bg, None);
         assert!(command.to_string().starts_with("    while true"));
-        assert!(
-            command
-                .spans
-                .iter()
-                .any(|span| span.style.bg == Some(Color::Rgb(27, 28, 31)))
-        );
+        assert!(command.spans.iter().all(|span| span.style.bg.is_none()));
         assert!(command.spans.iter().any(|span| span.style.fg.is_some()));
     }
 
