@@ -144,6 +144,8 @@ pub struct ModelSpec {
     pub context_window: u64,
     pub compaction_token_limit: u64,
     #[serde(default)]
+    pub strict_json_schema_capable: bool,
+    #[serde(default)]
     pub function_tools: bool,
     #[serde(default)]
     pub hosted_tools: Vec<String>,

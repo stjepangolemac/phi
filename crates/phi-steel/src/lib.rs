@@ -334,6 +334,12 @@ const PLUGIN_PRELUDE: &str = r#"
    events (tool-config (hash-ref implementation 'name))))
 
 (define (provider-request prompt model reasoning service-tier)
+  (define output-schema (hash-try-get prompt 'output_schema))
+  (if (and output-schema
+           (not (hash-try-get (model-spec model)
+                              'strict_json_schema_capable)))
+      (error! (string-append
+                "model does not support strict JSON schema: " model)))
   ((hash-ref (model-provider model) 'effect)
    prompt (hash-ref (model-spec model) 'model) reasoning service-tier))
 (define (provider-calls-for model events)
@@ -377,9 +383,9 @@ const PLUGIN_PRELUDE: &str = r#"
   ((hash-ref (find-named compactor-registry selected-compactor) 'start)
    messages max-tokens selected-compactor-config))
 
-(define (complete-selected-compaction messages usage max-tokens events)
+(define (complete-selected-compaction messages usage max-tokens events repair-count)
   ((hash-ref (find-named compactor-registry selected-compactor) 'complete)
-   messages usage max-tokens events selected-compactor-config))
+   messages usage max-tokens events repair-count selected-compactor-config))
 
 (define (validate-tool-preference preference)
   (define preferred (hash-try-get preference 'prefer))
@@ -725,14 +731,24 @@ mod tests {
     }
 
     fn compact_policy(root: &Path, limit: u64) -> Policy {
+        compact_policy_with_strict(root, limit, true)
+    }
+
+    fn compact_policy_with_strict(root: &Path, limit: u64, strict: bool) -> Policy {
         let temp = tempfile::tempdir().unwrap();
         let provider = temp.path().join("openai.scm");
-        let source = fs::read_to_string(root.join("policy/providers/openai.scm"))
+        let mut source = fs::read_to_string(root.join("policy/providers/openai.scm"))
             .unwrap()
             .replace(
                 "'compaction_token_limit 244800",
                 &format!("'compaction_token_limit {limit}"),
             );
+        if !strict {
+            source = source.replace(
+                "'strict_json_schema_capable #t",
+                "'strict_json_schema_capable #f",
+            );
+        }
         fs::write(&provider, source).unwrap();
         let mut sources = plugins(root);
         sources[1] = provider;
@@ -1157,7 +1173,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_recovers_from_unstructured_model_output() {
+    fn compaction_repairs_unstructured_model_output() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut policy = compact_policy(&root, 30_000);
         policy
@@ -1189,6 +1205,29 @@ mod tests {
                 error: String::new(),
             })
             .unwrap();
+        assert!(matches!(
+            &output.effects[0],
+            Effect::HttpRequest { body, .. }
+                if body["input"].as_array().unwrap().iter().any(|item|
+                    item["role"] == "user"
+                        && item["content"][0]["text"].as_str().unwrap()
+                            .contains("previous response was not valid JSON"))
+        ));
+        let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
+        assert_eq!(state["compactions"], 0.0);
+        assert_eq!(state["compaction_attempt"], 1.0);
+
+        let output = policy
+            .on_event(&Event::HttpCompleted {
+                success: true,
+                status: 200,
+                events: vec![serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "delta": r#"{"objective":"continue","requirements":[],"current_state":["repaired"],"pending":[],"next_steps":[]}"#
+                })],
+                error: String::new(),
+            })
+            .unwrap();
         assert_eq!(
             output.effects,
             vec![Effect::Finish {
@@ -1197,12 +1236,125 @@ mod tests {
         );
         let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
         assert_eq!(state["compactions"], 1.0);
-        assert!(
-            state["messages"][0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("The model ignored the JSON request.")
-        );
+        assert_eq!(state["compaction_attempt"], 0.0);
+    }
+
+    #[test]
+    fn compaction_repairs_empty_model_output() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut policy = compact_policy(&root, 30_000);
+        policy
+            .on_event(&Event::UserMessage {
+                content: "empty output test".into(),
+            })
+            .unwrap();
+        policy
+            .on_event(&Event::HttpCompleted {
+                success: true,
+                status: 200,
+                events: vec![serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "delta": "answer"
+                })],
+                error: String::new(),
+            })
+            .unwrap();
+        policy.on_event(&Event::CompactRequested).unwrap();
+
+        let output = policy
+            .on_event(&Event::HttpCompleted {
+                success: true,
+                status: 200,
+                events: Vec::new(),
+                error: String::new(),
+            })
+            .unwrap();
+        assert!(matches!(&output.effects[0], Effect::HttpRequest { .. }));
+        let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
+        assert_eq!(state["compaction_attempt"], 1.0);
+        assert_eq!(state["compactions"], 0.0);
+    }
+
+    #[test]
+    fn compaction_uses_prompt_fallback_for_non_strict_models() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut policy = compact_policy_with_strict(&root, 30_000, false);
+        policy
+            .on_event(&Event::UserMessage {
+                content: "fallback test".into(),
+            })
+            .unwrap();
+        policy
+            .on_event(&Event::HttpCompleted {
+                success: true,
+                status: 200,
+                events: vec![serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "delta": "answer"
+                })],
+                error: String::new(),
+            })
+            .unwrap();
+        let output = policy.on_event(&Event::CompactRequested).unwrap();
+        assert!(matches!(
+            &output.effects[0],
+            Effect::HttpRequest { body, .. }
+                if body.get("text").is_none()
+                    && body["instructions"].as_str().unwrap().contains("JSON only")
+        ));
+    }
+
+    #[test]
+    fn compaction_stops_after_four_repair_attempts() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut policy = compact_policy(&root, 30_000);
+        policy
+            .on_event(&Event::UserMessage {
+                content: "retry test".into(),
+            })
+            .unwrap();
+        policy
+            .on_event(&Event::HttpCompleted {
+                success: true,
+                status: 200,
+                events: vec![serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "delta": "answer"
+                })],
+                error: String::new(),
+            })
+            .unwrap();
+        policy.on_event(&Event::CompactRequested).unwrap();
+
+        for attempt in 1..=4 {
+            let output = policy
+                .on_event(&Event::HttpCompleted {
+                    success: true,
+                    status: 200,
+                    events: vec![serde_json::json!({
+                        "type": "response.output_text.delta",
+                        "delta": "not json"
+                    })],
+                    error: String::new(),
+                })
+                .unwrap();
+            assert!(matches!(&output.effects[0], Effect::HttpRequest { .. }));
+            let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
+            assert_eq!(state["compaction_attempt"], attempt as f64);
+        }
+
+        let error = policy
+            .on_event(&Event::HttpCompleted {
+                success: true,
+                status: 200,
+                events: vec![serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "delta": "still not json"
+                })],
+                error: String::new(),
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("after 4 repair attempts"));
     }
 
     #[test]

@@ -2219,6 +2219,7 @@ mod tests {
                     description: "Test model.".into(),
                     context_window: 1_000,
                     compaction_token_limit: 900,
+                    strict_json_schema_capable: false,
                     function_tools: true,
                     hosted_tools: Vec::new(),
                     reasoning: vec![

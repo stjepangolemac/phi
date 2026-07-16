@@ -12,7 +12,7 @@
     (hash-ref config 'reasoning)
     (hash-ref config 'service_tier)))
 
-(define (complete-compaction messages usage max-tokens events config)
+(define (complete-compaction messages usage max-tokens events _attempt config)
   (define summary
     (provider-output-for (hash-ref config 'model) events))
   (define message-token-budget
@@ -21,7 +21,8 @@
       (error! "compactor returned no summary")
       (if (<= message-token-budget 0)
           (error! "fixed prompt and tools exceed the context budget")
-          (fit-summary summary (* message-token-budget 4)))))
+          (hash 'messages
+                (fit-summary summary (* message-token-budget 4))))))
 
 (define (portable-messages messages)
   (cond

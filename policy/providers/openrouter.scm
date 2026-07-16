@@ -12,6 +12,7 @@
           'description description
           'context_window 1000000
           'compaction_token_limit 180000
+          'strict_json_schema_capable #t
           'function_tools #t
           'hosted_tools (list "openrouter/hosted-web-search")
           'reasoning openrouter-reasoning-options

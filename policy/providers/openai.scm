@@ -19,6 +19,7 @@
           'description description
           'context_window 272000
           'compaction_token_limit 244800
+          'strict_json_schema_capable #t
           'function_tools #t
           'hosted_tools (list "openai/hosted-web-search")
           'reasoning reasoning

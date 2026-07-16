@@ -21,13 +21,44 @@
   (define model (hash-ref config 'model))
   (define provider (hash-ref (model-spec model) 'provider))
   (provider-request
-    (hash 'instructions structured-compaction-instructions
-          'messages
-          (structured-compatible-messages
-            (structured-complete-tool-history messages)
-            provider)
-          'tools '()
-          'output_schema structured-compaction-schema)
+    (structured-output-prompt
+      model
+      structured-compaction-instructions
+      (structured-compatible-messages
+        (structured-complete-tool-history messages)
+        provider))
+    model
+    (hash-ref config 'reasoning)
+    (hash-ref config 'service_tier)))
+
+(define (structured-output-prompt model instructions messages)
+  (define prompt
+    (hash 'instructions instructions 'messages messages 'tools '()))
+  (if (hash-try-get (model-spec model) 'strict_json_schema_capable)
+      (hash-insert prompt 'output_schema structured-compaction-schema)
+      prompt))
+
+(define (start-structured-repair messages output config)
+  (define model (hash-ref config 'model))
+  (define provider (hash-ref (model-spec model) 'provider))
+  (define repair-message
+    (hash 'kind "message" 'role "user"
+          'content
+          (string-append
+            "Your previous response was not valid JSON for the required schema. "
+            "Return exactly one JSON object matching this schema, with no markdown "
+            "or commentary:\n"
+            (value->jsexpr-string structured-compaction-schema))))
+  (provider-request
+    (structured-output-prompt
+      model
+      structured-compaction-instructions
+      (append
+        (structured-compatible-messages
+          (structured-complete-tool-history messages)
+          provider)
+        (list (hash 'kind "message" 'role "assistant" 'content output)
+              repair-message)))
     model
     (hash-ref config 'reasoning)
     (hash-ref config 'service_tier)))
@@ -44,12 +75,15 @@
      (cons (car messages)
            (structured-compatible-messages (cdr messages) provider))]))
 
-(define (complete-structured-compaction messages usage max-tokens events config)
+(define (complete-structured-compaction messages usage max-tokens events repair-count config)
   (define output
     (provider-output-for (hash-ref config 'model) events))
-  (if (equal? output "")
-      (error! "compactor returned no structured summary")
-      (let* ([summary (structured-summary output)]
+  (let ([parsed (structured-summary output)])
+    (if (not (hash-ref parsed 'valid))
+        (if (< repair-count (or (hash-try-get config 'max_repair_attempts) 4))
+            (hash 'retry (start-structured-repair messages output config))
+            (error! "compactor returned invalid structured output after 4 repair attempts"))
+        (let* ([summary (hash-ref parsed 'summary)]
              [summary-message
               (list (hash 'kind "message" 'role "user"
                           'content
@@ -78,24 +112,37 @@
           [(<= message-token-budget 0)
            (error! "fixed prompt and tools exceed the context budget")]
           [else
-           (fit-structured-context summary-message tail max-context-chars)]))))
+           (hash 'messages
+                 (fit-structured-context
+                   summary-message tail max-context-chars))])))))
 
 (define (structured-summary output)
   (with-handler
     (lambda (_)
-      (value->jsexpr-string
-        (hash 'objective "Continue the conversation."
-              'requirements '()
-              'current_state (list output)
-              'pending (list "The compactor returned an unstructured summary.")
-              'next_steps '())))
+      (hash 'valid #f))
     (let ([parsed (string->jsexpr output)])
-      (value->jsexpr-string
-        (hash 'objective (hash-ref parsed 'objective)
-              'requirements (hash-ref parsed 'requirements)
-              'current_state (hash-ref parsed 'current_state)
-              'pending (hash-ref parsed 'pending)
-              'next_steps (hash-ref parsed 'next_steps))))))
+      (if (and (= (hash-length parsed) 5)
+               (string? (hash-ref parsed 'objective))
+               (structured-string-list? (hash-ref parsed 'requirements))
+               (structured-string-list? (hash-ref parsed 'current_state))
+               (structured-string-list? (hash-ref parsed 'pending))
+               (structured-string-list? (hash-ref parsed 'next_steps)))
+          (hash 'valid #t
+                'summary
+                (value->jsexpr-string
+                  (hash 'objective (hash-ref parsed 'objective)
+                        'requirements (hash-ref parsed 'requirements)
+                        'current_state (hash-ref parsed 'current_state)
+                        'pending (hash-ref parsed 'pending)
+                        'next_steps (hash-ref parsed 'next_steps))))
+          (hash 'valid #f)))))
+
+(define (structured-string-list? value)
+  (cond
+    [(not (list? value)) #f]
+    [(null? value) #t]
+    [(not (string? (car value))) #f]
+    [else (structured-string-list? (cdr value))]))
 
 ;; Walk newest-first, stopping as soon as either the message or token cap would
 ;; be crossed. Consing each accepted item restores chronological order.

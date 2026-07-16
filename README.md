@@ -99,6 +99,7 @@ Provider plugins may register a useful default model catalog. Configuration is e
         'description "MiniMax M3 through OpenRouter."
         'context_window 1000000
         'compaction_token_limit 180000
+        'strict_json_schema_capable #f
         'function_tools #t
         'hosted_tools (list "openrouter/hosted-web-search")
         'reasoning (list (hash 'id "high" 'description "Greater reasoning depth."))
@@ -107,7 +108,7 @@ Provider plugins may register a useful default model catalog. Configuration is e
         'default_service_tier ""))
 ```
 
-Provider-neutral prompts contain `instructions`, `messages`, and `tools`; compactors may also attach `output_schema`. Responses-compatible providers map that schema to strict JSON-schema output.
+Provider-neutral prompts contain `instructions`, `messages`, and `tools`; compactors may also attach `output_schema`. Models verified to support strict schema decoding register `strict_json_schema_capable` as true. Structured compaction uses native schemas for those models, otherwise prompts for JSON, validates the result, and makes up to four repair attempts.
 
 After changing `config.scm` or `config.json`, use `/reload`. The agent can call `reload_config` after reconfiguring itself. Reload validates the live composition, replaces the current session snapshot, and updates the catalog without discarding the conversation.
 

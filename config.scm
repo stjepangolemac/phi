@@ -11,7 +11,7 @@
                 model
                 (or (hash-try-get config 'reasoning) "")
                 (or (hash-try-get config 'service_tier) "")
-                "ready" "")))
+                "ready" "" 0)))
 
 (define (tool-call-execution model call)
   (define implementation
@@ -54,6 +54,8 @@
   (define service-tier (hash-ref state 'service_tier))
   (define activity (hash-ref state 'activity))
   (define pending-finish (hash-ref state 'pending_finish))
+  (define compaction-attempt
+    (or (hash-try-get state 'compaction_attempt) 0))
   (define next-state state)
   (define effect
     (cond
@@ -64,20 +66,20 @@
                                  'content (hash-ref event 'content)))))
        (set! next-state
              (make-state messages compactions last-usage context-budget
-                         model reasoning service-tier "working" ""))
+                         model reasoning service-tier "working" "" 0))
        (request-effect messages model reasoning service-tier)]
       [(equal? event-type "compact_requested")
        (if (null? messages)
            (begin
              (set! next-state
                    (make-state messages compactions last-usage context-budget
-                               model reasoning service-tier "ready" ""))
+                               model reasoning service-tier "ready" "" 0))
              (hash 'type "finish" 'content "Nothing to compact."))
            (begin
              (set! next-state
                    (make-state messages compactions last-usage context-budget
                                model reasoning service-tier "compacting"
-                               "Compaction complete."))
+                               "Compaction complete." 0))
              (start-selected-compaction messages context-budget)))]
       [(equal? event-type "model_selected")
        (set! model (hash-ref event 'model))
@@ -87,7 +89,7 @@
        (set! service-tier (hash-ref event 'service_tier))
        (set! next-state
              (make-state messages compactions last-usage
-                         context-budget model reasoning service-tier "ready" ""))
+                         context-budget model reasoning service-tier "ready" "" 0))
        (hash 'type "finish" 'content
              (string-append "Model set to " model " · " reasoning
                             " · " service-tier))]
@@ -96,26 +98,38 @@
          [(not (hash-ref event 'success))
           (set! next-state
                 (make-state messages compactions last-usage context-budget
-                            model reasoning service-tier "ready" ""))
+                            model reasoning service-tier "ready" "" 0))
           (hash 'type "finish" 'content (hash-ref event 'error))]
          [(equal? activity "compacting")
-          (set! messages
-                (complete-selected-compaction
-                  messages last-usage context-budget (hash-ref event 'events)))
-          (set! compactions (+ compactions 1))
-          (if (equal? pending-finish "")
+          (define result
+            (complete-selected-compaction
+              messages last-usage context-budget (hash-ref event 'events)
+              compaction-attempt))
+          (define retry (hash-try-get result 'retry))
+          (if retry
               (begin
                 (set! next-state
                       (make-state messages compactions last-usage
                                   context-budget model reasoning service-tier
-                                  "working" ""))
-                (request-effect messages model reasoning service-tier))
+                                  "compacting" pending-finish
+                                  (+ compaction-attempt 1)))
+                retry)
               (begin
-                (set! next-state
-                      (make-state messages compactions last-usage
-                                  context-budget model reasoning service-tier
-                                  "ready" ""))
-                (hash 'type "finish" 'content pending-finish)))]
+                (set! messages (hash-ref result 'messages))
+                (set! compactions (+ compactions 1))
+                (if (equal? pending-finish "")
+                    (begin
+                      (set! next-state
+                            (make-state messages compactions last-usage
+                                        context-budget model reasoning service-tier
+                                        "working" "" 0))
+                      (request-effect messages model reasoning service-tier))
+                    (begin
+                      (set! next-state
+                            (make-state messages compactions last-usage
+                                        context-budget model reasoning service-tier
+                                        "ready" "" 0))
+                      (hash 'type "finish" 'content pending-finish)))))]
          [else
           (define events (hash-ref event 'events))
           (define calls (provider-calls-for model events))
@@ -129,7 +143,7 @@
                 (set! next-state
                       (make-state messages compactions last-usage
                                   context-budget model reasoning service-tier
-                                  "working" ""))
+                                  "working" "" 0))
                 (hash 'type "run_tools"
                       'calls (map (lambda (call)
                                     (tool-call-execution model call))
@@ -151,13 +165,13 @@
                       (set! next-state
                             (make-state messages compactions last-usage
                                         context-budget model reasoning service-tier
-                                        "compacting" finished-content))
+                                        "compacting" finished-content 0))
                       (start-selected-compaction messages context-budget))
                     (begin
                       (set! next-state
                             (make-state messages compactions last-usage
                                         context-budget model reasoning service-tier
-                                        "ready" ""))
+                                        "ready" "" 0))
                       (hash 'type "finish" 'content finished-content)))))])]
       [(equal? event-type "tools_completed")
        (set! messages
@@ -167,12 +181,12 @@
            (begin
              (set! next-state
                    (make-state messages compactions last-usage context-budget
-                               model reasoning service-tier "compacting" ""))
+                               model reasoning service-tier "compacting" "" 0))
              (start-selected-compaction messages context-budget))
            (begin
              (set! next-state
                    (make-state messages compactions last-usage context-budget
-                               model reasoning service-tier "working" ""))
+                               model reasoning service-tier "working" "" 0))
              (request-effect messages model reasoning service-tier)))]
       [else (hash 'type "finish" 'content "Unsupported event.")]))
   (value->jsexpr-string
@@ -190,7 +204,8 @@
     model reasoning service-tier))
 
 (define (make-state messages compactions last-usage context-budget
-                    model reasoning service-tier activity pending-finish)
+                    model reasoning service-tier activity pending-finish
+                    compaction-attempt)
   (define usage
     (if (and (hash-try-get last-usage 'total_tokens)
              (not (hash-try-get last-usage '_message_tokens)))
@@ -206,6 +221,7 @@
         'service_tier service-tier
         'activity activity
         'pending_finish pending-finish
+        'compaction_attempt compaction-attempt
         'context_window (hash-ref (model-spec model) 'context_window)))
 
 (load-plugin! "responses")
@@ -241,4 +257,5 @@
         'reasoning "low"
         'service_tier "default"
         'retain_messages 16
-        'retain_token_limit 24000))
+        'retain_token_limit 24000
+        'max_repair_attempts 4))
