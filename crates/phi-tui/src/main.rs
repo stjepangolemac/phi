@@ -1850,20 +1850,27 @@ fn push_message(lines: &mut Vec<Line<'static>>, role: &str, content: &str, width
 }
 
 fn activity_indicator(state: &ThrobberState, label: &str, width: usize) -> Line<'static> {
-    if width == 0 {
-        return Line::default();
+    const INSET: usize = 2;
+
+    let mut line = Line::from(Span::raw(" ".repeat(width.min(INSET))));
+    let content_width = width.saturating_sub(INSET);
+    if content_width == 0 {
+        return line;
     }
     let throbber = Throbber::default().throbber_set(BRAILLE_SIX);
-    if width == 1 {
+    if content_width == 1 {
         let mut symbol = throbber.to_symbol_span(state);
         symbol.content = symbol.content.chars().take(1).collect::<String>().into();
-        return Line::from(symbol);
+        line.spans.push(symbol);
+        return line;
     }
-    let label_width = width - 2;
+    let label_width = content_width - 2;
     let mut label = truncate_width(label, label_width);
     let used = UnicodeWidthStr::width(label.as_str());
     label.push_str(&" ".repeat(label_width.saturating_sub(used)));
-    throbber.label(label).to_line(state)
+    line.spans
+        .extend(throbber.label(label).to_line(state).spans);
+    line
 }
 
 fn push_markdown(lines: &mut Vec<Line<'static>>, role: &str, content: &str, width: usize) {
@@ -3872,7 +3879,7 @@ mod tests {
         app.turn_started = Some(Instant::now() - Duration::from_secs(133));
         let text = transcript_text(&mut app, 40);
         let activity = text.lines[text.lines.len() - 2].to_string();
-        assert!(activity.starts_with("⠷ Working for 2m "));
+        assert!(activity.starts_with("  ⠷ Working for 2m "));
         assert!(!activity.contains('─'));
         assert_eq!(UnicodeWidthStr::width(activity.as_str()), 40);
         assert!(text.lines.last().unwrap().to_string().trim().is_empty());
@@ -3890,7 +3897,7 @@ mod tests {
         assert!(
             text.lines[text.lines.len() - 2]
                 .to_string()
-                .starts_with("⠷ Working for ")
+                .starts_with("  ⠷ Working for ")
         );
     }
 
@@ -3903,7 +3910,7 @@ mod tests {
 
         let text = transcript_text(&mut app, 32);
         let activity = text.lines[text.lines.len() - 2].to_string();
-        assert!(activity.starts_with("⠷ Compacting for 3s"));
+        assert!(activity.starts_with("  ⠷ Compacting for 3s"));
         assert!(!activity.contains('─'));
         assert_eq!(UnicodeWidthStr::width(activity.as_str()), 32);
     }
@@ -3921,8 +3928,8 @@ mod tests {
         let after = transcript_text(&mut app, 40);
         let after_activity = after.lines[after.lines.len() - 2].to_string();
 
-        assert!(before_activity.starts_with(BRAILLE_SIX.symbols[0]));
-        assert!(after_activity.starts_with(BRAILLE_SIX.symbols[1]));
+        assert!(before_activity.starts_with(&format!("  {}", BRAILLE_SIX.symbols[0])));
+        assert!(after_activity.starts_with(&format!("  {}", BRAILLE_SIX.symbols[1])));
         assert_eq!(app.transcript_render_count, render_count);
     }
 
@@ -3937,6 +3944,15 @@ mod tests {
                 "line at width {width}: {line:?}"
             );
             assert!(!line.contains('─'));
+            match width {
+                0 => assert!(line.is_empty()),
+                1 => assert_eq!(line, " "),
+                2 => assert_eq!(line, "  "),
+                _ => assert!(
+                    line.starts_with(&format!("  {}", BRAILLE_SIX.symbols[0])),
+                    "line at width {width}: {line:?}"
+                ),
+            }
         }
     }
 
