@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -40,6 +40,9 @@ pub enum RuntimeEvent {
     },
     UserMessage {
         content: String,
+    },
+    QueuedMessagesInjected {
+        contents: Vec<String>,
     },
     ContextUpdated {
         estimated_tokens: u64,
@@ -98,6 +101,7 @@ pub enum RuntimeCommand {
 pub struct Handle {
     pub events: mpsc::UnboundedReceiver<RuntimeEvent>,
     pub commands: mpsc::UnboundedSender<RuntimeCommand>,
+    steering: mpsc::UnboundedSender<Vec<String>>,
     cancellation: CancellationToken,
 }
 
@@ -153,6 +157,10 @@ pub enum CommandAction {
 impl Handle {
     pub fn cancel(&self) {
         self.cancellation.cancel();
+    }
+
+    pub fn queue_messages(&self, messages: Vec<String>) {
+        let _ = self.steering.send(messages);
     }
 }
 
@@ -1060,24 +1068,40 @@ fn discover_skills(
 }
 
 pub fn start(options: RunOptions, prompt: String) -> Handle {
-    start_event(options, Event::UserMessage { content: prompt })
+    start_events(options, vec![Event::UserMessage { content: prompt }])
+}
+
+pub fn start_messages(options: RunOptions, messages: Vec<String>) -> Handle {
+    start_events(
+        options,
+        messages
+            .into_iter()
+            .map(|content| Event::UserMessage { content })
+            .collect(),
+    )
 }
 
 pub fn compact(options: RunOptions) -> Handle {
-    start_event(options, Event::CompactRequested)
+    start_events(options, vec![Event::CompactRequested])
 }
 
-fn start_event(options: RunOptions, initial_event: Event) -> Handle {
+fn start_events(options: RunOptions, initial_events: Vec<Event>) -> Handle {
+    assert!(
+        !initial_events.is_empty(),
+        "a run requires an initial event"
+    );
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (command_tx, command_rx) = mpsc::unbounded_channel();
+    let (steering_tx, steering_rx) = mpsc::unbounded_channel();
     let cancellation = CancellationToken::new();
     let run_cancellation = cancellation.clone();
     tokio::task::spawn_local(async move {
         if let Err(error) = run(
             options,
-            initial_event,
+            initial_events,
             &event_tx,
             command_rx,
+            steering_rx,
             &run_cancellation,
         )
         .await
@@ -1090,15 +1114,17 @@ fn start_event(options: RunOptions, initial_event: Event) -> Handle {
     Handle {
         events: event_rx,
         commands: command_tx,
+        steering: steering_tx,
         cancellation,
     }
 }
 
 async fn run(
     options: RunOptions,
-    initial_event: Event,
+    initial_events: Vec<Event>,
     events: &mpsc::UnboundedSender<RuntimeEvent>,
     mut commands: mpsc::UnboundedReceiver<RuntimeCommand>,
+    mut steering: mpsc::UnboundedReceiver<Vec<String>>,
     cancellation: &CancellationToken,
 ) -> Result<()> {
     let workspace = options.workspace.canonicalize()?;
@@ -1118,14 +1144,6 @@ async fn run(
             id: session.id().into(),
         },
     )?;
-    if let Event::UserMessage { content } = &initial_event {
-        send(
-            events,
-            RuntimeEvent::UserMessage {
-                content: content.clone(),
-            },
-        )?;
-    }
     let bootstrap = build_policy(
         &home,
         &workspace,
@@ -1149,7 +1167,10 @@ async fn run(
             },
         )?;
     }
-    let mut event = initial_event;
+    let mut pending_events = VecDeque::from(initial_events);
+    let mut event = pending_events
+        .pop_front()
+        .expect("initial events were checked above");
     let mut activity = "ready".to_owned();
     let permissions = phi_core::permissions::Permissions {
         allow_shell: options.allow_shell,
@@ -1162,6 +1183,14 @@ async fn run(
             cancellation.is_cancelled() && matches!(&event, Event::ToolsCompleted { .. });
         if cancellation.is_cancelled() && !settle_cancelled_tools {
             bail!("cancelled");
+        }
+        if let Event::UserMessage { content } = &event {
+            send(
+                events,
+                RuntimeEvent::UserMessage {
+                    content: content.clone(),
+                },
+            )?;
         }
         session.append(&event)?;
         let output = policy.on_event(&event)?;
@@ -1180,6 +1209,29 @@ async fn run(
         }
         if cancellation.is_cancelled() {
             bail!("cancelled");
+        }
+        if matches!(&event, Event::ToolsCompleted { .. }) {
+            let mut queued = Vec::new();
+            while let Ok(messages) = steering.try_recv() {
+                queued.extend(messages);
+            }
+            if !queued.is_empty() {
+                send(
+                    events,
+                    RuntimeEvent::QueuedMessagesInjected {
+                        contents: queued.clone(),
+                    },
+                )?;
+                pending_events.extend(
+                    queued
+                        .into_iter()
+                        .map(|content| Event::UserMessage { content }),
+                );
+            }
+        }
+        if let Some(next_event) = pending_events.pop_front() {
+            event = next_event;
+            continue;
         }
         let stream_output = activity == "working";
         let effect = output
@@ -2978,19 +3030,21 @@ mod tests {
 
                 let (event_tx, _event_rx) = mpsc::unbounded_channel();
                 let (_command_tx, command_rx) = mpsc::unbounded_channel();
+                let (_steering_tx, steering_rx) = mpsc::unbounded_channel();
                 let cancellation = CancellationToken::new();
                 cancellation.cancel();
                 let error = run(
                     options,
-                    Event::ToolsCompleted {
+                    vec![Event::ToolsCompleted {
                         results: vec![ToolResult {
                             call_id: "waiting-call".into(),
                             name: "TaskOutput".into(),
                             result: serde_json::json!({ "error": "cancelled" }),
                         }],
-                    },
+                    }],
                     &event_tx,
                     command_rx,
+                    steering_rx,
                     &cancellation,
                 )
                 .await

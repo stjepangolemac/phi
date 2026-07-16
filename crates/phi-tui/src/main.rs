@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -119,6 +119,9 @@ struct App {
     command_filter: Option<String>,
     command_selected: usize,
     message_history: Vec<String>,
+    steering_queue: VecDeque<String>,
+    next_turn_queue: VecDeque<String>,
+    restart_after_cancel: Option<Vec<String>>,
     history_index: Option<usize>,
     history_draft: String,
     composer_width: usize,
@@ -194,6 +197,9 @@ impl App {
             command_filter: None,
             command_selected: 0,
             message_history: Vec::new(),
+            steering_queue: VecDeque::new(),
+            next_turn_queue: VecDeque::new(),
+            restart_after_cancel: None,
             history_index: None,
             history_draft: String::new(),
             composer_width: 80,
@@ -226,6 +232,10 @@ impl App {
     }
 
     fn submit(&mut self) {
+        if self.handle.is_some() {
+            self.queue_for_current_turn();
+            return;
+        }
         if self.busy() {
             return;
         }
@@ -258,6 +268,59 @@ impl App {
         self.final_response_rendered = false;
         self.status = "working".into();
         self.follow = true;
+    }
+
+    fn take_composer_message(&mut self) -> Option<String> {
+        self.command_filter = None;
+        self.command_selected = 0;
+        let message = self.composer.take();
+        (!message.trim().is_empty()).then_some(message)
+    }
+
+    fn queue_for_current_turn(&mut self) {
+        let Some(message) = self.take_composer_message() else {
+            return;
+        };
+        if let Some(handle) = &self.handle {
+            handle.queue_messages(vec![message.clone()]);
+        }
+        self.steering_queue.push_back(message);
+        self.follow = true;
+    }
+
+    fn queue_for_next_turn(&mut self) {
+        if self.handle.is_none() {
+            return;
+        }
+        let Some(message) = self.take_composer_message() else {
+            return;
+        };
+        self.next_turn_queue.push_back(message);
+        self.follow = true;
+    }
+
+    fn start_messages(&mut self, messages: Vec<String>) {
+        if messages.is_empty() {
+            return;
+        }
+        self.options.session_id = self.session_id.clone();
+        for message in &messages {
+            self.push_transcript("you", message.clone());
+            self.message_history.push(message.clone());
+        }
+        self.history_index = None;
+        self.history_draft.clear();
+        self.handle = Some(phi_runtime::start_messages(self.options.clone(), messages));
+        self.turn_started = Some(Instant::now());
+        self.final_response_rendered = false;
+        self.status = "working".into();
+        self.follow = true;
+    }
+
+    fn start_next_queued_turn(&mut self) {
+        if let Some(message) = self.next_turn_queue.pop_front() {
+            self.start_messages(vec![message]);
+        }
     }
 
     fn busy(&self) -> bool {
@@ -331,6 +394,9 @@ impl App {
         self.command_filter = None;
         self.command_selected = 0;
         self.message_history.clear();
+        self.steering_queue.clear();
+        self.next_turn_queue.clear();
+        self.restart_after_cancel = None;
         self.history_index = None;
         self.history_draft.clear();
         self.scroll = 0;
@@ -450,6 +516,24 @@ impl App {
         match event {
             RuntimeEvent::Session { id } => self.session_id = Some(id),
             RuntimeEvent::UserMessage { .. } => {}
+            RuntimeEvent::QueuedMessagesInjected { contents } => {
+                for content in &contents {
+                    if self.steering_queue.front() == Some(content) {
+                        self.steering_queue.pop_front();
+                    } else if let Some(index) = self
+                        .steering_queue
+                        .iter()
+                        .position(|queued| queued == content)
+                    {
+                        self.steering_queue.remove(index);
+                    }
+                    self.push_transcript("you", content.clone());
+                    self.message_history.push(content.clone());
+                }
+                self.history_index = None;
+                self.history_draft.clear();
+                self.follow = true;
+            }
             RuntimeEvent::ContextUpdated {
                 estimated_tokens,
                 token_budget,
@@ -727,17 +811,26 @@ impl App {
                 self.shell_streams.clear();
                 self.final_response_rendered = false;
                 self.status = "ready".into();
+                if !self.steering_queue.is_empty() {
+                    let messages = self.steering_queue.drain(..).collect();
+                    self.start_messages(messages);
+                } else {
+                    self.start_next_queued_turn();
+                }
             }
             RuntimeEvent::Error { message } => {
                 self.flush_model();
-                self.push_transcript(
-                    "error",
-                    if message == "cancelled" {
-                        "Cancelled by user".into()
-                    } else {
-                        message
-                    },
-                );
+                let restarting = message == "cancelled" && self.restart_after_cancel.is_some();
+                if !restarting {
+                    self.push_transcript(
+                        "error",
+                        if message == "cancelled" {
+                            "Cancelled by user".into()
+                        } else {
+                            message
+                        },
+                    );
+                }
                 self.handle = None;
                 self.approval = None;
                 self.turn_started = None;
@@ -747,6 +840,14 @@ impl App {
                 self.shell_streams.clear();
                 self.final_response_rendered = false;
                 self.status = "ready".into();
+                if restarting {
+                    let mut messages = self.restart_after_cancel.take().unwrap_or_default();
+                    messages.extend(self.steering_queue.drain(..));
+                    self.start_messages(messages);
+                } else {
+                    self.restart_after_cancel = None;
+                    self.start_next_queued_turn();
+                }
             }
         }
     }
@@ -809,20 +910,6 @@ impl App {
         {
             self.composer.set(format!("/{name}"));
         }
-        true
-    }
-
-    fn complete_command(&mut self) -> bool {
-        let Some(name) = self
-            .command_suggestions()
-            .get(self.command_selected)
-            .map(|command| command.name.clone())
-        else {
-            return false;
-        };
-        self.composer.set(format!("/{name} "));
-        self.command_filter = None;
-        self.command_selected = 0;
         true
     }
 
@@ -912,10 +999,27 @@ impl App {
         }
         match key.code {
             KeyCode::Esc if self.handle.is_some() => {
-                if let Some(handle) = &self.handle {
-                    handle.cancel();
+                if !self.steering_queue.is_empty() {
+                    let queued = self.steering_queue.drain(..).collect::<Vec<_>>();
+                    self.restart_after_cancel
+                        .get_or_insert_with(Vec::new)
+                        .extend(queued);
+                    if let Some(handle) = &self.handle {
+                        handle.cancel();
+                    }
+                    self.status = "cancelling".into();
+                } else if !self.next_turn_queue.is_empty() {
+                    self.next_turn_queue.clear();
+                    self.follow = true;
+                } else {
+                    if self.status == "cancelling" && self.restart_after_cancel.is_some() {
+                        self.restart_after_cancel = None;
+                    }
+                    if let Some(handle) = &self.handle {
+                        handle.cancel();
+                    }
+                    self.status = "cancelling".into();
                 }
-                self.status = "cancelling".into();
             }
             KeyCode::Enter
                 if key
@@ -927,9 +1031,7 @@ impl App {
                 self.composer.insert('\n');
             }
             KeyCode::Enter => self.submit(),
-            KeyCode::Tab if !self.composer_locked() => {
-                self.complete_command();
-            }
+            KeyCode::Tab if !self.composer_locked() => self.queue_for_next_turn(),
             KeyCode::Backspace
                 if !self.composer_locked() && key.modifiers.contains(KeyModifiers::ALT) =>
             {
@@ -1584,6 +1686,20 @@ fn live_transcript_tail(app: &App, width: usize) -> Vec<Line<'static>> {
             width,
         );
     }
+    push_message_queue(
+        &mut lines,
+        "Queued after tool call:",
+        &app.steering_queue,
+        width,
+        Color::LightYellow,
+    );
+    push_message_queue(
+        &mut lines,
+        "Queued for next turn:",
+        &app.next_turn_queue,
+        width,
+        Color::LightBlue,
+    );
     if lines
         .last()
         .or_else(|| {
@@ -1603,6 +1719,30 @@ fn live_transcript_tail(app: &App, width: usize) -> Vec<Line<'static>> {
         lines.push(Line::raw(" ".repeat(width)));
     }
     lines
+}
+
+fn push_message_queue(
+    lines: &mut Vec<Line<'static>>,
+    label: &str,
+    messages: &VecDeque<String>,
+    width: usize,
+    color: Color,
+) {
+    if messages.is_empty() || width == 0 {
+        return;
+    }
+    let style = Style::default().fg(color);
+    lines.push(Line::styled(
+        truncate_width(&format!("• {label}"), width),
+        style.add_modifier(Modifier::BOLD),
+    ));
+    for message in messages {
+        let message = message.split_whitespace().collect::<Vec<_>>().join(" ");
+        lines.push(Line::styled(
+            truncate_width(&format!("  └ {message}"), width),
+            style,
+        ));
+    }
 }
 
 fn transcript_window(
@@ -2939,7 +3079,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepts_queued_input_but_not_submission_during_a_turn() {
+    async fn enter_queues_input_for_the_current_turn() {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let mut app = app();
@@ -2948,8 +3088,140 @@ mod tests {
                     app.on_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
                 }
                 app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-                assert_eq!(app.composer.text, "next");
+                assert!(app.composer.text.is_empty());
+                assert_eq!(app.steering_queue, VecDeque::from(["next".into()]));
                 assert!(app.handle.is_some());
+                app.handle.as_ref().unwrap().cancel();
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn tab_queues_input_for_a_later_turn() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut app = app();
+                app.handle = Some(phi_runtime::start(app.options.clone(), "work".into()));
+                app.composer.set("later".into());
+
+                app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+                assert!(app.composer.text.is_empty());
+                assert_eq!(app.next_turn_queue, VecDeque::from(["later".into()]));
+                app.handle.as_ref().unwrap().cancel();
+            })
+            .await;
+    }
+
+    #[test]
+    fn renders_both_message_queues_as_single_line_entries() {
+        let mut app = app();
+        app.steering_queue
+            .push_back("change direction and inspect the other implementation".into());
+        app.next_turn_queue
+            .push_back("write a follow-up summary\nwith details".into());
+
+        let rendered = transcript_text(&mut app, 32).to_string();
+
+        assert!(rendered.contains("• Queued after tool call:"));
+        assert!(rendered.contains("• Queued for next turn:"));
+        assert!(rendered.contains("  └ change direction"));
+        assert!(rendered.contains("  └ write a follow-up"));
+        assert!(rendered.matches('…').count() >= 2);
+        assert!(!rendered.contains("with details\n"));
+    }
+
+    #[tokio::test]
+    async fn escape_prioritizes_steering_then_future_queue_then_cancellation() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut app = app();
+                app.handle = Some(phi_runtime::start(app.options.clone(), "work".into()));
+                app.steering_queue.push_back("steer".into());
+                app.next_turn_queue.push_back("later".into());
+
+                app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                assert!(app.steering_queue.is_empty());
+                assert_eq!(app.restart_after_cancel, Some(vec!["steer".into()]));
+                assert_eq!(app.next_turn_queue, VecDeque::from(["later".into()]));
+
+                app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                assert!(app.next_turn_queue.is_empty());
+                assert_eq!(app.restart_after_cancel, Some(vec!["steer".into()]));
+
+                app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                assert_eq!(app.restart_after_cancel, None);
+            })
+            .await;
+    }
+
+    #[test]
+    fn injected_messages_leave_the_steering_queue_and_enter_history() {
+        let mut app = app();
+        app.steering_queue.extend(["one".into(), "two".into()]);
+
+        app.on_runtime(RuntimeEvent::QueuedMessagesInjected {
+            contents: vec!["one".into(), "two".into()],
+        });
+
+        assert!(app.steering_queue.is_empty());
+        assert_eq!(
+            app.transcript,
+            vec![("you".into(), "one".into()), ("you".into(), "two".into())]
+        );
+        assert_eq!(app.message_history, vec!["one", "two"]);
+    }
+
+    #[tokio::test]
+    async fn a_finished_turn_prefers_undelivered_steering_messages() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut app = app();
+                app.handle = Some(phi_runtime::start(app.options.clone(), "work".into()));
+                app.turn_started = Some(Instant::now());
+                app.steering_queue.extend(["one".into(), "two".into()]);
+                app.next_turn_queue.push_back("later".into());
+
+                app.on_runtime(RuntimeEvent::Finished {
+                    content: "done".into(),
+                });
+
+                assert!(app.steering_queue.is_empty());
+                assert_eq!(app.next_turn_queue, VecDeque::from(["later".into()]));
+                assert!(app.handle.is_some());
+                assert_eq!(
+                    app.transcript
+                        .iter()
+                        .filter(|(role, _)| role == "you")
+                        .map(|(_, content)| content.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["one", "two"]
+                );
+                app.handle.as_ref().unwrap().cancel();
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_turn_starts_the_next_queued_turn() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut app = app();
+                app.handle = Some(phi_runtime::start(app.options.clone(), "work".into()));
+                app.next_turn_queue
+                    .extend(["first".into(), "second".into()]);
+
+                app.on_runtime(RuntimeEvent::Error {
+                    message: "cancelled".into(),
+                });
+
+                assert_eq!(app.next_turn_queue, VecDeque::from(["second".into()]));
+                assert!(app.handle.is_some());
+                assert!(
+                    app.transcript
+                        .iter()
+                        .any(|entry| entry == &("you".into(), "first".into()))
+                );
                 app.handle.as_ref().unwrap().cancel();
             })
             .await;
@@ -3732,7 +4004,7 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.composer.text, "/help");
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(app.composer.text, "/help ");
+        assert_eq!(app.composer.text, "/help");
     }
 
     #[test]
