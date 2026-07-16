@@ -177,7 +177,7 @@ async fn run() -> Result<()> {
                 )
             }
             Some(Command::Plugin { command }) => plugin(&home, command),
-            Some(Command::UpdatePlugins) => update_plugins(&home),
+            Some(Command::UpdatePlugins) => update_plugins(&home, &workspace),
             Some(Command::CheckConfig) => {
                 phi_runtime::check_scheme_config(&home, &workspace)?;
                 println!("config ok");
@@ -191,12 +191,9 @@ async fn run() -> Result<()> {
     result
 }
 
-fn update_plugins(home: &phi_core::home::PhiHome) -> Result<()> {
+fn update_plugins(home: &phi_core::home::PhiHome, workspace: &std::path::Path) -> Result<()> {
     let updated = phi_core::plugin::update_all(home)?;
-    for plugin in &updated {
-        let installed = phi_core::plugin::installed(home, &plugin.name)?;
-        phi_steel::check_plugin(&installed.root.join(installed.manifest.entrypoint))?;
-    }
+    phi_runtime::check_scheme_config(home, workspace)?;
     println!("updated {} plugins", updated.len());
     Ok(())
 }

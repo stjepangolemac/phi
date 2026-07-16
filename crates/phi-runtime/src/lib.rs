@@ -737,10 +737,7 @@ pub fn execute_command(
             bail!("usage: /update-plugins");
         }
         let updated = phi_core::plugin::update_all(&home)?;
-        for plugin in &updated {
-            let installed = phi_core::plugin::installed(&home, &plugin.name)?;
-            phi_steel::check_plugin(&installed.root.join(installed.manifest.entrypoint))?;
-        }
+        check_scheme_config(&home, &workspace)?;
         let mut bootstrap = build_policy(
             &home,
             &workspace,
