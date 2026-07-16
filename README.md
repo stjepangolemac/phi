@@ -130,6 +130,12 @@ Loaded plugins can register package-relative skill directories with `(register-s
 
 Phi also bundles an authoritative `phi-harness` skill describing its architecture, configuration, extension points, and operations. The agent reads it before inspecting or reconfiguring the harness. Use `phi status` for the human-readable active composition or `phi --json status` for machine-readable output.
 
+### Local planning
+
+The bundled `planning` skill uses `.phi/PLAN.md` as lightweight persistent state for nontrivial, multi-step work. The plan is human-readable Markdown: one goal, one plan-wide `planning`, `execution`, or `done` stage, a flat checklist with one `**Current:**` task during planning or execution, blockers, and resume notes. Tasks can be checked off and the current marker can move, but tasks do not have independent stages, stable IDs, subtasks, milestones, or dependency graphs.
+
+At meaningful checkpoints the agent updates the plan. A new session or compacted conversation resumes by reading it. In a Git workspace the agent records the plan's repository-relative path in the repository-local `.git/info/exclude`, never in a shared `.gitignore`; after all work and validation are complete, it marks the plan done and deletes the file. This skill-first workflow uses ordinary file tools rather than a `/plan` command suite and takes design inspiration from the planning workflows in OpenAI Codex and Claude Code.
+
 ## Dynamic workflows
 
 The official `dynamic-workflows` plugin exposes background `Workflow`, `TaskOutput`, and `TaskStop` tools. Workflows are named JavaScript modules discovered in this order:
@@ -216,7 +222,6 @@ These are possible extensions, not committed scope. Do not implement them withou
 - turn steering and structured questions
 - richer session management
 - MCP integration
-- plans and task tracking
 - checkpoints and rewind
 - lifecycle hooks
 - worktrees

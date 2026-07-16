@@ -22,6 +22,7 @@ Do not edit installed or official plugin files to reconfigure Phi. All provider,
 
 - `.phi/skills/`: workspace skills; these override personal skills with the same name.
 - `.phi/sessions/`: session state and exact composition snapshots.
+- `.phi/PLAN.md`: temporary, human-readable state for nontrivial work. The bundled `planning` skill keeps it out of Git through the repository-local `.git/info/exclude` and deletes it when the work is complete.
 
 Loaded plugins may register package-relative skills. Skill precedence is protected system skills, workspace skills, personal skills, then plugin skills.
 

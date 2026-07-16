@@ -234,6 +234,10 @@ const PHI_HARNESS_SKILL: &[(&str, &str)] = &[
         include_str!("../../../skills/phi-harness/references/operations.md"),
     ),
 ];
+const PLANNING_SKILL: &[(&str, &str)] = &[(
+    "SKILL.md",
+    include_str!("../../../skills/planning/SKILL.md"),
+)];
 
 pub fn initialize_home() -> Result<phi_core::home::PhiHome> {
     let home = phi_core::home::PhiHome::discover()?;
@@ -270,6 +274,12 @@ pub fn initialize_at(home: &phi_core::home::PhiHome) -> Result<()> {
     for (relative, content) in PHI_HARNESS_SKILL {
         write_bundled(
             &home.builtin_skills().join("phi-harness").join(relative),
+            content,
+        )?;
+    }
+    for (relative, content) in PLANNING_SKILL {
+        write_bundled(
+            &home.builtin_skills().join("planning").join(relative),
             content,
         )?;
     }
@@ -2659,6 +2669,7 @@ mod tests {
         .unwrap();
         assert!(execution.content.contains("- review: Review code."));
         assert!(execution.content.contains("- phi-harness:"));
+        assert!(execution.content.contains("- planning:"));
         assert!(execution.content.contains("- dynamic-workflows:"));
     }
 
@@ -3352,6 +3363,13 @@ mod tests {
             std::fs::read_to_string(home.builtin_skills().join("phi-harness/SKILL.md")).unwrap(),
             PHI_HARNESS_SKILL[0].1
         );
+        let planning =
+            std::fs::read_to_string(home.builtin_skills().join("planning/SKILL.md")).unwrap();
+        assert_eq!(planning, PLANNING_SKILL[0].1);
+        assert!(planning.contains("**Stage:** planning"));
+        assert!(planning.contains("**Current:**"));
+        assert!(planning.contains("git rev-parse --git-path info/exclude"));
+        assert!(planning.contains("delete `.phi/PLAN.md`"));
         assert!(
             phi_core::plugin::read_lock(&home)
                 .unwrap()
