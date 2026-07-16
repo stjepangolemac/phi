@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+blake3.workspace = true
 include_dir.workspace = true
 phi-core = { path = "../phi-core" }
 phi-protocol = { path = "../phi-protocol" }

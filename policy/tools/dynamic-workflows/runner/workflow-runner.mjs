@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto"
 import { join } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import { configure } from "./api.mjs"
+import { createWorktreeManager } from "./worktrees.mjs"
 
 const nodeProcess = globalThis.process
 const requestPath = nodeProcess.argv[2]
@@ -61,14 +62,39 @@ function enqueueProgress(event) {
   return progressQueue
 }
 
-function stopChildren() {
-  for (const child of children) {
+async function stopChildren() {
+  const running = [...children]
+  for (const child of running) {
     try { child.kill("SIGTERM") } catch {}
   }
+  await Promise.all(running.map(child => new Promise(resolve => {
+    if (child.exitCode !== null) return resolve()
+    const killTimer = setTimeout(() => {
+      try { child.kill("SIGKILL") } catch {}
+    }, 2_000)
+    const fallbackTimer = setTimeout(resolve, 4_000)
+    child.once("exit", () => {
+      clearTimeout(killTimer)
+      clearTimeout(fallbackTimer)
+      resolve()
+    })
+  })))
 }
 
-nodeProcess.on("SIGTERM", () => { stopChildren(); nodeProcess.exit(143) })
-nodeProcess.on("SIGINT", () => { stopChildren(); nodeProcess.exit(130) })
+let worktrees = null
+let terminating = false
+let closing = false
+async function terminateFromSignal(code) {
+  if (terminating) return
+  terminating = true
+  closing = true
+  await stopChildren().catch(() => {})
+  await worktrees?.cleanup().catch(() => {})
+  nodeProcess.exit(code)
+}
+
+nodeProcess.on("SIGTERM", () => { void terminateFromSignal(143) })
+nodeProcess.on("SIGINT", () => { void terminateFromSignal(130) })
 
 function prepareSource(source, apiUrl) {
   if (/\bimport\s*\(/.test(source)) throw new Error("dynamic imports are not allowed")
@@ -104,10 +130,20 @@ try {
   const apiUrl = pathToFileURL(join(fileURLToPath(new URL(".", import.meta.url)), "api.mjs")).href
   const generatedPath = join(taskDir, "workflow.generated.mjs")
   await writeFile(generatedPath, prepareSource(source, apiUrl))
+  worktrees = createWorktreeManager({
+    taskId: request.taskId,
+    workspace: request.workspace,
+    git: request.git,
+    worktreeRoot: request.worktreeRoot,
+    persist: value => atomicJson(join(taskDir, "worktrees.json"), value),
+    progress: (type, value) => enqueueProgress({ type, ...value })
+  })
   configure({
     phi: request.phi,
     workspace: request.workspace,
     limits: request.limits,
+    worktrees,
+    isClosing: () => closing,
     progress: enqueueProgress,
     childStarted: child => children.add(child),
     childFinished: child => children.delete(child)
@@ -134,6 +170,9 @@ try {
   } finally {
     clearTimeout(timer)
   }
+  closing = true
+  await stopChildren()
+  await worktrees.cleanup()
   await progressQueue
   await atomicJson(resultPath, { value: value ?? null })
   await atomicJson(statePath, {
@@ -144,16 +183,26 @@ try {
     completedAt: Date.now()
   })
 } catch (error) {
+  closing = true
+  await stopChildren().catch(() => {})
+  let cleanupError = null
+  try {
+    await worktrees?.cleanup()
+  } catch (cleanup) {
+    cleanupError = cleanup
+  }
   await progressQueue.catch(() => {})
   await atomicJson(statePath, {
     taskId: request.taskId,
     workflow: request.name,
     status: "failed",
-    error: error?.stack ?? String(error),
+    error: [error?.stack ?? String(error), cleanupError?.stack ?? null]
+      .filter(Boolean)
+      .join("\n\nCleanup error:\n"),
     startedAt: request.startedAt,
     completedAt: Date.now()
   })
   nodeProcess.exitCode = 1
 } finally {
-  stopChildren()
+  await stopChildren().catch(() => {})
 }

@@ -38,12 +38,18 @@ function progress(type, value = {}) {
 
 export async function agent(prompt, options = {}) {
   const context = configured()
+  if (context.isClosing()) throw new Error("workflow is finishing")
   if (typeof prompt !== "string" || prompt.length === 0) {
     throw new TypeError("agent() requires a non-empty prompt")
   }
-  const unknown = Object.keys(options).filter(key => key !== "label" && key !== "schema")
+  const unknown = Object.keys(options).filter(key =>
+    !["label", "schema", "branch", "branch_off"].includes(key)
+  )
   if (unknown.length > 0) {
     throw new TypeError(`unsupported agent option: ${unknown[0]}`)
+  }
+  if (options.branch_off !== undefined && options.branch === undefined) {
+    throw new TypeError("agent branch_off requires branch")
   }
   if (totalAgents >= context.limits.maxAgents) {
     throw new Error(`workflow agent limit exceeded (${context.limits.maxAgents})`)
@@ -53,16 +59,33 @@ export async function agent(prompt, options = {}) {
   const label = options.label ?? `agent-${index}`
   await acquire()
   runningAgents += 1
-  progress("agent_started", { index, label })
+  let managed = null
+  let managedBranch = null
   try {
-    const value = await runPhi(context, prompt, options.schema, event => {
+    if (context.isClosing()) throw new Error("workflow is finishing")
+    if (options.branch !== undefined) {
+      managed = await context.worktrees.prepare(options.branch, options.branch_off)
+      managedBranch = options.branch
+    }
+    if (context.isClosing()) throw new Error("workflow is finishing")
+    const workspace = managed?.workspace ?? context.workspace
+    const branchContext = managed?.promptContext ?? context.worktrees.promptContext()
+    progress("agent_started", {
+      index,
+      label,
+      branch: options.branch ?? null,
+      workspace
+    })
+    const value = await runPhi(context, branchContext + prompt, options.schema, workspace, event => {
       if (event.type === "model_delta") {
         progress("agent_output", { index, label, content: event.content })
       }
     })
+    await context.worktrees.finished(managedBranch, "completed")
     progress("agent_completed", { index, label })
     return value
   } catch (error) {
+    await context.worktrees.finished(managedBranch, "failed").catch(() => {})
     progress("agent_failed", { index, label, error: error.message })
     throw error
   } finally {
@@ -71,11 +94,11 @@ export async function agent(prompt, options = {}) {
   }
 }
 
-function runPhi(context, prompt, schema, onEvent) {
+function runPhi(context, prompt, schema, workspace, onEvent) {
   return new Promise((resolve, reject) => {
     const child = spawn(
       context.phi,
-      ["--workspace", context.workspace, "--yolo", "rpc"],
+      ["--workspace", workspace, "--yolo", "rpc"],
       { stdio: ["pipe", "pipe", "pipe"] }
     )
     context.childStarted(child)

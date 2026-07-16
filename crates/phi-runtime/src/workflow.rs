@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{Command as StdCommand, Stdio},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -65,6 +65,13 @@ impl WorkflowTasks {
             }),
         )?;
         let phi = std::env::current_exe().context("resolve Phi executable")?;
+        let git = git_context(workspace);
+        let worktree_root = git.as_ref().map(|context| {
+            std::env::temp_dir()
+                .join("phi-worktrees")
+                .join(format!("{}-{}", context.repo_name, context.repo_hash))
+                .join(&task_id)
+        });
         let request = json!({
             "taskId": task_id,
             "name": name,
@@ -74,6 +81,8 @@ impl WorkflowTasks {
             "home": home,
             "taskDir": dir,
             "phi": phi,
+            "git": git,
+            "worktreeRoot": worktree_root,
             "startedAt": started_at,
             "limits": {
                 "maxConcurrency": MAX_CONCURRENCY,
@@ -136,7 +145,7 @@ impl WorkflowTasks {
         }
         let deadline = Instant::now() + Duration::from_millis(wait_ms);
         loop {
-            self.reconcile(task_id).await?;
+            self.reconcile(task_id, &dir).await?;
             let state = read_json(&dir.join("state.json"))?;
             let status = state["status"].as_str().unwrap_or("unknown");
             if terminal(status) || Instant::now() >= deadline {
@@ -180,6 +189,7 @@ impl WorkflowTasks {
         let started_at = state["startedAt"].as_u64();
         let Some(entry) = entry else {
             if dir.join("state.json").is_file() {
+                cleanup_owned_worktrees(&dir).await?;
                 return Ok(json!({
                     "task_id": task_id,
                     "workflow": workflow.as_deref(),
@@ -189,6 +199,7 @@ impl WorkflowTasks {
             bail!("workflow task not found: {task_id}");
         };
         terminate(&entry).await;
+        cleanup_owned_worktrees(&dir).await?;
         write_json(
             &dir.join("state.json"),
             &json!({
@@ -220,10 +231,11 @@ impl WorkflowTasks {
             .collect::<Vec<_>>();
         for entry in entries {
             terminate(&entry).await;
+            let _ = cleanup_owned_worktrees(&entry.dir).await;
         }
     }
 
-    async fn reconcile(&self, task_id: &str) -> Result<()> {
+    async fn reconcile(&self, task_id: &str, dir: &Path) -> Result<()> {
         let entry = self
             .tasks
             .lock()
@@ -231,25 +243,53 @@ impl WorkflowTasks {
             .get(task_id)
             .cloned();
         let Some(entry) = entry else {
+            let state = read_json(&dir.join("state.json"))?;
+            if !terminal(state["status"].as_str().unwrap_or("")) {
+                let cleanup = cleanup_owned_worktrees(dir).await;
+                write_json(
+                    &dir.join("state.json"),
+                    &json!({
+                        "taskId": task_id,
+                        "workflow": state["workflow"].as_str(),
+                        "status": "failed",
+                        "error": match cleanup {
+                            Ok(()) => "workflow task was stale and had no managed runner".to_owned(),
+                            Err(error) => format!("workflow task was stale; cleanup failed: {error:#}"),
+                        },
+                        "startedAt": state["startedAt"].as_u64(),
+                        "completedAt": now_ms()?,
+                    }),
+                )?;
+            } else {
+                cleanup_owned_worktrees(dir).await?;
+            }
             return Ok(());
         };
         let mut child = entry.child.lock().await;
         if let Some(status) = child.try_wait()? {
             let state = read_json(&entry.dir.join("state.json"))?;
-            if !terminal(state["status"].as_str().unwrap_or("")) {
+            drop(child);
+            terminate(&entry).await;
+            let cleanup = cleanup_owned_worktrees(&entry.dir).await;
+            if !terminal(state["status"].as_str().unwrap_or("")) || cleanup.is_err() {
+                let error = match cleanup {
+                    Ok(()) => format!("workflow runner exited with {status}"),
+                    Err(error) => format!(
+                        "workflow runner exited with {status}; managed worktree cleanup failed: {error:#}"
+                    ),
+                };
                 write_json(
                     &entry.dir.join("state.json"),
                     &json!({
                         "taskId": task_id,
                         "workflow": state["workflow"].as_str(),
                         "status": "failed",
-                        "error": format!("workflow runner exited with {status}"),
+                        "error": error,
                         "startedAt": state["startedAt"].as_u64(),
                         "completedAt": now_ms()?,
                     }),
                 )?;
             }
-            drop(child);
             self.tasks
                 .lock()
                 .expect("workflow task registry poisoned")
@@ -257,6 +297,250 @@ impl WorkflowTasks {
         }
         Ok(())
     }
+}
+
+async fn cleanup_owned_worktrees(dir: &Path) -> Result<()> {
+    let manifest_path = dir.join("worktrees.json");
+    if !manifest_path.is_file() {
+        return Ok(());
+    }
+    let request = read_json(&dir.join("request.json"))?;
+    let mut manifest = read_json(&manifest_path)?;
+    if manifest["version"].as_u64() != Some(1) {
+        bail!("unsupported managed worktree manifest version");
+    }
+    let task_id = request["taskId"]
+        .as_str()
+        .context("workflow request has no taskId")?;
+    if manifest["taskId"].as_str() != Some(task_id) {
+        bail!("managed worktree manifest task does not match request");
+    }
+    let repo_root = PathBuf::from(
+        request["git"]["repoRoot"]
+            .as_str()
+            .context("workflow request has no Git repository root")?,
+    );
+    if manifest["repoRoot"].as_str() != repo_root.to_str() {
+        bail!("managed worktree manifest repository does not match request");
+    }
+    let expected_common_dir = PathBuf::from(
+        request["git"]["gitCommonDir"]
+            .as_str()
+            .context("workflow request has no Git common directory")?,
+    );
+    let common_dir = PathBuf::from(git_output(&repo_root, &["rev-parse", "--git-common-dir"])?);
+    let common_dir = if common_dir.is_absolute() {
+        common_dir
+    } else {
+        repo_root.join(common_dir)
+    }
+    .canonicalize()
+    .context("canonicalize current Git common directory")?;
+    if common_dir != expected_common_dir {
+        bail!("Git repository identity changed during managed worktree cleanup");
+    }
+    let worktree_root = PathBuf::from(
+        request["worktreeRoot"]
+            .as_str()
+            .context("workflow request has no managed worktree root")?,
+    );
+    if !worktree_root.is_absolute() {
+        bail!("managed worktree root is not absolute");
+    }
+    if manifest["worktreeRoot"].as_str() != worktree_root.to_str() {
+        bail!("managed worktree manifest root does not match request");
+    }
+    let task_short = task_id
+        .get(..8)
+        .context("workflow taskId is too short for managed branch namespace")?;
+    let branch_prefix = format!("phi/{task_short}/");
+    let root_owned = manifest["rootOwned"].as_bool() == Some(true);
+    let entries = manifest["entries"]
+        .as_array_mut()
+        .context("managed worktree manifest entries must be an array")?;
+    let mut errors = Vec::new();
+    for entry in entries.iter_mut().rev() {
+        if entry["state"].as_str() == Some("cleaned") {
+            continue;
+        }
+        let branch = entry["branch"]
+            .as_str()
+            .context("managed worktree entry has no branch")?
+            .to_owned();
+        if !branch.starts_with(&branch_prefix) {
+            bail!("managed branch is outside task namespace: {branch}");
+        }
+        let path = PathBuf::from(
+            entry["path"]
+                .as_str()
+                .context("managed worktree entry has no path")?,
+        );
+        if !path.is_absolute() || path.parent() != Some(worktree_root.as_path()) {
+            bail!(
+                "managed worktree path is outside task root: {}",
+                path.display()
+            );
+        }
+        let state = entry["state"].as_str().unwrap_or("");
+        let mut owns_branch = entry["branchCreated"].as_bool() == Some(true) || state == "active";
+        if !owns_branch && path.exists() {
+            let symbolic = Command::new("git")
+                .arg("-C")
+                .arg(&path)
+                .args(["symbolic-ref", "-q", "HEAD"])
+                .output()
+                .await
+                .context("inspect managed Git worktree branch")?;
+            owns_branch = symbolic.status.success()
+                && String::from_utf8_lossy(&symbolic.stdout).trim()
+                    == format!("refs/heads/{branch}");
+        }
+        let removal = Command::new("git")
+            .arg("-C")
+            .arg(&repo_root)
+            .args(["worktree", "remove", "--force"])
+            .arg(&path)
+            .output()
+            .await
+            .context("remove managed Git worktree")?;
+        if root_owned && path.exists() {
+            fs::remove_dir_all(&path).with_context(|| {
+                format!("force-remove managed worktree path {}", path.display())
+            })?;
+        }
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&repo_root)
+            .args(["worktree", "prune"])
+            .status()
+            .await;
+        let deletion = if owns_branch {
+            Some(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&repo_root)
+                    .args(["branch", "-D", &branch])
+                    .output()
+                    .await
+                    .context("delete managed Git branch")?,
+            )
+        } else {
+            None
+        };
+        let branch_exists = Command::new("git")
+            .arg("-C")
+            .arg(&repo_root)
+            .args(["show-ref", "--verify", "--quiet"])
+            .arg(format!("refs/heads/{branch}"))
+            .status()
+            .await
+            .context("verify managed Git branch cleanup")?
+            .success();
+        if path.exists() {
+            errors.push(format!(
+                "remove {}: {}",
+                path.display(),
+                String::from_utf8_lossy(&removal.stderr).trim()
+            ));
+        }
+        if owns_branch && branch_exists {
+            errors.push(format!(
+                "delete {branch}: {}",
+                String::from_utf8_lossy(&deletion.as_ref().unwrap().stderr).trim()
+            ));
+        }
+        if !path.exists() && (!owns_branch || !branch_exists) {
+            entry["state"] = Value::String("cleaned".to_owned());
+        }
+    }
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(&repo_root)
+        .args(["worktree", "prune"])
+        .status()
+        .await;
+    if root_owned {
+        match fs::remove_dir(&worktree_root) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                ) => {}
+            Err(error) => errors.push(format!(
+                "remove managed worktree root {}: {error}",
+                worktree_root.display()
+            )),
+        }
+    }
+    write_json(&manifest_path, &manifest)?;
+    if !errors.is_empty() {
+        bail!(errors.join("; "));
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitContext {
+    repo_root: PathBuf,
+    git_common_dir: PathBuf,
+    starting_commit: String,
+    workspace_relative: PathBuf,
+    repo_name: String,
+    repo_hash: String,
+}
+
+fn git_context(workspace: &Path) -> Option<GitContext> {
+    let root = PathBuf::from(git_output(workspace, &["rev-parse", "--show-toplevel"]).ok()?);
+    let repo_root = root.canonicalize().ok()?;
+    let workspace = workspace.canonicalize().ok()?;
+    let workspace_relative = workspace.strip_prefix(&repo_root).ok()?;
+    let common = PathBuf::from(git_output(&repo_root, &["rev-parse", "--git-common-dir"]).ok()?);
+    let common = if common.is_absolute() {
+        common
+    } else {
+        repo_root.join(common)
+    };
+    let git_common_dir = common.canonicalize().ok()?;
+    let starting_commit =
+        git_output(&repo_root, &["rev-parse", "--verify", "HEAD^{commit}"]).ok()?;
+    let repo_name = repo_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("repository")
+        .to_owned();
+    let repo_hash =
+        blake3::hash(git_common_dir.to_string_lossy().as_bytes()).to_hex()[..12].to_owned();
+    Some(GitContext {
+        repo_root,
+        git_common_dir,
+        starting_commit,
+        workspace_relative: workspace_relative.to_owned(),
+        repo_name,
+        repo_hash,
+    })
+}
+
+fn git_output(directory: &Path, arguments: &[&str]) -> Result<String> {
+    let output = StdCommand::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(arguments)
+        .output()
+        .context("run Git")?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed: {}",
+            arguments.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8(output.stdout)
+        .context("Git output is not UTF-8")?
+        .trim()
+        .to_owned())
 }
 
 fn validate_name(name: &str) -> Result<()> {
@@ -352,9 +636,7 @@ async fn terminate(entry: &TaskEntry) {
         let group = Pid::from_raw(id as i32);
         let _ = killpg(group, Signal::SIGTERM);
         tokio::time::sleep(Duration::from_millis(500)).await;
-        if child.try_wait().ok().flatten().is_none() {
-            let _ = killpg(group, Signal::SIGKILL);
-        }
+        let _ = killpg(group, Signal::SIGKILL);
     }
     #[cfg(not(unix))]
     {
@@ -366,6 +648,16 @@ async fn terminate(entry: &TaskEntry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn initialize_repository(root: &Path) -> String {
+        git_output(root, &["init", "-q"]).unwrap();
+        git_output(root, &["config", "user.name", "Phi Test"]).unwrap();
+        git_output(root, &["config", "user.email", "phi@example.invalid"]).unwrap();
+        fs::write(root.join("tracked.txt"), "base\n").unwrap();
+        git_output(root, &["add", "."]).unwrap();
+        git_output(root, &["commit", "-qm", "base"]).unwrap();
+        git_output(root, &["rev-parse", "HEAD"]).unwrap()
+    }
 
     #[test]
     fn workflow_names_are_single_safe_components() {
@@ -419,6 +711,164 @@ mod tests {
             resolve_workflow(workspace.path(), home.path(), &plugins, ".hidden").unwrap(),
             first_plugin_workflow
         );
+    }
+
+    #[test]
+    fn captures_immutable_git_context_from_repository_subdirectory() {
+        let repository = tempfile::tempdir().unwrap();
+        let starting_commit = initialize_repository(repository.path());
+        let workspace = repository.path().join("nested/workspace");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let context = git_context(&workspace).unwrap();
+        assert_eq!(context.repo_root, repository.path().canonicalize().unwrap());
+        assert_eq!(context.starting_commit, starting_commit);
+        assert_eq!(context.workspace_relative, Path::new("nested/workspace"));
+        assert_eq!(context.repo_hash.len(), 12);
+
+        fs::write(repository.path().join("tracked.txt"), "later\n").unwrap();
+        git_output(repository.path(), &["commit", "-qam", "later"]).unwrap();
+        assert_ne!(
+            context.starting_commit,
+            git_output(repository.path(), &["rev-parse", "HEAD"]).unwrap()
+        );
+    }
+
+    #[test]
+    fn non_git_workspace_has_no_git_context() {
+        let workspace = tempfile::tempdir().unwrap();
+        assert!(git_context(workspace.path()).is_none());
+    }
+
+    #[test]
+    fn unborn_git_repository_does_not_block_unbranched_workflows() {
+        let workspace = tempfile::tempdir().unwrap();
+        git_output(workspace.path(), &["init", "-q"]).unwrap();
+        assert!(git_context(workspace.path()).is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fallback_cleanup_removes_only_manifest_owned_worktrees_and_refs() {
+        let repository = tempfile::tempdir().unwrap();
+        let starting_commit = initialize_repository(repository.path());
+        let task_root = tempfile::tempdir().unwrap();
+        let task_id = "55555555-5555-4555-8555-555555555555";
+        let task_dir = task_root.path().join(task_id);
+        let worktree_root = task_root.path().join("owned").join(task_id);
+        let worktree = worktree_root.join("feature-deadbeef");
+        let branch = "phi/55555555/feature-deadbeef";
+        fs::create_dir_all(&task_dir).unwrap();
+        git_output(
+            repository.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                worktree.to_str().unwrap(),
+                &starting_commit,
+            ],
+        )
+        .unwrap();
+        let unrelated = "keep-this-branch";
+        git_output(repository.path(), &["branch", unrelated]).unwrap();
+        write_json(
+            &task_dir.join("request.json"),
+            &json!({
+                "taskId": task_id,
+                "git": {
+                    "repoRoot": repository.path().canonicalize().unwrap(),
+                    "gitCommonDir": repository.path().join(".git").canonicalize().unwrap()
+                },
+                "worktreeRoot": worktree_root,
+            }),
+        )
+        .unwrap();
+        write_json(
+            &task_dir.join("worktrees.json"),
+            &json!({
+                "version": 1,
+                "taskId": task_id,
+                "repoRoot": repository.path().canonicalize().unwrap(),
+                "worktreeRoot": worktree_root,
+                "rootOwned": true,
+                "entries": [{
+                    "logicalBranch": "feature",
+                    "branch": branch,
+                    "path": worktree,
+                    "state": "active"
+                }]
+            }),
+        )
+        .unwrap();
+
+        cleanup_owned_worktrees(&task_dir).await.unwrap();
+        assert!(!worktree.exists());
+        assert!(!worktree_root.exists());
+        assert!(
+            git_output(
+                repository.path(),
+                &["show-ref", "--verify", &format!("refs/heads/{branch}")]
+            )
+            .is_err()
+        );
+        assert!(
+            git_output(
+                repository.path(),
+                &["show-ref", "--verify", &format!("refs/heads/{unrelated}")]
+            )
+            .is_ok()
+        );
+        let manifest = read_json(&task_dir.join("worktrees.json")).unwrap();
+        assert_eq!(manifest["entries"][0]["state"], "cleaned");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_task_reconciliation_marks_task_failed() {
+        let session = tempfile::tempdir().unwrap();
+        let task_id = "88888888-8888-4888-8888-888888888888";
+        let task_dir = session.path().join("workflows/tasks").join(task_id);
+        fs::create_dir_all(&task_dir).unwrap();
+        write_json(
+            &task_dir.join("request.json"),
+            &json!({ "taskId": task_id, "name": "stale-test" }),
+        )
+        .unwrap();
+        write_json(
+            &task_dir.join("state.json"),
+            &json!({
+                "taskId": task_id,
+                "workflow": "stale-test",
+                "status": "running",
+                "startedAt": 1,
+            }),
+        )
+        .unwrap();
+
+        let output = WorkflowTasks::default()
+            .output(session.path(), &json!({ "task_id": task_id, "wait_ms": 0 }))
+            .await
+            .unwrap();
+        assert_eq!(output["status"], "failed");
+        assert!(output["state"]["error"].as_str().unwrap().contains("stale"));
+    }
+
+    #[test]
+    fn node_managed_worktree_tests_pass() {
+        if StdCommand::new("node").arg("--version").output().is_err() {
+            return;
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let status = StdCommand::new("node")
+            .args([
+                "--test",
+                "policy/tools/dynamic-workflows/runner/worktrees.test.mjs",
+                "policy/tools/dynamic-workflows/runner/workflow-runner.test.mjs",
+            ])
+            .current_dir(root)
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     #[tokio::test(flavor = "current_thread")]

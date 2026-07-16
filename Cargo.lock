@@ -1973,6 +1973,7 @@ name = "phi-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "include_dir",
  "nix 0.28.0",
  "phi-core",
