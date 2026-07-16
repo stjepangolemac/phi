@@ -1596,6 +1596,9 @@ fn sync_transcript_cache(app: &mut App, width: usize) {
         if stale {
             first_changed = Some(first_changed.map_or(index, |changed| changed.min(index)));
             let mut lines = Vec::new();
+            if role == "response_start" && index > 0 {
+                lines.push(Line::raw(" ".repeat(width)));
+            }
             push_message(&mut lines, role, content, width);
             app.transcript_cache[index] = Some(RenderedTranscriptBlock { width, lines });
             #[cfg(test)]
@@ -3799,11 +3802,19 @@ mod tests {
 
         assert_eq!(streaming_app.transcript.last().unwrap().0, "response_start");
         let text = transcript_text(&mut streaming_app, 40);
-        assert!(
-            text.lines
-                .iter()
-                .any(|line| line.to_string() == "─".repeat(40))
-        );
+        let rendered = text
+            .lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let divider = rendered
+            .iter()
+            .position(|line| line == &"─".repeat(40))
+            .unwrap();
+        assert!(!rendered[divider - 2].trim().is_empty());
+        assert!(rendered[divider - 1].trim().is_empty());
+        assert!(rendered[divider + 1].trim().is_empty());
+        assert!(!rendered[divider + 2].trim().is_empty());
 
         let mut fallback_app = app();
         fallback_app
@@ -3814,6 +3825,19 @@ mod tests {
         });
         assert_eq!(fallback_app.transcript[1].0, "response_start");
         assert_eq!(fallback_app.transcript[2].0, "phi");
+    }
+
+    #[test]
+    fn response_divider_has_no_leading_gap_without_preceding_transcript() {
+        let mut app = app();
+        app.transcript
+            .push(("response_start".into(), String::new()));
+        app.transcript.push(("phi".into(), "Final answer".into()));
+
+        let text = transcript_text(&mut app, 40);
+        assert_eq!(text.lines[0].to_string(), "─".repeat(40));
+        assert!(text.lines[1].to_string().trim().is_empty());
+        assert!(!text.lines[2].to_string().trim().is_empty());
     }
 
     #[test]
