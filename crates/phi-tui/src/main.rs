@@ -581,11 +581,11 @@ impl App {
                 self.token_budget = selected_context_window(&self.catalog);
             }
             RuntimeEvent::ActivityChanged { activity } => match activity.as_str() {
-                "compacting" => {
+                "compacting" | "selective_compacting" => {
                     self.final_response_rendered = !self.current_model.is_empty();
                     self.flush_model();
                     self.compaction_started = Some(Instant::now());
-                    self.status = activity;
+                    self.status = "compacting".into();
                 }
                 "searching" => {
                     self.flush_model();
@@ -2858,7 +2858,7 @@ mod tests {
     }
 
     #[test]
-    fn shows_async_compaction_and_keeps_a_completion_marker() {
+    fn shows_model_directed_compaction_and_keeps_a_completion_marker() {
         let mut app = app();
         app.turn_started = Some(Instant::now());
         app.current_model = "answer".into();
@@ -2872,8 +2872,9 @@ mod tests {
             output_tokens: None,
         });
         app.on_runtime(RuntimeEvent::ActivityChanged {
-            activity: "compacting".into(),
+            activity: "selective_compacting".into(),
         });
+        assert_eq!(app.status, "compacting");
         assert_eq!(
             app.transcript.last().unwrap(),
             &("phi".into(), "answer".into())

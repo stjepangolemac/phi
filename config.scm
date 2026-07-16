@@ -1,12 +1,15 @@
 (set-agent-instructions!
-  "You are a coding agent running inside a Phi harness in the user's current workspace. Work directly on the user's requests using the available tools. Inspect before editing, verify changes, and continue until the requested outcome is complete. Keep responses concise. When working on or reconfiguring the Phi harness itself, read the phi-harness skill with read_file before acting. The user can already see tool calls and their output, so do not repeat them verbatim; state only the conclusion or necessary interpretation. When reconfiguring Phi, edit the active config.scm, validate the change, and reload it into the current conversation.")
+  "You are a coding agent running inside a Phi harness in the user's current workspace. Work directly on the user's requests using the available tools. Inspect before editing, verify changes, and continue until the requested outcome is complete. Keep responses concise. Use context_mark proactively after completing a substantial phase or when changing focus so older work becomes eligible for selective compaction. When context pressure rises, inspect the active context and compact substantial closed older items when that preserves focus without losing needed details. When working on or reconfiguring the Phi harness itself, read the phi-harness skill with read_file before acting. The user can already see tool calls and their output, so do not repeat them verbatim; state only the conclusion or necessary interpretation. When reconfiguring Phi, edit the active config.scm, validate the change, and reload it into the current conversation.")
 
 (define active-context-items '())
 (define next-context-span 2)
 (define next-context-summary 1)
 (define pending-context (hash))
+(define context-pressure-thresholds (list 50 60 70 80 90))
+(define next-context-notification 50)
 
 (define (init encoded-config)
+  (set! next-context-notification 50)
   (define config (string->jsexpr encoded-config))
   (define model (or (hash-try-get config 'model) ""))
   (define context-budget
@@ -56,6 +59,8 @@
   (set! next-context-span (or (hash-try-get state 'next_context_span) 2))
   (set! next-context-summary (or (hash-try-get state 'next_context_summary) 1))
   (set! pending-context (or (hash-try-get state 'pending_context) (hash)))
+  (set! next-context-notification
+        (or (hash-try-get state 'next_context_notification) 50))
   (define compactions (hash-ref state 'compactions))
   (define last-usage (hash-ref state 'last_usage))
   (define model (hash-ref state 'model))
@@ -78,7 +83,7 @@
        (set! next-state
              (make-state messages compactions last-usage context-budget
                          model reasoning service-tier "working" "" 0))
-       (request-effect messages model reasoning service-tier)]
+       (request-effect messages last-usage model reasoning service-tier)]
       [(equal? event-type "compact_requested")
        (if (null? messages)
            (begin
@@ -98,6 +103,8 @@
              (hash-ref (model-spec model) 'compaction_token_limit))
        (set! reasoning (hash-ref event 'reasoning))
        (set! service-tier (hash-ref event 'service_tier))
+       (reset-context-pressure-notification!
+         messages last-usage context-budget)
        (set! next-state
              (make-state messages compactions last-usage
                          context-budget model reasoning service-tier "ready" "" 0))
@@ -118,7 +125,7 @@
                 (set! next-state
                       (make-state messages compactions last-usage context-budget
                                   model reasoning service-tier "working" "" 0))
-                (request-effect messages model reasoning service-tier))
+                (request-effect messages last-usage model reasoning service-tier))
               (begin
                 (set! next-state
                       (make-state messages compactions last-usage context-budget
@@ -151,7 +158,7 @@
                     (set! next-state
                           (make-state messages compactions last-usage context-budget
                                       model reasoning service-tier "working" "" 0))
-                    (request-effect messages model reasoning service-tier)))
+                    (request-effect messages last-usage model reasoning service-tier)))
               (begin
                 (define summary-message
                   (hash 'kind "message" 'role "user"
@@ -172,7 +179,7 @@
                         'usage
                         (hash-ref
                           (context-inspection active-context-items messages last-usage
-                                              (hash-ref (model-spec model) 'context_window))
+                                              context-budget)
                           'usage)))
                 (set! messages
                       (append messages
@@ -181,10 +188,12 @@
                                           'content (value->jsexpr-string result)))))
                 (set! pending-context (hash))
                 (set! compactions (+ compactions 1))
+                (reset-context-pressure-notification!
+                  messages last-usage context-budget)
                 (set! next-state
                       (make-state messages compactions last-usage context-budget
                                   model reasoning service-tier "working" "" 0))
-                (request-effect messages model reasoning service-tier)))]
+                (request-effect messages last-usage model reasoning service-tier)))]
          [(equal? activity "compacting")
           (define result
             (complete-selected-compaction
@@ -202,13 +211,15 @@
               (begin
                 (set! messages (hash-ref result 'messages))
                 (set! compactions (+ compactions 1))
+                (reset-context-pressure-notification!
+                  messages last-usage context-budget)
                 (if (equal? pending-finish "")
                     (begin
                       (set! next-state
                             (make-state messages compactions last-usage
                                         context-budget model reasoning service-tier
                                         "working" "" 0))
-                      (request-effect messages model reasoning service-tier))
+                      (request-effect messages last-usage model reasoning service-tier))
                     (begin
                       (set! next-state
                             (make-state messages compactions last-usage
@@ -220,7 +231,10 @@
           (define calls (provider-calls-for model events))
           (define usage (provider-usage-for model events))
           (define preserved (provider-preserved-items-for model events))
-          (if usage (set! last-usage usage))
+          (if usage
+              (set! last-usage
+                    (hash-insert usage '_message_tokens
+                                 (estimated-message-tokens messages))))
           (set! messages (append messages preserved))
           (if (not (null? calls))
               (if (and (null? (cdr calls))
@@ -236,14 +250,14 @@
                        (define result
                          (context-inspection
                            active-context-items messages last-usage
-                           (hash-ref (model-spec model) 'context_window)))
+                           context-budget))
                        (set! messages
                              (append messages (list (context-tool-result call result))))
                        (set! next-state
                              (make-state messages compactions last-usage
                                          context-budget model reasoning service-tier
                                          "working" "" 0))
-                       (request-effect messages model reasoning service-tier)]
+                       (request-effect messages last-usage model reasoning service-tier)]
                       [(equal? name "context_mark")
                        (define label (hash-ref arguments 'label))
                        (define result
@@ -264,7 +278,7 @@
                              (make-state messages compactions last-usage
                                          context-budget model reasoning service-tier
                                          "working" "" 0))
-                       (request-effect messages model reasoning service-tier)]
+                       (request-effect messages last-usage model reasoning service-tier)]
                       [else
                        (define ids (hash-ref arguments 'items))
                        (define selected (context-selection active-context-items ids))
@@ -328,21 +342,91 @@
              (set! next-state
                    (make-state messages compactions last-usage context-budget
                                model reasoning service-tier "working" "" 0))
-             (request-effect messages model reasoning service-tier)))]
+             (request-effect messages last-usage model reasoning service-tier)))]
       [else (hash 'type "finish" 'content "Unsupported event.")]))
+  (set! next-state
+        (hash-insert next-state 'next_context_notification
+                     next-context-notification))
   (value->jsexpr-string
     (hash 'state (value->jsexpr-string next-state)
           'effects (list effect))))
 
-(define (request-effect messages model reasoning service-tier)
+(define (request-effect messages usage model reasoning service-tier)
+  (define tools (tools-for-model model))
+  (define context-budget
+    (hash-ref (model-spec model) 'compaction_token_limit))
+  (define used (estimated-context-tokens messages usage))
+  (define pressure
+    (if (<= context-budget 0) 0 (quotient (* used 100) context-budget)))
+  (define crossed
+    (context-highest-crossed-threshold
+      pressure next-context-notification context-pressure-thresholds #f))
+  (define request-messages
+    (if (and crossed (context-tool-available? tools "context_compact"))
+        (begin
+          (set! next-context-notification
+                (context-next-threshold crossed context-pressure-thresholds))
+          (append
+            messages
+            (list (context-pressure-notification crossed pressure used context-budget))))
+        messages))
   (define prompt
-    (build-selected-prompt messages agent-instructions (tools-for-model model)))
+    (build-selected-prompt request-messages agent-instructions tools))
   (define output-schema (runtime-config-value 'output_schema #f))
   (provider-request
     (if output-schema
         (hash-insert prompt 'output_schema output-schema)
         prompt)
     model reasoning service-tier))
+
+(define (context-tool-available? tools name)
+  (cond
+    [(null? tools) #f]
+    [(and (hash-try-get (car tools) 'name)
+          (equal? (hash-ref (car tools) 'name) name)) #t]
+    [else (context-tool-available? (cdr tools) name)]))
+
+(define (context-highest-crossed-threshold percent next thresholds found)
+  (cond
+    [(null? thresholds) found]
+    [(< (car thresholds) next)
+     (context-highest-crossed-threshold percent next (cdr thresholds) found)]
+    [(<= (car thresholds) percent)
+     (context-highest-crossed-threshold
+       percent next (cdr thresholds) (car thresholds))]
+    [else found]))
+
+(define (context-next-threshold percent thresholds)
+  (cond
+    [(null? thresholds) 101]
+    [(> (car thresholds) percent) (car thresholds)]
+    [else (context-next-threshold percent (cdr thresholds))]))
+
+(define (context-reset-pressure-threshold messages usage context-budget)
+  (define used (estimated-context-tokens messages usage))
+  (define percent
+    (if (<= context-budget 0) 0 (quotient (* used 100) context-budget)))
+  (context-next-threshold percent context-pressure-thresholds))
+
+(define (reset-context-pressure-notification! messages usage context-budget)
+  (set! next-context-notification
+        (context-reset-pressure-threshold messages usage context-budget)))
+
+(define (context-pressure-notification threshold percent used limit)
+  (hash
+    'kind "message"
+    'role "user"
+    'content
+    (string-append
+      "Internal context-management notice: active context has crossed "
+      (number->string threshold) "% of the usable window (approximately "
+      (number->string percent) "%, " (number->string used) " of "
+      (number->string limit) " tokens). Before continuing, use context_inspect. "
+      "If substantial closed older items can be summarized without losing "
+      "details needed for the remaining work, call context_compact now. Never "
+      "compact the open item or fixed context. If nothing is eligible yet, "
+      "continue the task and use context_mark at the next meaningful phase "
+      "transition so completed work can be compacted later.")))
 
 (define (make-state messages compactions last-usage context-budget
                     model reasoning service-tier activity pending-finish
@@ -369,6 +453,7 @@
         'next_context_span next-context-span
         'next_context_summary next-context-summary
         'pending_context pending-context
+        'next_context_notification next-context-notification
         'context_window (hash-ref (model-spec model) 'context_window)))
 
 (load-plugin! "responses")

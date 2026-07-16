@@ -2,7 +2,7 @@
 
 (define context-mark-spec
   (hash 'name "context_mark"
-        'description "Close the current context span and begin a new labeled span. Use this for a meaningful change in focus; it does not require an active plan."
+        'description "Close the current context span and begin a new labeled span. Call this proactively after completing a substantial phase or when changing focus so finished work becomes eligible for selective compaction; no active plan is required."
         'parameters
         (hash 'type "object"
               'properties (hash 'label (hash 'type "string" 'minLength 1))
@@ -11,14 +11,14 @@
 
 (define context-inspect-spec
   (hash 'name "context_inspect"
-        'description "Inspect context usage and the ordered active raw and summary items. Only closed items can be selected for compaction."
+        'description "Inspect context pressure and the ordered active raw and summary items. Use this when context pressure rises to identify substantial closed items worth compacting."
         'parameters
         (hash 'type "object" 'properties (hash)
               'additionalProperties #f)))
 
 (define context-compact-spec
   (hash 'name "context_compact"
-        'description "Compact one or more ordered, adjacent, closed context items into one summary. The fixed prompt and current open item are never selectable."
+        'description "Compact one or more ordered, adjacent, closed context items into one durable summary. Use this proactively under context pressure when older completed work can be summarized without losing details needed for the current task. The fixed prompt and open item are never selectable."
         'parameters
         (hash 'type "object"
               'properties
