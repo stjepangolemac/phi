@@ -157,7 +157,7 @@
        (hash-ref parsed 'rest)
        (cons (hash 'operation "update" 'path path
                    'destination destination
-                   'hunks (hash-ref parsed 'hunks))
+                   'hunk_groups (list (hash-ref parsed 'hunks)))
              operations))]
     [else (error! "expected an add, delete, or update file header")]))
 
@@ -166,6 +166,44 @@
   (if (or (null? lines) (not (equal? (car lines) begin-patch)))
       (error! "patch must start with *** Begin Patch"))
   (parse-operations (cdr lines) '()))
+
+(define (plain-update-for? operation path)
+  (and (equal? (hash-ref operation 'operation) "update")
+       (equal? (hash-ref operation 'path) path)
+       (equal? (hash-ref operation 'destination) "")))
+
+(define (collect-update-groups operations path groups kept)
+  (cond
+    [(null? operations)
+     (hash 'groups groups 'rest (reverse kept))]
+    [(plain-update-for? (car operations) path)
+     (collect-update-groups
+       (cdr operations) path
+       (append groups (hash-ref (car operations) 'hunk_groups)) kept)]
+    [else
+     (collect-update-groups
+       (cdr operations) path groups (cons (car operations) kept))]))
+
+;; Multiple plain update sections for one file are one atomic edit. Keep their
+;; hunk groups separate so each section starts matching from the file beginning.
+(define (normalize-operations operations)
+  (cond
+    [(null? operations) '()]
+    [(and (equal? (hash-ref (car operations) 'operation) "update")
+          (equal? (hash-ref (car operations) 'destination) ""))
+     (define operation (car operations))
+     (define collected
+       (collect-update-groups
+         (cdr operations) (hash-ref operation 'path)
+         (hash-ref operation 'hunk_groups) '()))
+     (cons
+       (hash 'operation "update"
+             'path (hash-ref operation 'path)
+             'destination ""
+             'hunk_groups (hash-ref collected 'groups))
+       (normalize-operations (hash-ref collected 'rest)))]
+    [else
+     (cons (car operations) (normalize-operations (cdr operations)))]))
 
 (define (targets-for operations)
   (cond
@@ -180,7 +218,7 @@
 
 (define (prepare-patch arguments)
   (define text (hash-ref arguments 'patch))
-  (define operations (parse-patch text))
+  (define operations (normalize-operations (parse-patch text)))
   (hash 'plan operations 'targets (targets-for operations)))
 
 (define (snapshot-for snapshots path)
@@ -260,6 +298,13 @@
         (apply-hunks (hash-ref result 'lines) (hash-ref result 'cursor)
                      (cdr hunks) path (+ hunk-index 1)))))
 
+(define (apply-hunk-groups lines groups path)
+  (if (null? groups)
+      lines
+      (apply-hunk-groups
+        (apply-hunks lines 0 (car groups) path 1)
+        (cdr groups) path)))
+
 (define (propose-operation operation snapshots)
   (define kind (hash-ref operation 'operation))
   (define path (hash-ref operation 'path))
@@ -279,8 +324,9 @@
      (define original (file-lines (hash-ref snapshot 'content)))
      (define content
        (render-lines
-         (apply-hunks (hash-ref original 'lines) 0
-                      (hash-ref operation 'hunks) path 1)
+         (apply-hunk-groups
+           (hash-ref original 'lines)
+           (hash-ref operation 'hunk_groups) path)
          (hash-ref original 'newline)))
      (if (and (equal? destination "")
               (equal? content (hash-ref snapshot 'content)))
@@ -308,7 +354,7 @@
   (hash
     'name "patch"
     'description
-    "Apply a Codex-style workspace patch. Wrap operations in *** Begin Patch and *** End Patch. Use *** Add File: path with every content line prefixed +; *** Delete File: path; or *** Update File: path, optional *** Move to: path, and @@ contextual hunks whose lines begin with space, -, or +. Put locator text on the @@ line, or use a context-only hunk before a later changing hunk. Every update must change file content or destination. Read files before updating them."
+    "Apply a Codex-style workspace patch. Wrap operations in *** Begin Patch and *** End Patch. Use *** Add File: path with every content line prefixed +; *** Delete File: path; or *** Update File: path, optional *** Move to: path, and @@ contextual hunks whose lines begin with space, -, or +. Put locator text on the @@ line, or use a context-only hunk before a later changing hunk. Repeated plain update sections for one file are applied sequentially as one atomic edit. Every update must change file content or destination. Read files before updating them."
     'parameters
     (hash 'type "object"
           'properties (hash 'patch (hash 'type "string"))

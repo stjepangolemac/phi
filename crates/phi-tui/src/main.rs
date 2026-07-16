@@ -970,6 +970,12 @@ impl App {
             {
                 self.composer.move_line_end();
             }
+            KeyCode::Char('u')
+                if !self.composer_locked() && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.edit_composer();
+                self.composer.delete_to_line_start();
+            }
             KeyCode::Char(character) if !self.composer_locked() => {
                 self.edit_composer();
                 self.composer.insert(character);
@@ -3803,6 +3809,12 @@ mod tests {
         app.composer.set("one two\nthree".into());
         app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER));
         assert_eq!(app.composer.text, "one two\n");
+
+        app.composer.set("before\nalpha beta\nafter".into());
+        app.composer.cursor = 12;
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.composer.text, "before\n beta\nafter");
+        assert_eq!(app.composer.cursor, 7);
     }
 
     #[test]

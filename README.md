@@ -84,7 +84,7 @@ Phi keeps behavior in Scheme and data in JSON:
         'retain_token_limit 24000))
 ```
 
-The selected file editor owns its model-facing format and matching logic in Steel. Rust supplies contained file snapshots, checks revisions, requests write approval, and persists the proposed changes. The bundled `codex-patch` editor exposes one `patch` tool for add, update, delete, and move operations. Update operations accept locator text directly on an `@@` line or in a context-only hunk before a later changing hunk; every update must still change file content or destination. Approved reads and edits may target the workspace or Phi home; `--yolo` removes all filesystem boundaries.
+The selected file editor owns its model-facing format and matching logic in Steel. Rust supplies contained file snapshots, checks revisions, requests write approval, and persists the proposed changes. The bundled `codex-patch` editor exposes one `patch` tool for add, update, delete, and move operations. Update operations accept locator text directly on an `@@` line or in a context-only hunk before a later changing hunk; repeated plain update sections for one file run sequentially as one atomic edit, and every update must still change file content or destination. Approved reads and edits may target the workspace or Phi home; `--yolo` removes all filesystem boundaries.
 
 There is no default provider. Providers register qualified model identities such as `openai/gpt-5.6-luna`; the selected model determines the provider. Use `/model` in the TUI to pick the model, reasoning, and provider-supported service tier.
 

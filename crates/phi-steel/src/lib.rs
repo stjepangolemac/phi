@@ -1497,6 +1497,63 @@ mod tests {
     }
 
     #[test]
+    fn provider_request_repairs_existing_incomplete_tool_history() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let state = serde_json::json!({
+            "messages": [
+                { "kind": "message", "role": "user", "content": "wait" },
+                { "kind": "tool_call", "call_id": "orphan-call", "name": "TaskOutput", "arguments": "{}" },
+                { "kind": "tool_result", "call_id": "orphan-result", "content": "lost call" },
+                { "kind": "tool_call", "call_id": "paired", "name": "read_file", "arguments": "{}" },
+                { "kind": "tool_result", "call_id": "paired", "content": "result" }
+            ],
+            "estimated_tokens": 10,
+            "compactions": 0,
+            "last_usage": {},
+            "model": "openai/gpt-5.6-luna",
+            "reasoning": "low",
+            "service_tier": "default",
+            "activity": "working",
+            "pending_finish": "",
+            "context_window": 272000
+        });
+        let mut policy = Policy::load_with_state(
+            &root.join("config.scm"),
+            &plugins(&root),
+            r#"{"model":"openai/gpt-5.6-luna","reasoning":"low","service_tier":"default"}"#,
+            Some(state.to_string()),
+        )
+        .unwrap();
+
+        let output = policy
+            .on_event(&Event::UserMessage {
+                content: "continue".into(),
+            })
+            .unwrap();
+        let Effect::HttpRequest { body, .. } = &output.effects[0] else {
+            panic!("expected provider request");
+        };
+        let input = body["input"].as_array().unwrap();
+        assert!(!input.iter().any(|item| item["call_id"] == "orphan-call"));
+        assert!(!input.iter().any(|item| item["call_id"] == "orphan-result"));
+        assert!(
+            input
+                .iter()
+                .any(|item| { item["type"] == "function_call" && item["call_id"] == "paired" })
+        );
+        assert!(
+            input.iter().any(|item| {
+                item["type"] == "function_call_output" && item["call_id"] == "paired"
+            })
+        );
+        assert!(input.iter().any(|item| {
+            item["type"] == "message"
+                && item["role"] == "user"
+                && item["content"][0]["text"] == "continue"
+        }));
+    }
+
+    #[test]
     fn structured_compaction_stops_before_the_twenty_four_thousand_token_tail_cap() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut policy = compact_policy(&root, 30_000);

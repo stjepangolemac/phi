@@ -24,13 +24,15 @@
   "anthropic/claude-sonnet-4.6" "Claude Sonnet 4.6 through OpenRouter." "high")
 
 (define (openrouter-provider-effect prompt model reasoning _service-tier)
+  (define history
+    (responses-complete-tool-history (hash-ref prompt 'messages)))
   (define base-body
     (hash 'model model
           'instructions (hash-ref prompt 'instructions)
           'input
           (map (lambda (message)
                  (responses-message->item "openrouter" message))
-               (hash-ref prompt 'messages))
+               history)
           'tools (map responses-tool (hash-ref prompt 'tools))
           'tool_choice "auto"
           'parallel_tool_calls #t

@@ -1158,7 +1158,9 @@ async fn run(
     let shell_sessions = Arc::clone(&options.processes);
 
     loop {
-        if cancellation.is_cancelled() {
+        let settle_cancelled_tools =
+            cancellation.is_cancelled() && matches!(&event, Event::ToolsCompleted { .. });
+        if cancellation.is_cancelled() && !settle_cancelled_tools {
             bail!("cancelled");
         }
         session.append(&event)?;
@@ -1175,6 +1177,9 @@ async fn run(
                 },
             )?;
             activity = next_activity;
+        }
+        if cancellation.is_cancelled() {
+            bail!("cancelled");
         }
         let stream_output = activity == "working";
         let effect = output
@@ -2717,6 +2722,55 @@ mod tests {
     }
 
     #[test]
+    fn editor_applies_repeated_updates_to_one_file_atomically() {
+        let (workspace, options) = options();
+        std::fs::write(
+            workspace.path().join("notes.txt"),
+            "first old\nmiddle\nlast old\n",
+        )
+        .unwrap();
+        let home = home_for_config(&options.config_path).unwrap();
+        let sources = resolve_sources(&home, workspace.path()).unwrap();
+        let capabilities = capabilities(&home, false);
+        let mut policy = phi_steel::Policy::load_with_state(
+            &sources.config,
+            &entrypoints(&sources),
+            &policy_config(&capabilities, "test", &load_user_state(&home).unwrap(), &[]),
+            None,
+        )
+        .unwrap();
+
+        let (result, _) = execute_file_edit(
+            workspace.path(),
+            &home.root,
+            &mut policy,
+            "patch",
+            &serde_json::json!({
+                "patch": concat!(
+                    "*** Begin Patch\n",
+                    "*** Update File: notes.txt\n",
+                    "@@\n",
+                    "-last old\n",
+                    "+last new\n",
+                    "*** Update File: notes.txt\n",
+                    "@@\n",
+                    "-first old\n",
+                    "+first new\n",
+                    "*** End Patch\n"
+                )
+            }),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(result["changes"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("notes.txt")).unwrap(),
+            "first new\nmiddle\nlast new\n"
+        );
+    }
+
+    #[test]
     fn unrestricted_editor_applies_a_patch_outside_the_workspace() {
         let (workspace, options) = options();
         let outside = tempfile::tempdir().unwrap();
@@ -2867,6 +2921,91 @@ mod tests {
                         .iter()
                         .all(|result| result.result["concurrent"] == true)
                 );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancellation_settles_completed_tool_calls_before_saving_state() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (workspace, mut options) = options();
+                let home = home_for_config(&options.config_path).unwrap();
+                let sources = resolve_sources(&home, workspace.path()).unwrap();
+                let session = phi_core::session::Session::create_composed(
+                    &workspace.path().join(".phi/sessions"),
+                    &sources.config,
+                    &sources.plugins,
+                )
+                .unwrap();
+                let capabilities = capabilities(&home, false);
+                let mut policy = phi_steel::Policy::load_with_state(
+                    &sources.config,
+                    &entrypoints(&sources),
+                    &policy_config(
+                        &capabilities,
+                        session.id(),
+                        &load_user_state(&home).unwrap(),
+                        &[],
+                    ),
+                    None,
+                )
+                .unwrap();
+                policy
+                    .on_event(&Event::UserMessage {
+                        content: "wait".into(),
+                    })
+                    .unwrap();
+                let output = policy
+                    .on_event(&Event::HttpCompleted {
+                        success: true,
+                        status: 200,
+                        events: vec![serde_json::json!({
+                            "type": "response.output_item.done",
+                            "item": {
+                                "type": "function_call",
+                                "call_id": "waiting-call",
+                                "name": "TaskOutput",
+                                "arguments": "{\"task_id\":\"task\",\"wait_ms\":300000}"
+                            }
+                        })],
+                        error: String::new(),
+                    })
+                    .unwrap();
+                assert!(matches!(&output.effects[0], Effect::RunTools { .. }));
+                session.save_state(policy.state()).unwrap();
+                options.session_id = Some(session.id().into());
+
+                let (event_tx, _event_rx) = mpsc::unbounded_channel();
+                let (_command_tx, command_rx) = mpsc::unbounded_channel();
+                let cancellation = CancellationToken::new();
+                cancellation.cancel();
+                let error = run(
+                    options,
+                    Event::ToolsCompleted {
+                        results: vec![ToolResult {
+                            call_id: "waiting-call".into(),
+                            name: "TaskOutput".into(),
+                            result: serde_json::json!({ "error": "cancelled" }),
+                        }],
+                    },
+                    &event_tx,
+                    command_rx,
+                    &cancellation,
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(runtime_error(&error), "cancelled");
+
+                let state: serde_json::Value =
+                    serde_json::from_str(&session.load_state().unwrap()).unwrap();
+                let messages = state["messages"].as_array().unwrap();
+                assert!(messages.iter().any(|message| {
+                    message["kind"] == "tool_call" && message["call_id"] == "waiting-call"
+                }));
+                assert!(messages.iter().any(|message| {
+                    message["kind"] == "tool_result" && message["call_id"] == "waiting-call"
+                }));
             })
             .await;
     }

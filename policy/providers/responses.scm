@@ -27,6 +27,43 @@
               'strict #t
               'schema schema)))
 
+(define (responses-tool-ids messages kind)
+  (cond
+    [(null? messages) '()]
+    [(equal? (hash-ref (car messages) 'kind) kind)
+     (cons (hash-ref (car messages) 'call_id)
+           (responses-tool-ids (cdr messages) kind))]
+    [else (responses-tool-ids (cdr messages) kind)]))
+
+(define (responses-id-present? id ids)
+  (cond
+    [(null? ids) #f]
+    [(equal? id (car ids)) #t]
+    [else (responses-id-present? id (cdr ids))]))
+
+;; Interrupted and legacy sessions can contain only one half of a tool exchange.
+;; Responses providers reject the entire request unless both halves are present.
+(define (responses-complete-tool-history messages)
+  (define call-ids (responses-tool-ids messages "tool_call"))
+  (define result-ids (responses-tool-ids messages "tool_result"))
+  (define (keep remaining)
+    (cond
+      [(null? remaining) '()]
+      [else
+       (define message (car remaining))
+       (define kind (hash-ref message 'kind))
+       (define keep?
+         (cond
+           [(equal? kind "tool_call")
+            (responses-id-present? (hash-ref message 'call_id) result-ids)]
+           [(equal? kind "tool_result")
+            (responses-id-present? (hash-ref message 'call_id) call-ids)]
+           [else #t]))
+       (if keep?
+           (cons message (keep (cdr remaining)))
+           (keep (cdr remaining)))]))
+  (keep messages))
+
 (define (responses-message->item provider message)
   (define kind (hash-ref message 'kind))
   (cond

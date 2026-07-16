@@ -38,7 +38,8 @@
   reasoning-options "medium")
 
 (define (provider-effect prompt model reasoning service-tier)
-  (define history (hash-ref prompt 'messages))
+  (define history
+    (responses-complete-tool-history (hash-ref prompt 'messages)))
   (define base-body
     (hash 'model model
           'instructions (hash-ref prompt 'instructions)

@@ -27,7 +27,7 @@ Keep complete model metadata in the registration spec: label, description, conte
 
 Prefer Steel for configurable behavior. Add Rust only for trusted effects, containment, durable state, transport, scheduling, or primitives Steel cannot safely provide.
 
-The bundled `codex-patch` editor accepts locator text on an `@@` line or as a context-only hunk before a later changing hunk. Each update must contain at least one syntactic change and must change file content or destination. Matching errors identify the file and hunk.
+The bundled `codex-patch` editor accepts locator text on an `@@` line or as a context-only hunk before a later changing hunk. Repeated plain update sections for one file run sequentially as one atomic edit. Each update must contain at least one syntactic change and must change file content or destination. Matching errors identify the file and hunk.
 
 ## Dynamic workflows
 
