@@ -22,6 +22,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Clear, Paragraph},
 };
+use throbber_widgets_tui::{BRAILLE_SIX, Throbber, ThrobberState};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 mod composer;
@@ -111,6 +112,7 @@ struct App {
     compactions: u64,
     turn_started: Option<Instant>,
     compaction_started: Option<Instant>,
+    throbber_state: ThrobberState,
     tool_started: HashMap<String, (String, Instant)>,
     tool_blocks: HashMap<String, usize>,
     workflow_names: HashMap<String, String>,
@@ -189,6 +191,7 @@ impl App {
             compactions: 0,
             turn_started: None,
             compaction_started: None,
+            throbber_state: ThrobberState::default(),
             tool_started: HashMap::new(),
             tool_blocks: HashMap::new(),
             workflow_names: HashMap::new(),
@@ -229,6 +232,12 @@ impl App {
     fn current_model_changed(&mut self) {
         self.current_model_revision = self.current_model_revision.wrapping_add(1);
         self.current_model_cache = None;
+    }
+
+    fn on_tick(&mut self) {
+        if self.turn_started.is_some() && self.status != "searching" {
+            self.throbber_state.calc_next();
+        }
     }
 
     fn submit(&mut self) {
@@ -1181,11 +1190,12 @@ pub async fn launch(options: RunOptions, prompt: Option<String>) -> Result<()> {
 
 async fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
     let mut input = EventStream::new();
-    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     while !app.quit {
         terminal.draw(|frame| draw(frame, app))?;
         tokio::select! {
-            _ = tick.tick(), if app.turn_started.is_some() => {}
+            _ = tick.tick(), if app.turn_started.is_some() => app.on_tick(),
             event = input.next().fuse() => {
                 match event.transpose()? {
                     Some(Event::Key(key)) if key.is_press() => app.on_key(key),
@@ -1684,12 +1694,13 @@ fn live_transcript_tail(app: &App, width: usize) -> Vec<Line<'static>> {
             ),
             _ => ("Working", turn_started),
         };
-        push_message(
-            &mut lines,
-            "turn_working",
-            &format!("{activity} for {}", human_duration(started.elapsed())),
-            width,
-        );
+        let label = format!("{activity} for {}", human_duration(started.elapsed()));
+        if activity == "Searching" {
+            push_message(&mut lines, "turn_working", &label, width);
+        } else {
+            lines.push(activity_indicator(&app.throbber_state, &label, width));
+            lines.push(Line::raw(" ".repeat(width)));
+        }
     }
     push_message_queue(
         &mut lines,
@@ -1850,6 +1861,23 @@ fn push_message(lines: &mut Vec<Line<'static>>, role: &str, content: &str, width
         }
     }
     lines.push(Line::styled(" ".repeat(width), style));
+}
+
+fn activity_indicator(state: &ThrobberState, label: &str, width: usize) -> Line<'static> {
+    if width == 0 {
+        return Line::default();
+    }
+    let throbber = Throbber::default().throbber_set(BRAILLE_SIX);
+    if width == 1 {
+        let mut symbol = throbber.to_symbol_span(state);
+        symbol.content = symbol.content.chars().take(1).collect::<String>().into();
+        return Line::from(symbol);
+    }
+    let label_width = width - 2;
+    let mut label = truncate_width(label, label_width);
+    let used = UnicodeWidthStr::width(label.as_str());
+    label.push_str(&" ".repeat(label_width.saturating_sub(used)));
+    throbber.label(label).to_line(state)
 }
 
 fn push_markdown(lines: &mut Vec<Line<'static>>, role: &str, content: &str, width: usize) {
@@ -3854,21 +3882,20 @@ mod tests {
     }
 
     #[test]
-    fn shows_live_working_divider_at_end_of_history() {
+    fn shows_live_working_throbber_at_end_of_history() {
         let mut app = app();
         app.current_model = "partial response".into();
         app.turn_started = Some(Instant::now() - Duration::from_secs(133));
         let text = transcript_text(&mut app, 40);
-        assert!(
-            text.lines[text.lines.len() - 2]
-                .to_string()
-                .starts_with("─ Working for 2m ")
-        );
+        let activity = text.lines[text.lines.len() - 2].to_string();
+        assert!(activity.starts_with("⠷ Working for 2m "));
+        assert!(!activity.contains('─'));
+        assert_eq!(UnicodeWidthStr::width(activity.as_str()), 40);
         assert!(text.lines.last().unwrap().to_string().trim().is_empty());
     }
 
     #[test]
-    fn working_divider_has_a_gap_after_user_block() {
+    fn working_throbber_has_a_gap_after_user_block() {
         let mut app = app();
         app.transcript.push(("you".into(), "hello".into()));
         app.turn_started = Some(Instant::now());
@@ -3879,8 +3906,54 @@ mod tests {
         assert!(
             text.lines[text.lines.len() - 2]
                 .to_string()
-                .starts_with("─ Working for ")
+                .starts_with("⠷ Working for ")
         );
+    }
+
+    #[test]
+    fn shows_live_compaction_throbber() {
+        let mut app = app();
+        app.turn_started = Some(Instant::now());
+        app.compaction_started = Some(Instant::now() - Duration::from_secs(3));
+        app.status = "compacting".into();
+
+        let text = transcript_text(&mut app, 32);
+        let activity = text.lines[text.lines.len() - 2].to_string();
+        assert!(activity.starts_with("⠷ Compacting for 3s"));
+        assert!(!activity.contains('─'));
+        assert_eq!(UnicodeWidthStr::width(activity.as_str()), 32);
+    }
+
+    #[test]
+    fn activity_tick_advances_braille_six_without_rerendering_history() {
+        let mut app = app();
+        app.push_transcript("phi", "cached history");
+        app.turn_started = Some(Instant::now());
+        let before = transcript_text(&mut app, 40);
+        let before_activity = before.lines[before.lines.len() - 2].to_string();
+        let render_count = app.transcript_render_count;
+
+        app.on_tick();
+        let after = transcript_text(&mut app, 40);
+        let after_activity = after.lines[after.lines.len() - 2].to_string();
+
+        assert!(before_activity.starts_with(BRAILLE_SIX.symbols[0]));
+        assert!(after_activity.starts_with(BRAILLE_SIX.symbols[1]));
+        assert_eq!(app.transcript_render_count, render_count);
+    }
+
+    #[test]
+    fn activity_indicator_pads_and_truncates_to_narrow_display_widths() {
+        let state = ThrobberState::default();
+        for width in 0..=24 {
+            let line = activity_indicator(&state, "Working for 12s", width).to_string();
+            assert_eq!(
+                UnicodeWidthStr::width(line.as_str()),
+                width,
+                "line at width {width}: {line:?}"
+            );
+            assert!(!line.contains('─'));
+        }
     }
 
     #[tokio::test]

@@ -16,6 +16,7 @@ phi-runtime = { path = "../phi-runtime" }
 ratatui.workspace = true
 serde_json.workspace = true
 syntect.workspace = true
+throbber-widgets-tui = "0.11.1"
 tokio.workspace = true
 tui-markdown = "0.3.8"
 unicode-width.workspace = true
