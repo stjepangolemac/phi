@@ -1664,7 +1664,9 @@ fn live_transcript_tail(app: &App, width: usize) -> Vec<Line<'static>> {
                     .filter_map(Option::as_ref)
                     .find_map(|block| block.lines.last())
             });
-        if last_line.is_some_and(|line| line.style.bg.is_some()) {
+        if last_line
+            .is_some_and(|line| !line.to_string().trim().is_empty() || line.style.bg.is_some())
+        {
             lines.push(Line::raw(" ".repeat(width)));
         }
         let (activity, started) = match app.status.as_str() {
@@ -3902,6 +3904,20 @@ mod tests {
     }
 
     #[test]
+    fn working_throbber_has_one_gap_after_tool_block() {
+        let mut app = app();
+        app.transcript.push(("tool".into(), "Ran `test`".into()));
+        app.turn_started = Some(Instant::now());
+
+        let text = transcript_text(&mut app, 40);
+        let tail = &text.lines[text.lines.len() - 4..];
+        assert!(!tail[0].to_string().trim().is_empty());
+        assert!(tail[1].to_string().trim().is_empty());
+        assert!(tail[2].to_string().starts_with("  ⠷ Working for "));
+        assert!(tail[3].to_string().trim().is_empty());
+    }
+
+    #[test]
     fn shows_live_compaction_throbber() {
         let mut app = app();
         app.turn_started = Some(Instant::now());
@@ -3913,6 +3929,24 @@ mod tests {
         assert!(activity.starts_with("  ⠷ Compacting for 3s"));
         assert!(!activity.contains('─'));
         assert_eq!(UnicodeWidthStr::width(activity.as_str()), 32);
+        assert_eq!(text.lines.len(), 2);
+        assert!(text.lines.last().unwrap().to_string().trim().is_empty());
+    }
+
+    #[test]
+    fn compacting_throbber_has_one_gap_after_tool_block() {
+        let mut app = app();
+        app.transcript.push(("tool".into(), "Ran `test`".into()));
+        app.turn_started = Some(Instant::now());
+        app.compaction_started = Some(Instant::now());
+        app.status = "compacting".into();
+
+        let text = transcript_text(&mut app, 40);
+        let tail = &text.lines[text.lines.len() - 4..];
+        assert!(!tail[0].to_string().trim().is_empty());
+        assert!(tail[1].to_string().trim().is_empty());
+        assert!(tail[2].to_string().starts_with("  ⠷ Compacting for "));
+        assert!(tail[3].to_string().trim().is_empty());
     }
 
     #[test]
