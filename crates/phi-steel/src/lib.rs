@@ -1070,6 +1070,65 @@ mod tests {
     }
 
     #[test]
+    fn codex_patch_accepts_context_only_locator_hunks() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut policy = policy(&root);
+        let preparation = policy
+            .prepare_file_edit(
+                "patch",
+                &serde_json::json!({
+                    "patch": concat!(
+                        "*** Begin Patch\n",
+                        "*** Update File: crates/phi-runtime/src/workflow.rs\n",
+                        "@@\n",
+                        "     async fn launches_and_inspects_a_plugin_workflow() {\n",
+                        "@@\n",
+                        "         tasks.shutdown().await;\n",
+                        "     }\n",
+                        "+\n",
+                        "+    #[tokio::test]\n",
+                        "+    async fn added_workflow_test() {}\n",
+                        "*** End Patch\n"
+                    )
+                }),
+            )
+            .unwrap();
+
+        let changes = policy
+            .propose_file_edit(
+                "patch",
+                &preparation["plan"],
+                &serde_json::json!([{
+                    "path": "crates/phi-runtime/src/workflow.rs",
+                    "exists": true,
+                    "content": concat!(
+                        "mod tests {\n",
+                        "    async fn launches_and_inspects_a_plugin_workflow() {\n",
+                        "        tasks.shutdown().await;\n",
+                        "    }\n",
+                        "}\n"
+                    ),
+                    "revision": "one"
+                }]),
+            )
+            .unwrap();
+
+        assert_eq!(
+            changes[0]["content"],
+            concat!(
+                "mod tests {\n",
+                "    async fn launches_and_inspects_a_plugin_workflow() {\n",
+                "        tasks.shutdown().await;\n",
+                "    }\n",
+                "\n",
+                "    #[tokio::test]\n",
+                "    async fn added_workflow_test() {}\n",
+                "}\n"
+            )
+        );
+    }
+
+    #[test]
     fn policy_rejections_expose_only_the_domain_message() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut policy = policy(&root);
@@ -1090,10 +1149,86 @@ mod tests {
 
         assert_eq!(
             user_error_message(&error).as_deref(),
-            Some("patch hunk makes no change")
+            Some("src/main.rs: patch makes no change")
         );
         assert!(!error.to_string().contains("Steel"));
         assert!(!error.to_string().contains("policy"));
+    }
+
+    #[test]
+    fn codex_patch_rejects_semantically_unchanged_updates() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut policy = policy(&root);
+        let preparation = policy
+            .prepare_file_edit(
+                "patch",
+                &serde_json::json!({
+                    "patch": concat!(
+                        "*** Begin Patch\n",
+                        "*** Update File: src/main.rs\n",
+                        "@@ fn main() {\n",
+                        "-    unchanged();\n",
+                        "+    unchanged();\n",
+                        "*** End Patch\n"
+                    )
+                }),
+            )
+            .unwrap();
+        let error = policy
+            .propose_file_edit(
+                "patch",
+                &preparation["plan"],
+                &serde_json::json!([{
+                    "path": "src/main.rs",
+                    "exists": true,
+                    "content": "fn main() {\n    unchanged();\n}\n",
+                    "revision": "one"
+                }]),
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            user_error_message(&error).as_deref(),
+            Some("src/main.rs: patch makes no change")
+        );
+    }
+
+    #[test]
+    fn codex_patch_errors_identify_the_file_and_hunk() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut policy = policy(&root);
+        let preparation = policy
+            .prepare_file_edit(
+                "patch",
+                &serde_json::json!({
+                    "patch": concat!(
+                        "*** Begin Patch\n",
+                        "*** Update File: src/main.rs\n",
+                        "@@\n",
+                        "-missing();\n",
+                        "+replacement();\n",
+                        "*** End Patch\n"
+                    )
+                }),
+            )
+            .unwrap();
+        let error = policy
+            .propose_file_edit(
+                "patch",
+                &preparation["plan"],
+                &serde_json::json!([{
+                    "path": "src/main.rs",
+                    "exists": true,
+                    "content": "present();\n",
+                    "revision": "one"
+                }]),
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            user_error_message(&error).as_deref(),
+            Some("src/main.rs: hunk 1 context not found")
+        );
     }
 
     #[test]

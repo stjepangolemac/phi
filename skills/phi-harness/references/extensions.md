@@ -27,11 +27,13 @@ Keep complete model metadata in the registration spec: label, description, conte
 
 Prefer Steel for configurable behavior. Add Rust only for trusted effects, containment, durable state, transport, scheduling, or primitives Steel cannot safely provide.
 
+The bundled `codex-patch` editor accepts locator text on an `@@` line or as a context-only hunk before a later changing hunk. Each update must contain at least one syntactic change and must change file content or destination. Matching errors identify the file and hunk.
+
 ## Dynamic workflows
 
 The official `dynamic-workflows` plugin keeps orchestration in named JavaScript modules while Rust owns background process lifecycle and the public one-shot agent transport. Workflows are discovered from `.phi/workflows/NAME.js`, `~/.phi/workflows/NAME.js`, then `workflows/NAME.js` in loaded plugins.
 
-Workflow modules export `meta` with `name` and `description`, plus a default async `({ args }) => value` function. They may import `agent`, `parallel`, `batch`, `pipeline`, `phase`, `log`, and `budget` from `phi:workflow`. `parallel(tasks, { concurrency? })` runs task functions with an optional continuously replenished concurrency limit. `batch(tasks, { size })` runs fixed-size waves and waits for each wave before starting the next. `agent(prompt, { label?, schema? })` launches a fresh `phi --workspace WORKSPACE --yolo rpc` child. Limits are 8 concurrent agents, 32 total agents, and 60 minutes. The model launches and manages workflows through `Workflow`, `TaskOutput`, and `TaskStop`; task state is stored under the parent session.
+Workflow modules export `meta` with `name` and `description`, plus a default async `({ args }) => value` function. They may import `agent`, `parallel`, `batch`, `pipeline`, `phase`, `log`, and `budget` from `phi:workflow`. `parallel(tasks, { concurrency? })` runs task functions with an optional continuously replenished concurrency limit. `batch(tasks, { size })` runs fixed-size waves and waits for each wave before starting the next. `agent(prompt, { label?, schema? })` launches a fresh `phi --workspace WORKSPACE --yolo rpc` child. Limits are 8 concurrent agents, 32 total agents, and 60 minutes. The model launches and manages workflows through `Workflow`, `TaskOutput`, and `TaskStop`; task state is stored under the parent session. `TaskOutput` waits for up to 15 seconds by default, accepts a model-selected `wait_ms` up to 300 seconds, and returns a summary containing the active phase, latest log, and agent counts.
 
 `phi rpc` accepts one line-framed JSON-RPC 2.0 `agent.run` request on stdin. Params contain `prompt` and optional `schema`; stdout contains `agent.event` notifications followed by a result with `value` and `sessionId`, or a JSON-RPC error. This interface is public and versioned through Phi releases.
 

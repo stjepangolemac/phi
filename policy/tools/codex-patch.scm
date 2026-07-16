@@ -91,11 +91,18 @@
               anchors))
       (hash 'anchors (reverse anchors) 'rest lines)))
 
-(define (parse-hunks lines hunks)
+(define (any-changed-hunk? hunks)
+  (cond [(null? hunks) #f]
+        [(hash-ref (car hunks) 'changed) #t]
+        [else (any-changed-hunk? (cdr hunks))]))
+
+(define (parse-hunks lines hunks path)
   (cond
     [(null? lines) (error! "patch is missing its end marker")]
     [(operation-header? (car lines))
      (if (null? hunks) (error! "updated file requires a hunk"))
+     (if (not (any-changed-hunk? hunks))
+         (error! (string-append path ": patch makes no change")))
      (hash 'hunks (reverse hunks) 'rest lines)]
     [(not (starts-with? (car lines) "@@"))
      (error! "updated file requires a @@ hunk header")]
@@ -103,15 +110,15 @@
      (define parsed-anchors (parse-anchors lines '()))
      (define parsed
        (parse-hunk-lines (hash-ref parsed-anchors 'rest) '() '() #f #f))
-     (if (not (hash-ref parsed 'changed))
-         (error! "patch hunk makes no change"))
      (parse-hunks
        (hash-ref parsed 'rest)
        (cons (hash 'anchors (hash-ref parsed-anchors 'anchors)
                    'old (hash-ref parsed 'old)
                    'new (hash-ref parsed 'new)
+                   'changed (hash-ref parsed 'changed)
                    'end_of_file (hash-ref parsed 'end_of_file))
-             hunks))]))
+             hunks)
+       path)]))
 
 (define (parse-operations lines operations)
   (cond
@@ -145,7 +152,7 @@
          (begin
            (set! destination (path-after (car remaining) move-to))
            (set! remaining (cdr remaining))))
-     (define parsed (parse-hunks remaining '()))
+     (define parsed (parse-hunks remaining '() path))
      (parse-operations
        (hash-ref parsed 'rest)
        (cons (hash 'operation "update" 'path path
@@ -209,44 +216,49 @@
   (define content (join-lines lines))
   (if newline? (string-append content "\n") content))
 
-(define (after-anchors lines anchors cursor)
+(define (hunk-error path index message)
+  (error! (string-append path ": hunk " (to-string index) " " message)))
+
+(define (after-anchors lines anchors cursor path hunk-index)
   (cond
     [(null? anchors) cursor]
-    [(equal? (car anchors) "") (after-anchors lines (cdr anchors) cursor)]
+    [(equal? (car anchors) "")
+     (after-anchors lines (cdr anchors) cursor path hunk-index)]
     [else
      (define index (find-line lines (car anchors) cursor))
      (if (equal? index #f)
-         (error! (string-append "patch anchor not found: " (car anchors))))
-     (after-anchors lines (cdr anchors) (+ index 1))]))
+         (hunk-error path hunk-index
+                     (string-append "anchor not found: " (car anchors))))
+     (after-anchors lines (cdr anchors) (+ index 1) path hunk-index)]))
 
-(define (apply-hunk lines cursor hunk)
+(define (apply-hunk lines cursor hunk path hunk-index)
   (define anchors (hash-ref hunk 'anchors))
   (define old (hash-ref hunk 'old))
   (define new (hash-ref hunk 'new))
   (define end? (hash-ref hunk 'end_of_file))
-  (define start (after-anchors lines anchors cursor))
+  (define start (after-anchors lines anchors cursor path hunk-index))
   (define index
     (if (null? old)
         (if end? (length lines) start)
         (find-sequence lines old start)))
-  (if (equal? index #f) (error! "patch context not found"))
+  (if (equal? index #f) (hunk-error path hunk-index "context not found"))
   (if (and (null? anchors)
            (not (null? old))
            (not (equal? (find-sequence lines old (+ index 1)) #f)))
-      (error! "patch context is ambiguous"))
+      (hunk-error path hunk-index "context is ambiguous"))
   (if (and end? (not (= (+ index (length old)) (length lines))))
-      (error! "patch hunk does not end at end of file"))
+      (hunk-error path hunk-index "does not end at end of file"))
   (hash 'lines
         (append (take lines index) new
                 (drop lines (+ index (length old))))
         'cursor (+ index (length new))))
 
-(define (apply-hunks lines cursor hunks)
+(define (apply-hunks lines cursor hunks path hunk-index)
   (if (null? hunks)
       lines
-      (let ([result (apply-hunk lines cursor (car hunks))])
+      (let ([result (apply-hunk lines cursor (car hunks) path hunk-index)])
         (apply-hunks (hash-ref result 'lines) (hash-ref result 'cursor)
-                     (cdr hunks)))))
+                     (cdr hunks) path (+ hunk-index 1)))))
 
 (define (propose-operation operation snapshots)
   (define kind (hash-ref operation 'operation))
@@ -263,12 +275,16 @@
      (hash 'operation "delete" 'path path)]
     [(equal? kind "update")
      (if (not (hash-ref snapshot 'exists)) (error! "updated file does not exist"))
+     (define destination (hash-ref operation 'destination))
      (define original (file-lines (hash-ref snapshot 'content)))
      (define content
        (render-lines
-         (apply-hunks (hash-ref original 'lines) 0 (hash-ref operation 'hunks))
+         (apply-hunks (hash-ref original 'lines) 0
+                      (hash-ref operation 'hunks) path 1)
          (hash-ref original 'newline)))
-     (define destination (hash-ref operation 'destination))
+     (if (and (equal? destination "")
+              (equal? content (hash-ref snapshot 'content)))
+         (error! (string-append path ": patch makes no change")))
      (if (equal? destination "")
          (hash 'operation "replace" 'path path 'content content)
          (begin
@@ -292,7 +308,7 @@
   (hash
     'name "patch"
     'description
-    "Apply a Codex-style workspace patch. Wrap operations in *** Begin Patch and *** End Patch. Use *** Add File: path with every content line prefixed +; *** Delete File: path; or *** Update File: path, optional *** Move to: path, and @@ contextual hunks whose lines begin with space, -, or +. Read files before updating them."
+    "Apply a Codex-style workspace patch. Wrap operations in *** Begin Patch and *** End Patch. Use *** Add File: path with every content line prefixed +; *** Delete File: path; or *** Update File: path, optional *** Move to: path, and @@ contextual hunks whose lines begin with space, -, or +. Put locator text on the @@ line, or use a context-only hunk before a later changing hunk. Every update must change file content or destination. Read files before updating them."
     'parameters
     (hash 'type "object"
           'properties (hash 'patch (hash 'type "string"))
