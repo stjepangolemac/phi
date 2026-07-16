@@ -43,15 +43,15 @@
   (define base-body
     (hash 'model model
           'instructions (hash-ref prompt 'instructions)
-          'input (map (lambda (message) (responses-message->item "openai" message))
-                      history)
+          'input (responses-input-items "openai" history)
           'tools (map responses-tool (hash-ref prompt 'tools))
           'prompt_cache_key (runtime-session-id)
           'tool_choice "auto"
           ;; Context tools mutate policy state and must be dispatched alone.
           'parallel_tool_calls
           (not (context-tools-available? (hash-ref prompt 'tools)))
-          'reasoning (hash 'effort reasoning 'context "all_turns")
+          'reasoning (hash 'effort reasoning 'summary "concise"
+                           'context "all_turns")
           'service_tier service-tier
           'store #f
           'stream #t

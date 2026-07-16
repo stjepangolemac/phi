@@ -629,6 +629,7 @@ mod tests {
                 if url.ends_with("/responses")
                     && body["model"] == "gpt-5.6-luna"
                     && body["reasoning"]["effort"] == "low"
+                    && body["reasoning"]["summary"] == "concise"
                     && body["prompt_cache_key"] == ""
                     && body["tools"].as_array().unwrap().iter()
                         .any(|tool| tool["type"] == "web_search")
@@ -681,6 +682,10 @@ mod tests {
                 status: 200,
                 events: vec![
                     serde_json::json!({
+                        "type": "response.reasoning_summary_text.delta",
+                        "delta": "Checked the request."
+                    }),
+                    serde_json::json!({
                         "type": "response.output_item.done",
                         "item": {
                             "type": "reasoning",
@@ -712,6 +717,18 @@ mod tests {
                 error: String::new(),
             })
             .unwrap();
+        let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
+        assert!(state["messages"].as_array().unwrap().iter().any(|message| {
+            message["kind"] == "reasoning_summary" && message["content"] == "Checked the request."
+        }));
+        let saved_state = policy.state().to_owned();
+        let mut policy = Policy::load_with_state(
+            &root.join("config.scm"),
+            &plugins(&root),
+            r#"{"model":"openai/gpt-5.6-luna","reasoning":"low","service_tier":"default"}"#,
+            Some(saved_state),
+        )
+        .unwrap();
         let output = policy
             .on_event(&Event::UserMessage {
                 content: "second".into(),
@@ -726,6 +743,7 @@ mod tests {
                     && body["input"][2]["encrypted_content"] == "compact"
                     && body["input"][3]["phase"] == "final_answer"
                     && body["input"][3]["content"][0]["text"] == "answer"
+                    && body["input"].as_array().unwrap().len() == 5
         ));
     }
 

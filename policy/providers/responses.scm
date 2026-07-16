@@ -2,6 +2,8 @@
 
 (define responses-stream-rules
   (list
+    (hash 'match (hash "/type" "response.reasoning_summary_text.delta")
+          'emit "reasoning_summary_delta" 'value "/delta")
     (hash 'match (hash "/type" "response.output_text.delta")
           'emit "model_delta" 'value "/delta")
     (hash 'match (hash "/type" "response.output_item.added"
@@ -91,7 +93,15 @@
      (if (equal? (hash-ref message 'provider) provider)
          (hash-ref message 'item)
          (error! "provider item belongs to another provider"))]
+    [(equal? kind "reasoning_summary") #f]
     [else (error! "unsupported normalized message")]))
+
+(define (responses-input-items provider messages)
+  (if (null? messages)
+      '()
+      (let ([item (responses-message->item provider (car messages))]
+            [rest (responses-input-items provider (cdr messages))])
+        (if item (cons item rest) rest))))
 
 (define (responses-calls events)
   (if (null? events)
@@ -124,6 +134,16 @@
             (string-append (hash-ref event 'delta) rest)
             rest))))
 
+(define (responses-reasoning-summary events)
+  (if (null? events)
+      ""
+      (let* ([event (car events)]
+             [rest (responses-reasoning-summary (cdr events))])
+        (if (equal? (hash-ref event 'type)
+                    "response.reasoning_summary_text.delta")
+            (string-append (hash-ref event 'delta) rest)
+            rest))))
+
 (define (responses-usage events)
   (if (null? events)
       #f
@@ -133,19 +153,25 @@
             (responses-usage (cdr events))))))
 
 (define (responses-preserved-items provider events)
-  (if (null? events)
-      '()
-      (let* ([event (car events)]
-             [item (hash-try-get event 'item)]
-             [type (if item (hash-ref item 'type) "")]
-             [rest (responses-preserved-items provider (cdr events))])
-        (if (and (equal? (hash-ref event 'type) "response.output_item.done")
-                 (or (equal? type "reasoning")
-                     (equal? type "compaction")
-                     (equal? type "web_search_call")))
-            (cons (hash 'kind "provider_item" 'provider provider 'item item)
-                  rest)
-            rest))))
+  (define (items remaining)
+    (if (null? remaining)
+        '()
+        (let* ([event (car remaining)]
+               [item (hash-try-get event 'item)]
+               [type (if item (hash-ref item 'type) "")]
+               [rest (items (cdr remaining))])
+          (if (and (equal? (hash-ref event 'type) "response.output_item.done")
+                   (or (equal? type "reasoning")
+                       (equal? type "compaction")
+                       (equal? type "web_search_call")))
+              (cons (hash 'kind "provider_item" 'provider provider 'item item)
+                    rest)
+              rest))))
+  (define summary (responses-reasoning-summary events))
+  (if (equal? summary "")
+      (items events)
+      (append (items events)
+              (list (hash 'kind "reasoning_summary" 'content summary)))))
 
 (define (responses-message-phase events)
   (if (null? events)

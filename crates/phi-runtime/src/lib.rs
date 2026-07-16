@@ -67,6 +67,9 @@ pub enum RuntimeEvent {
     ModelDelta {
         content: String,
     },
+    ReasoningSummaryDelta {
+        content: String,
+    },
     ToolStarted {
         call_id: String,
         name: String,
@@ -2024,6 +2027,13 @@ fn emit_stream_events(
             "model_delta" => value.as_str().map(|content| RuntimeEvent::ModelDelta {
                 content: content.into(),
             }),
+            "reasoning_summary_delta" => {
+                value
+                    .as_str()
+                    .map(|content| RuntimeEvent::ReasoningSummaryDelta {
+                        content: content.into(),
+                    })
+            }
             "tool_started" => Some(RuntimeEvent::ToolStarted {
                 call_id: String::new(),
                 name: rule.name.clone(),
@@ -2708,8 +2718,13 @@ mod tests {
     }
 
     #[test]
-    fn provider_stream_rules_emit_generic_tool_events() {
+    fn provider_stream_rules_emit_generic_summary_and_tool_events() {
         let rules: Vec<StreamRule> = serde_json::from_value(serde_json::json!([
+            {
+                "match": { "/type": "response.reasoning_summary_text.delta" },
+                "emit": "reasoning_summary_delta",
+                "value": "/delta"
+            },
             {
                 "match": { "/type": "response.output_item.added", "/item/type": "web_search_call" },
                 "emit": "tool_started",
@@ -2729,6 +2744,14 @@ mod tests {
         emit_stream_events(
             &events,
             &serde_json::json!({
+                "type": "response.reasoning_summary_text.delta",
+                "delta": "Checked the request."
+            }),
+            &rules,
+        );
+        emit_stream_events(
+            &events,
+            &serde_json::json!({
                 "type": "response.output_item.added",
                 "item": { "type": "web_search_call" }
             }),
@@ -2743,6 +2766,11 @@ mod tests {
             &rules,
         );
 
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            RuntimeEvent::ReasoningSummaryDelta { content }
+                if content == "Checked the request."
+        ));
         assert!(matches!(
             received.try_recv().unwrap(),
             RuntimeEvent::ToolStarted { name, .. } if name == "web_search"
@@ -2815,6 +2843,7 @@ mod tests {
             Effect::HttpRequest { body, headers, .. }
                 if body["model"] == "gpt-5.6-terra"
                     && body["reasoning"]["effort"] == "high"
+                    && body["reasoning"]["summary"] == "concise"
                     && body["service_tier"] == "priority"
                     && body["parallel_tool_calls"] == false
                     && body["prompt_cache_key"] == execution.session_id

@@ -97,6 +97,7 @@ struct App {
     current_model: String,
     current_model_revision: u64,
     current_model_cache: Option<RenderedLiveModel>,
+    current_reasoning_summary: Option<usize>,
     composer: Composer,
     handle: Option<Handle>,
     command_task: Option<tokio::task::JoinHandle<Result<CommandExecution>>>,
@@ -176,6 +177,7 @@ impl App {
             current_model: String::new(),
             current_model_revision: 0,
             current_model_cache: None,
+            current_reasoning_summary: None,
             composer: Composer::default(),
             handle: None,
             command_task: None,
@@ -387,6 +389,7 @@ impl App {
         self.transcript_offsets.clear();
         self.current_model.clear();
         self.current_model_changed();
+        self.current_reasoning_summary = None;
         self.approval = None;
         self.estimated_tokens = self.token_budget.map(|_| 0);
         self.input_tokens = None;
@@ -596,15 +599,32 @@ impl App {
             },
             RuntimeEvent::ToolRouteSelected { .. } => {}
             RuntimeEvent::ModelDelta { content } => {
+                self.current_reasoning_summary = None;
                 self.mark_response_start_after_tools();
                 self.current_model.push_str(&content);
                 self.current_model_changed();
+            }
+            RuntimeEvent::ReasoningSummaryDelta { content } => {
+                self.flush_model();
+                let index = if let Some(index) = self.current_reasoning_summary {
+                    index
+                } else {
+                    let index = self.transcript.len();
+                    self.push_transcript("reasoning_summary", "");
+                    self.current_reasoning_summary = Some(index);
+                    index
+                };
+                if let Some((_, summary)) = self.transcript.get_mut(index) {
+                    summary.push_str(&content);
+                    self.transcript_changed(index);
+                }
             }
             RuntimeEvent::ToolStarted {
                 call_id,
                 name,
                 arguments,
             } => {
+                self.current_reasoning_summary = None;
                 self.flush_model();
                 self.tool_started
                     .insert(call_id.clone(), (name.clone(), Instant::now()));
@@ -782,6 +802,7 @@ impl App {
             }
             RuntimeEvent::ApprovalRequested { name } => self.approval = Some(name),
             RuntimeEvent::Finished { content } => {
+                self.current_reasoning_summary = None;
                 if !self.final_response_rendered
                     && self.current_model.is_empty()
                     && !content.is_empty()
@@ -814,6 +835,7 @@ impl App {
                 }
             }
             RuntimeEvent::Error { message } => {
+                self.current_reasoning_summary = None;
                 self.flush_model();
                 let restarting = message == "cancelled" && self.restart_after_cancel.is_some();
                 if !restarting {
@@ -1819,6 +1841,10 @@ fn push_message(lines: &mut Vec<Line<'static>>, role: &str, content: &str, width
         push_patch(lines, content, width);
         return;
     }
+    if role == "reasoning_summary" {
+        push_reasoning_summary(lines, content, width);
+        return;
+    }
     if role == "you" || role == "phi" || role == "processes" {
         push_markdown(lines, role, content, width);
         return;
@@ -1852,6 +1878,31 @@ fn push_message(lines: &mut Vec<Line<'static>>, role: &str, content: &str, width
         }
     }
     lines.push(Line::styled(" ".repeat(width), style));
+}
+
+fn push_reasoning_summary(lines: &mut Vec<Line<'static>>, content: &str, width: usize) {
+    let label_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD | Modifier::ITALIC);
+    let content_style = Style::default()
+        .fg(Color::Gray)
+        .add_modifier(Modifier::ITALIC);
+    lines.push(Line::raw(" ".repeat(width)));
+    lines.push(Line::styled(
+        truncate_width("• Provider reasoning summary", width),
+        label_style,
+    ));
+    let content_width = width.saturating_sub(2).max(1);
+    for content_line in content.split('\n') {
+        for wrapped in wrap_line(content_line, content_width) {
+            let used = UnicodeWidthStr::width(wrapped.as_str()).min(content_width);
+            lines.push(Line::styled(
+                format!("  {wrapped}{}", " ".repeat(width.saturating_sub(2 + used))),
+                content_style,
+            ));
+        }
+    }
+    lines.push(Line::raw(" ".repeat(width)));
 }
 
 fn activity_indicator(state: &ThrobberState, label: &str, width: usize) -> Line<'static> {
@@ -2575,6 +2626,42 @@ mod tests {
         });
         assert_eq!(app.transcript[0], ("phi".into(), "hi".into()));
         assert_eq!(app.transcript[1].1, "Read src/main.rs");
+    }
+
+    #[test]
+    fn streams_reasoning_summaries_separately_and_preserves_event_order() {
+        let mut app = app();
+        app.on_runtime(RuntimeEvent::ReasoningSummaryDelta {
+            content: "Checked ".into(),
+        });
+        app.on_runtime(RuntimeEvent::ReasoningSummaryDelta {
+            content: "the request.".into(),
+        });
+        app.on_runtime(RuntimeEvent::ToolStarted {
+            call_id: "read".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({ "path": "src/main.rs" }),
+        });
+        app.on_runtime(RuntimeEvent::ModelDelta {
+            content: "Final answer".into(),
+        });
+        app.on_runtime(RuntimeEvent::Finished {
+            content: "Final answer".into(),
+        });
+
+        assert_eq!(
+            &app.transcript[..3],
+            &[
+                ("reasoning_summary".into(), "Checked the request.".into()),
+                ("tool".into(), "Read src/main.rs".into()),
+                ("response_start".into(), String::new()),
+            ]
+        );
+        assert_eq!(app.transcript[3], ("phi".into(), "Final answer".into()));
+        let rendered = transcript_text(&mut app, 48).to_string();
+        assert!(rendered.contains("Provider reasoning summary"));
+        assert!(rendered.contains("Checked the request."));
+        assert_eq!(rendered.matches("Final answer").count(), 1);
     }
 
     #[test]

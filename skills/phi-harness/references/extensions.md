@@ -20,6 +20,8 @@ The official `context-management` plugin provides `context_mark`, `context_inspe
 
 Provider-neutral prompts contain `instructions`, `messages`, and `tools`. A compactor may add `output_schema`; Responses-compatible providers map it to strict JSON-schema output.
 
+Provider stream rules use provider-neutral emit names. Use `model_delta` for final-answer text, `reasoning_summary_delta` for provider-generated readable reasoning summaries, and `tool_started`/`tool_completed` for hosted-tool lifecycle events. Preserve opaque provider reasoning items independently; do not render or attempt to decrypt encrypted reasoning state.
+
 Provider plugins may register default models. Because plugin entrypoints are evaluated before `config.scm`, configuration can customize those defaults with the same extension API:
 
 - `(register-model! "provider" spec)` adds a model. If the qualified ID already exists, the later registration replaces it.

@@ -29,10 +29,7 @@
   (define base-body
     (hash 'model model
           'instructions (hash-ref prompt 'instructions)
-          'input
-          (map (lambda (message)
-                 (responses-message->item "openrouter" message))
-               history)
+          'input (responses-input-items "openrouter" history)
           'tools (map responses-tool (hash-ref prompt 'tools))
           'tool_choice "auto"
           ;; Context tools mutate policy state and must be dispatched alone.
