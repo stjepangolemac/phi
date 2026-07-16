@@ -140,10 +140,10 @@ The official `dynamic-workflows` plugin exposes background `Workflow`, `TaskOutp
 LOADED_PLUGIN/workflows/NAME.js
 ```
 
-Each module exports `meta` and a default async function. The `phi:workflow` module supplies `agent`, `parallel`, `pipeline`, `phase`, `log`, and `budget`:
+Each module exports `meta` and a default async function. The `phi:workflow` module supplies `agent`, `parallel`, `batch`, `pipeline`, `phase`, `log`, and `budget`:
 
 ```js
-import { agent, parallel, phase } from "phi:workflow"
+import { agent, batch, parallel, phase } from "phi:workflow"
 
 export const meta = {
   name: "review",
@@ -152,12 +152,17 @@ export const meta = {
 
 export default async function ({ args }) {
   phase("Review")
-  return parallel([
-    () => agent(`Review correctness:\n${args.diff}`, { label: "correctness" }),
-    () => agent(`Review tests:\n${args.diff}`, { label: "tests" })
-  ])
+  const reviews = args.files.map((file, index) => () => agent(
+    `Review file ${index + 1}:\n${file}`,
+    { label: `review-${index + 1}` }
+  ))
+  return args.mode === "batch"
+    ? batch(reviews, { size: 3 })
+    : parallel(reviews, { concurrency: 3 })
 }
 ```
+
+`parallel(tasks, { concurrency })` continuously fills up to the requested number of task slots while preserving result order. `batch(tasks, { size })` runs fixed-size waves through `parallel()` and waits for each wave before starting the next. Tasks are functions so their work does not start before the scheduler invokes them. Both APIs remain subject to the workflow runtime's global agent concurrency limit.
 
 `agent(prompt, { label?, schema? })` starts a fresh one-shot Phi child in the same workspace and Phi home. Child agents run with `--yolo`; workflows are therefore trusted local code. A schema requests strict JSON-schema output and makes `agent()` return the parsed JSON value. The initial runtime limits are 8 concurrent agents, 32 agents total per workflow, and 60 minutes per workflow. Workflow task files, progress, logs, and results live under the parent session's `workflows/tasks/` directory. Background tasks live for the duration of the parent Phi process and are cancelled when it exits.
 

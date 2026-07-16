@@ -119,11 +119,66 @@ function runPhi(context, prompt, schema, onEvent) {
   })
 }
 
-export async function parallel(tasks) {
+function validateTasks(name, tasks) {
   if (!Array.isArray(tasks) || tasks.some(task => typeof task !== "function")) {
-    throw new TypeError("parallel() requires an array of functions")
+    throw new TypeError(`${name}() requires an array of functions`)
   }
-  return Promise.all(tasks.map(task => Promise.resolve().then(task)))
+}
+
+function positiveInteger(name, value) {
+  if (!Number.isInteger(value) || value < 1) {
+    throw new RangeError(`${name} must be a positive integer`)
+  }
+  return value
+}
+
+function validateOptions(name, options, allowed) {
+  if (options === null || typeof options !== "object" || Array.isArray(options)) {
+    throw new TypeError(`${name}() options must be an object`)
+  }
+  const unknown = Object.keys(options).filter(key => !allowed.includes(key))
+  if (unknown.length > 0) {
+    throw new TypeError(`unsupported ${name} option: ${unknown[0]}`)
+  }
+}
+
+export async function parallel(tasks, options = {}) {
+  validateTasks("parallel", tasks)
+  validateOptions("parallel", options, ["concurrency"])
+  const concurrency = positiveInteger(
+    "parallel concurrency",
+    options.concurrency ?? Math.max(1, tasks.length)
+  )
+  if (tasks.length === 0) return []
+  const results = new Array(tasks.length)
+  let nextIndex = 0
+
+  async function worker() {
+    while (true) {
+      const index = nextIndex
+      nextIndex += 1
+      if (index >= tasks.length) return
+      results[index] = await Promise.resolve().then(tasks[index])
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, tasks.length) }, () => worker())
+  )
+  return results
+}
+
+export async function batch(tasks, options = {}) {
+  validateTasks("batch", tasks)
+  validateOptions("batch", options, ["size"])
+  const size = positiveInteger("batch size", options.size)
+  const results = []
+
+  for (let start = 0; start < tasks.length; start += size) {
+    const current = tasks.slice(start, start + size)
+    results.push(...await parallel(current, { concurrency: size }))
+  }
+  return results
 }
 
 export async function pipeline(items, ...stages) {

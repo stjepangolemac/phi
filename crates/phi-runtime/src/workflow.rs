@@ -379,4 +379,70 @@ mod tests {
         );
         tasks.shutdown().await;
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn workflow_scheduling_limits_parallelism_and_preserves_batch_barriers() {
+        if Command::new("node")
+            .arg("--version")
+            .output()
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let session = workspace.path().join(".phi/sessions/test");
+        fs::create_dir_all(&session).unwrap();
+        let mut plugins = HashMap::new();
+        plugins.insert(
+            "dynamic-workflows".into(),
+            root.join("policy/tools/dynamic-workflows"),
+        );
+        let tasks = WorkflowTasks::default();
+        let launched = tasks
+            .launch(
+                workspace.path(),
+                home.path(),
+                &session,
+                &plugins,
+                &json!({ "name": "scheduling-example" }),
+            )
+            .await
+            .unwrap();
+        let task_id = launched["task_id"].as_str().unwrap();
+        let output = tasks
+            .output(&session, &json!({ "task_id": task_id, "wait_ms": 10_000 }))
+            .await
+            .unwrap();
+        assert_eq!(output["status"], "completed");
+
+        let result = &output["result"]["value"];
+        assert_eq!(result["parallel"]["maximum"], 2);
+        assert_eq!(
+            result["parallel"]["results"],
+            json!(["p1", "p2", "p3", "p4"])
+        );
+        assert_eq!(result["batch"]["maximum"], 2);
+        assert_eq!(result["batch"]["results"], json!(["b1", "b2", "b3", "b4"]));
+
+        let batch_events = result["batch"]["events"].as_array().unwrap();
+        let first_batch_end = batch_events
+            .iter()
+            .position(|event| event == "end:b1")
+            .unwrap()
+            .max(
+                batch_events
+                    .iter()
+                    .position(|event| event == "end:b2")
+                    .unwrap(),
+            );
+        let second_batch_start = batch_events
+            .iter()
+            .position(|event| event == "start:b3")
+            .unwrap();
+        assert!(second_batch_start > first_batch_end);
+        tasks.shutdown().await;
+    }
 }
