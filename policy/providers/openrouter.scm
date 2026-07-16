@@ -35,7 +35,9 @@
                history)
           'tools (map responses-tool (hash-ref prompt 'tools))
           'tool_choice "auto"
-          'parallel_tool_calls #t
+          ;; Context tools mutate policy state and must be dispatched alone.
+          'parallel_tool_calls
+          (not (context-tools-available? (hash-ref prompt 'tools)))
           'reasoning (hash 'effort reasoning)
           'store #f
           'stream #t))

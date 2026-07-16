@@ -822,6 +822,7 @@ mod tests {
             matches!(&output.effects[0], Effect::HttpRequest { body, .. }
             if ["context_mark", "context_inspect", "context_compact"].iter().all(|name|
                 body["tools"].as_array().unwrap().iter().any(|tool| tool["name"] == *name))
+                && body["parallel_tool_calls"] == false
                 && body["instructions"].as_str().unwrap().contains(
                     "Use context_mark proactively after completing a substantial phase")
                 && body["tools"].as_array().unwrap().iter().any(|tool|
@@ -881,6 +882,29 @@ mod tests {
         assert_eq!(inspected["items"][0]["id"], "S1");
         assert_eq!(inspected["items"][1]["id"], "S2");
         assert!(inspected.get("messages").is_none());
+
+        let output = policy
+            .on_event(&response_call(
+                "context_inspect",
+                "inspect-2",
+                serde_json::json!({}),
+            ))
+            .unwrap();
+        assert!(
+            matches!(&output.effects[0], Effect::HttpRequest { body, .. }
+            if body["parallel_tool_calls"] == false)
+        );
+        let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
+        let inspect_results = state["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| {
+                message["kind"] == "tool_result"
+                    && matches!(message["call_id"].as_str(), Some("inspect-1" | "inspect-2"))
+            })
+            .count();
+        assert_eq!(inspect_results, 2);
     }
 
     #[test]
@@ -1066,6 +1090,7 @@ mod tests {
                 content: "x".repeat(32_000),
             })
             .unwrap();
+        assert_eq!(effect_body(&output)["parallel_tool_calls"], true);
         assert!(!effect_body(&output).to_string().contains(CONTEXT_NOTICE));
         assert_eq!(state_json(&policy)["next_context_notification"], 50.0);
     }

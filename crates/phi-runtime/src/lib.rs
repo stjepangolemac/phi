@@ -2816,6 +2816,7 @@ mod tests {
                 if body["model"] == "gpt-5.6-terra"
                     && body["reasoning"]["effort"] == "high"
                     && body["service_tier"] == "priority"
+                    && body["parallel_tool_calls"] == false
                     && body["prompt_cache_key"] == execution.session_id
                     && headers["session_id"] == execution.session_id
                     && body["tools"].as_array().unwrap().len() == 14

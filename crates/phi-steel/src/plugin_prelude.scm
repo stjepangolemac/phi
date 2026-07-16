@@ -131,6 +131,13 @@
       (equal? name "context_inspect")
       (equal? name "context_compact")))
 
+(define (context-tools-available? tools)
+  (cond
+    [(null? tools) #f]
+    [(and (hash-try-get (car tools) 'name)
+          (context-tool-name? (hash-ref (car tools) 'name))) #t]
+    [else (context-tools-available? (cdr tools))]))
+
 (define (context-runtime-id prefix number)
   (define raw (number->string number))
   (define length (string-length raw))
