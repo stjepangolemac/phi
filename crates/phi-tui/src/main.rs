@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Result;
@@ -113,6 +113,7 @@ struct App {
     compaction_started: Option<Instant>,
     tool_started: HashMap<String, (String, Instant)>,
     tool_blocks: HashMap<String, usize>,
+    workflow_names: HashMap<String, String>,
     shell_streams: HashMap<String, ShellStream>,
     final_response_rendered: bool,
     command_filter: Option<String>,
@@ -187,6 +188,7 @@ impl App {
             compaction_started: None,
             tool_started: HashMap::new(),
             tool_blocks: HashMap::new(),
+            workflow_names: HashMap::new(),
             shell_streams: HashMap::new(),
             final_response_rendered: false,
             command_filter: None,
@@ -532,6 +534,16 @@ impl App {
                     "load_skill" => skill_resource_label("Loading", &arguments),
                     "patch" => "Applying patch".into(),
                     "reload_config" => "Reloading configuration".into(),
+                    "Workflow" => format!(
+                        "Starting workflow `{}`",
+                        arguments["name"].as_str().unwrap_or("unknown")
+                    ),
+                    "TaskOutput" => {
+                        workflow_action_label("Checking", &arguments, &self.workflow_names)
+                    }
+                    "TaskStop" => {
+                        workflow_action_label("Stopping", &arguments, &self.workflow_names)
+                    }
                     _ => format!("Ran `{name}`"),
                 };
                 if matches!(name.as_str(), "exec_command" | "write_stdin") {
@@ -575,6 +587,13 @@ impl App {
                 name,
                 result,
             } => {
+                if name == "Workflow"
+                    && let (Some(task_id), Some(workflow)) =
+                        (result["task_id"].as_str(), result["workflow"].as_str())
+                {
+                    self.workflow_names
+                        .insert(task_id.to_owned(), workflow.to_owned());
+                }
                 let elapsed = self
                     .tool_started
                     .remove(&call_id)
@@ -670,6 +689,8 @@ impl App {
                                 result["commands"].as_u64().unwrap_or_default()
                             );
                         }
+                    } else if matches!(name.as_str(), "Workflow" | "TaskOutput" | "TaskStop") {
+                        *content = workflow_tool_result(&name, &result, elapsed);
                     } else {
                         let result = tool_result(&result);
                         if !result.is_empty() {
@@ -2058,6 +2079,125 @@ fn skill_resource_label(action: &str, value: &serde_json::Value) -> String {
     }
 }
 
+fn workflow_action_label(
+    action: &str,
+    arguments: &serde_json::Value,
+    names: &HashMap<String, String>,
+) -> String {
+    arguments["task_id"]
+        .as_str()
+        .and_then(|task_id| names.get(task_id))
+        .map_or_else(
+            || format!("{action} workflow"),
+            |workflow| format!("{action} workflow `{workflow}`"),
+        )
+}
+
+fn workflow_tool_result(name: &str, result: &serde_json::Value, elapsed: Duration) -> String {
+    if let Some(error) = result.get("error").and_then(serde_json::Value::as_str) {
+        let action = match name {
+            "Workflow" => "start",
+            "TaskOutput" => "check",
+            "TaskStop" => "stop",
+            _ => "run",
+        };
+        return format!(
+            "Failed to {action} workflow\n\n{}",
+            truncate_display(error, 2_000)
+        );
+    }
+
+    let workflow = result["workflow"]
+        .as_str()
+        .or_else(|| result["state"]["workflow"].as_str())
+        .unwrap_or("unknown");
+    match name {
+        "Workflow" => format!(
+            "Started workflow `{workflow}` · {}\n\nRunning in background",
+            human_duration(elapsed)
+        ),
+        "TaskOutput" => {
+            let status = result["status"].as_str().unwrap_or("unknown");
+            let duration = workflow_duration(result, elapsed);
+            let label = match status {
+                "pending" | "running" => "still running",
+                "completed" => "completed",
+                "failed" => "failed",
+                "cancelled" => "cancelled",
+                other => other,
+            };
+            let mut output = format!(
+                "Workflow `{workflow}` {label} · {}",
+                human_duration(duration)
+            );
+            let mut details = workflow_summary(result);
+            if status == "failed"
+                && let Some(error) = result["state"]["error"].as_str()
+            {
+                details.push(truncate_display(error, 2_000));
+            }
+            if !details.is_empty() {
+                output.push_str("\n\n");
+                output.push_str(&details.join("\n"));
+            }
+            output
+        }
+        "TaskStop" => match result["status"].as_str() {
+            Some("cancelled") => format!("Stopped workflow `{workflow}`"),
+            Some("not_running") => format!("Workflow `{workflow}` is not running"),
+            Some(status) => format!("Workflow `{workflow}`: {status}"),
+            None => format!("Stopped workflow `{workflow}`"),
+        },
+        _ => format!("Ran workflow `{workflow}`"),
+    }
+}
+
+fn workflow_duration(result: &serde_json::Value, fallback: Duration) -> Duration {
+    let Some(started) = result["state"]["startedAt"].as_u64() else {
+        return fallback;
+    };
+    let ended = result["state"]["completedAt"].as_u64().or_else(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+    });
+    ended
+        .and_then(|ended| ended.checked_sub(started))
+        .map(Duration::from_millis)
+        .unwrap_or(fallback)
+}
+
+fn workflow_summary(result: &serde_json::Value) -> Vec<String> {
+    let summary = &result["summary"];
+    let mut details = Vec::new();
+    if let Some(phase) = summary["phase"].as_str() {
+        details.push(format!("Phase: {phase}"));
+    }
+
+    let agents = &summary["agents"];
+    let running = agents["running"].as_u64().unwrap_or_default();
+    let completed = agents["completed"].as_u64().unwrap_or_default();
+    let failed = agents["failed"].as_u64().unwrap_or_default();
+    let mut counts = Vec::new();
+    if running > 0 {
+        counts.push(format!("{running} running"));
+    }
+    if completed > 0 {
+        counts.push(format!("{completed} completed"));
+    }
+    if failed > 0 {
+        counts.push(format!("{failed} failed"));
+    }
+    if !counts.is_empty() {
+        details.push(format!("Agents: {}", counts.join(" · ")));
+    }
+    if let Some(log) = summary["latestLog"].as_str() {
+        details.push(format!("Latest: {}", truncate_display(log, 500)));
+    }
+    details
+}
+
 fn tool_result(result: &serde_json::Value) -> String {
     if let Some(error) = result.get("error").and_then(serde_json::Value::as_str) {
         return truncate_display(error, 2_000);
@@ -3189,6 +3329,89 @@ mod tests {
             "Stopped background process · 0s\n\nSIGINT"
         );
         assert!(!app.transcript[0].1.contains('7'));
+    }
+
+    #[test]
+    fn renders_workflow_launch_with_its_name() {
+        let mut app = app();
+        app.on_runtime(RuntimeEvent::ToolStarted {
+            call_id: "workflow".into(),
+            name: "Workflow".into(),
+            arguments: serde_json::json!({ "name": "review" }),
+        });
+        assert_eq!(app.transcript[0].1, "Starting workflow `review`");
+
+        app.on_runtime(RuntimeEvent::ToolCompleted {
+            call_id: "workflow".into(),
+            name: "Workflow".into(),
+            result: serde_json::json!({
+                "workflow": "review",
+                "task_id": "task-1",
+                "status": "async_launched"
+            }),
+        });
+        assert_eq!(
+            app.transcript[0].1,
+            "Started workflow `review` · 0s\n\nRunning in background"
+        );
+
+        app.on_runtime(RuntimeEvent::ToolStarted {
+            call_id: "output".into(),
+            name: "TaskOutput".into(),
+            arguments: serde_json::json!({ "task_id": "task-1" }),
+        });
+        assert_eq!(app.transcript[1].1, "Checking workflow `review`");
+    }
+
+    #[test]
+    fn renders_running_workflow_phase_and_agent_progress() {
+        let rendered = workflow_tool_result(
+            "TaskOutput",
+            &serde_json::json!({
+                "workflow": "review",
+                "status": "running",
+                "state": {},
+                "summary": {
+                    "phase": "Reviewing tests",
+                    "latestLog": "Reviewed 4 of 10 files",
+                    "agents": {
+                        "started": 6,
+                        "running": 2,
+                        "completed": 4,
+                        "failed": 0
+                    }
+                }
+            }),
+            Duration::from_secs(15),
+        );
+        assert_eq!(
+            rendered,
+            "Workflow `review` still running · 15s\n\nPhase: Reviewing tests\nAgents: 2 running · 4 completed\nLatest: Reviewed 4 of 10 files"
+        );
+    }
+
+    #[test]
+    fn renders_completed_workflow_total_duration() {
+        let rendered = workflow_tool_result(
+            "TaskOutput",
+            &serde_json::json!({
+                "workflow": "review",
+                "status": "completed",
+                "state": {
+                    "startedAt": 1_000,
+                    "completedAt": 63_000
+                },
+                "summary": {
+                    "phase": "Final review",
+                    "agents": { "completed": 3 }
+                }
+            }),
+            Duration::ZERO,
+        );
+        assert_eq!(
+            rendered,
+            "Workflow `review` completed · 1m 2s\n\nPhase: Final review\nAgents: 3 completed"
+        );
     }
 
     #[test]

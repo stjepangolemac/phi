@@ -22,14 +22,14 @@
   (hash
     'name "TaskOutput"
     'description
-    "Inspect a workflow task. Optionally wait for completion or until the timeout expires."
+    "Inspect a workflow task. Use null for the 15-second default, another wait in milliseconds, or 0 to inspect immediately."
     'parameters
     (hash 'type "object"
           'properties
           (hash 'task_id (hash 'type "string")
                 'wait_ms
                 (hash 'type (list "integer" "null") 'minimum 0 'maximum 300000
-                      'description "Milliseconds to wait. Use null or 0 to inspect immediately."))
+                      'description "Milliseconds to wait. Use null for 15000 or 0 to inspect immediately."))
           'required (list "task_id" "wait_ms")
           'additionalProperties #f)))
 

@@ -2497,7 +2497,10 @@ mod tests {
                     && body["tools"].as_array().unwrap().iter()
                         .any(|tool| tool["name"] == "Workflow" && tool["strict"] == false)
                     && body["tools"].as_array().unwrap().iter()
-                        .any(|tool| tool["name"] == "TaskOutput")
+                        .any(|tool| tool["name"] == "TaskOutput"
+                            && tool["strict"] == true
+                            && tool["parameters"]["required"]
+                                == serde_json::json!(["task_id", "wait_ms"]))
                     && body["tools"].as_array().unwrap().iter()
                         .any(|tool| tool["name"] == "TaskStop")
                     && !body["tools"].as_array().unwrap().iter()

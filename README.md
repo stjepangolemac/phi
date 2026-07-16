@@ -166,7 +166,7 @@ export default async function ({ args }) {
 
 `agent(prompt, { label?, schema? })` starts a fresh one-shot Phi child in the same workspace and Phi home. Child agents run with `--yolo`; workflows are therefore trusted local code. A schema requests strict JSON-schema output and makes `agent()` return the parsed JSON value. The initial runtime limits are 8 concurrent agents, 32 agents total per workflow, and 60 minutes per workflow. Workflow task files, progress, logs, and results live under the parent session's `workflows/tasks/` directory. Background tasks live for the duration of the parent Phi process and are cancelled when it exits.
 
-`TaskOutput` waits up to 15 seconds by default before returning the current state. Workflows can be checked immediately with `wait_ms: 0` or with any model-selected wait up to 300 seconds. Its structured summary reports the active phase, latest workflow log, and running, completed, and failed agent counts so the TUI can show useful progress without dumping internal task paths or raw progress events.
+`TaskOutput` accepts required nullable `wait_ms`: `null` waits up to the 15-second default, `0` checks immediately, and an integer selects a wait up to 300 seconds. Its structured summary reports the active phase, latest workflow log, and running, completed, and failed agent counts so the TUI can show useful progress without dumping internal task paths or raw progress events.
 
 The public child-agent transport is one-request, line-framed JSON-RPC over stdio:
 

@@ -123,7 +123,7 @@ impl WorkflowTasks {
             .filter(|value| !value.is_null())
             .map(|value| value.as_u64().context("wait_ms must be an integer"))
             .transpose()?
-            .unwrap_or(0)
+            .unwrap_or(15_000)
             .min(300_000);
         let dir = self
             .tasks
@@ -142,11 +142,16 @@ impl WorkflowTasks {
             let status = state["status"].as_str().unwrap_or("unknown");
             if terminal(status) || Instant::now() >= deadline {
                 let result = read_optional_json(&dir.join("result.json"))?;
+                let request = read_optional_json(&dir.join("request.json"))?;
+                let summary = read_optional_json(&dir.join("summary.json"))?;
                 let progress = read_tail(&dir.join("progress.jsonl"), MAX_PROGRESS_BYTES)?;
                 return Ok(json!({
                     "task_id": task_id,
+                    "workflow": state["workflow"].as_str()
+                        .or_else(|| request["name"].as_str()),
                     "status": status,
                     "state": state,
+                    "summary": summary,
                     "result": result,
                     "progress": progress,
                 }));
@@ -167,9 +172,20 @@ impl WorkflowTasks {
             .as_ref()
             .map(|entry| entry.dir.clone())
             .unwrap_or_else(|| session_dir.join("workflows/tasks").join(task_id));
+        let request = read_optional_json(&dir.join("request.json"))?;
+        let state = read_optional_json(&dir.join("state.json"))?;
+        let workflow = request["name"]
+            .as_str()
+            .or_else(|| state["workflow"].as_str())
+            .map(str::to_owned);
+        let started_at = state["startedAt"].as_u64();
         let Some(entry) = entry else {
             if dir.join("state.json").is_file() {
-                return Ok(json!({ "task_id": task_id, "status": "not_running" }));
+                return Ok(json!({
+                    "task_id": task_id,
+                    "workflow": workflow.as_deref(),
+                    "status": "not_running"
+                }));
             }
             bail!("workflow task not found: {task_id}");
         };
@@ -178,7 +194,9 @@ impl WorkflowTasks {
             &dir.join("state.json"),
             &json!({
                 "taskId": task_id,
+                "workflow": workflow.as_deref(),
                 "status": "cancelled",
+                "startedAt": started_at,
                 "completedAt": now_ms()?,
             }),
         )?;
@@ -186,7 +204,11 @@ impl WorkflowTasks {
             .lock()
             .expect("workflow task registry poisoned")
             .remove(task_id);
-        Ok(json!({ "task_id": task_id, "status": "cancelled" }))
+        Ok(json!({
+            "task_id": task_id,
+            "workflow": workflow.as_deref(),
+            "status": "cancelled"
+        }))
     }
 
     pub async fn shutdown(&self) {
@@ -220,8 +242,10 @@ impl WorkflowTasks {
                     &entry.dir.join("state.json"),
                     &json!({
                         "taskId": task_id,
+                        "workflow": state["workflow"].as_str(),
                         "status": "failed",
                         "error": format!("workflow runner exited with {status}"),
+                        "startedAt": state["startedAt"].as_u64(),
                         "completedAt": now_ms()?,
                     }),
                 )?;
@@ -366,10 +390,11 @@ mod tests {
             .unwrap();
         let task_id = launched["task_id"].as_str().unwrap();
         let output = tasks
-            .output(&session, &json!({ "task_id": task_id, "wait_ms": 10_000 }))
+            .output(&session, &json!({ "task_id": task_id }))
             .await
             .unwrap();
         assert_eq!(output["status"], "completed");
+        assert_eq!(output["workflow"], "example");
         assert_eq!(output["result"]["value"], json!({ "ok": true }));
         assert!(
             output["progress"]
@@ -417,6 +442,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(output["status"], "completed");
+        assert_eq!(output["workflow"], "scheduling-example");
+        assert_eq!(output["summary"]["phase"], "Fixed-size batches");
+        assert_eq!(output["summary"]["latestLog"], "Batch tasks completed");
 
         let result = &output["result"]["value"];
         assert_eq!(result["parallel"]["maximum"], 2);

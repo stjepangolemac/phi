@@ -1,4 +1,4 @@
-import { batch, parallel } from "phi:workflow"
+import { batch, log, parallel, phase } from "phi:workflow"
 
 export const meta = {
   name: "scheduling-example",
@@ -30,6 +30,7 @@ function tracker() {
 }
 
 export default async function () {
+  phase("Limited parallelism")
   let releaseParallelFirst
   const parallelFirst = new Promise(resolve => { releaseParallelFirst = resolve })
   const parallelTracker = tracker()
@@ -39,7 +40,9 @@ export default async function () {
     parallelTracker.task("p3", null, releaseParallelFirst),
     parallelTracker.task("p4")
   ], { concurrency: 2 })
+  log("Parallel tasks completed")
 
+  phase("Fixed-size batches")
   let releaseBatchFirst
   const batchFirst = new Promise(resolve => { releaseBatchFirst = resolve })
   const batchTracker = tracker()
@@ -49,6 +52,7 @@ export default async function () {
     batchTracker.task("b3"),
     batchTracker.task("b4")
   ], { size: 2 })
+  log("Batch tasks completed")
 
   return {
     parallel: {

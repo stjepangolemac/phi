@@ -10,9 +10,15 @@ const request = JSON.parse(await readFile(requestPath, "utf8"))
 const taskDir = request.taskDir
 const statePath = join(taskDir, "state.json")
 const progressPath = join(taskDir, "progress.jsonl")
+const summaryPath = join(taskDir, "summary.json")
 const resultPath = join(taskDir, "result.json")
 const children = new Set()
 let progressQueue = Promise.resolve()
+const summary = {
+  phase: null,
+  latestLog: null,
+  agents: { started: 0, running: 0, completed: 0, failed: 0 }
+}
 
 async function atomicJson(path, value) {
   const temporary = `${path}.tmp`
@@ -22,6 +28,31 @@ async function atomicJson(path, value) {
 
 async function progress(event) {
   await appendFile(progressPath, JSON.stringify({ at: Date.now(), ...event }) + "\n")
+  let changed = false
+  if (typeof event.phase === "string" && event.phase.length > 0
+      && summary.phase !== event.phase) {
+    summary.phase = event.phase
+    changed = true
+  }
+  if (event.type === "log") {
+    summary.latestLog = event.message ?? null
+    changed = true
+  } else if (event.type === "agent_started") {
+    summary.agents.started += 1
+    summary.agents.running += 1
+    changed = true
+  } else if (event.type === "agent_completed") {
+    summary.agents.running = Math.max(0, summary.agents.running - 1)
+    summary.agents.completed += 1
+    changed = true
+  } else if (event.type === "agent_failed") {
+    summary.agents.running = Math.max(0, summary.agents.running - 1)
+    summary.agents.failed += 1
+    changed = true
+  }
+  if (changed) {
+    await atomicJson(summaryPath, { ...summary, updatedAt: Date.now() })
+  }
 }
 
 function enqueueProgress(event) {
@@ -82,6 +113,7 @@ await atomicJson(statePath, {
   status: "running",
   startedAt: request.startedAt
 })
+await atomicJson(summaryPath, summary)
 
 try {
   const sourcePath = await resolveWorkflow(request.name)
@@ -137,6 +169,7 @@ try {
     workflow: request.name,
     status: "failed",
     error: error?.stack ?? String(error),
+    startedAt: request.startedAt,
     completedAt: Date.now()
   })
   nodeProcess.exitCode = 1
