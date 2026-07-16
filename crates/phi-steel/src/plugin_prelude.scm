@@ -3,6 +3,7 @@
 (require-builtin steel/hash)
 
 (define command-registry '())
+(define skill-registry '())
 (define model-registry '())
 (define tool-registry '())
 (define plugin-tool-registry '())
@@ -20,6 +21,7 @@
 (define agent-instructions "")
 (define session-id "")
 (define runtime-config (hash))
+(define current-plugin "")
 
 (define (configure-runtime! encoded-config)
   (define config (string->jsexpr encoded-config))
@@ -33,6 +35,14 @@
 (define (register-command! spec handler)
   (set! command-registry
         (append command-registry (list (hash 'spec spec 'handler handler)))))
+
+(define (set-current-plugin! name) (set! current-plugin name))
+
+(define (register-skill! spec)
+  (if (equal? current-plugin "") (error! "skills must be registered by a plugin"))
+  (set! skill-registry
+        (append skill-registry
+                (list (hash-insert spec 'plugin current-plugin)))))
 
 (define (register-tool! builder)
   (set! plugin-tool-registry (append plugin-tool-registry (list builder))))
@@ -116,6 +126,8 @@
 
 (define (registered-command-specs)
   (map (lambda (entry) (hash-ref entry 'spec)) command-registry))
+
+(define (registered-skills) skill-registry)
 
 (define (registered-models) model-registry)
 (define (runtime-config-value name fallback)

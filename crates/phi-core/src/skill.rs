@@ -27,8 +27,9 @@ pub fn discover(
     system_root: &Path,
     personal_root: &Path,
     workspace: &Path,
+    plugin_roots: &[PathBuf],
 ) -> Result<Vec<SkillSpec>> {
-    Ok(index(system_root, personal_root, workspace)?
+    Ok(index(system_root, personal_root, workspace, plugin_roots)?
         .into_values()
         .map(|skill| skill.spec)
         .collect())
@@ -37,6 +38,7 @@ pub fn discover(
 pub struct LoadSkill {
     pub system_root: PathBuf,
     pub personal_root: PathBuf,
+    pub plugin_roots: Vec<PathBuf>,
 }
 
 impl Tool for LoadSkill {
@@ -65,7 +67,12 @@ impl Tool for LoadSkill {
             .get("path")
             .and_then(Value::as_str)
             .unwrap_or("SKILL.md");
-        let skills = index(&self.system_root, &self.personal_root, workspace)?;
+        let skills = index(
+            &self.system_root,
+            &self.personal_root,
+            workspace,
+            &self.plugin_roots,
+        )?;
         let skill = skills
             .get(name)
             .with_context(|| format!("skill not found: {name}"))?;
@@ -92,12 +99,31 @@ fn index(
     system_root: &Path,
     personal_root: &Path,
     workspace: &Path,
+    plugin_roots: &[PathBuf],
 ) -> Result<BTreeMap<String, Skill>> {
     let mut skills = BTreeMap::new();
+    for root in plugin_roots {
+        add_skill(&mut skills, root)?;
+    }
     add_root(&mut skills, personal_root)?;
     add_root(&mut skills, &workspace.join(".phi/skills"))?;
     add_root(&mut skills, system_root)?;
     Ok(skills)
+}
+
+fn add_skill(skills: &mut BTreeMap<String, Skill>, root: &Path) -> Result<()> {
+    let root = fs::canonicalize(root)?;
+    let source = root.join("SKILL.md");
+    if !source.is_file() {
+        bail!("registered skill is missing SKILL.md: {}", root.display());
+    }
+    let spec = parse_metadata(&fs::read_to_string(&source)?)
+        .with_context(|| format!("read skill metadata from {}", source.display()))?;
+    if skills.contains_key(&spec.name) {
+        bail!("duplicate registered plugin skill: {}", spec.name);
+    }
+    skills.insert(spec.name.clone(), Skill { spec, root });
+    Ok(())
 }
 
 fn add_root(skills: &mut BTreeMap<String, Skill>, root: &Path) -> Result<()> {
@@ -230,7 +256,7 @@ mod tests {
         );
 
         assert_eq!(
-            discover(&system, &personal, &workspace).unwrap(),
+            discover(&system, &personal, &workspace, &[]).unwrap(),
             vec![SkillSpec {
                 name: "review".into(),
                 description: "Workspace review.".into(),
@@ -241,6 +267,7 @@ mod tests {
         registry.register_hidden(LoadSkill {
             system_root: system,
             personal_root: personal,
+            plugin_roots: Vec::new(),
         });
         let result = registry
             .execute(
@@ -264,6 +291,7 @@ mod tests {
         let tool = LoadSkill {
             system_root: system,
             personal_root: personal,
+            plugin_roots: Vec::new(),
         };
         assert!(
             tool.execute(&workspace, json!({ "name": "review", "path": "../secret" }),)
@@ -288,10 +316,29 @@ mod tests {
         );
 
         assert_eq!(
-            discover(&system, &personal, &workspace).unwrap(),
+            discover(&system, &personal, &workspace, &[]).unwrap(),
             vec![SkillSpec {
                 name: "phi-harness".into(),
                 description: "System manual.".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn personal_skills_override_registered_plugin_skills() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin = temp.path().join("plugin-skill");
+        let personal = temp.path().join("personal");
+        let system = temp.path().join("system");
+        let workspace = temp.path().join("workspace");
+        skill(temp.path(), "plugin-skill", "review", "Plugin review.");
+        skill(&personal, "review", "review", "Personal review.");
+
+        assert_eq!(
+            discover(&system, &personal, &workspace, &[plugin]).unwrap(),
+            vec![SkillSpec {
+                name: "review".into(),
+                description: "Personal review.".into(),
             }]
         );
     }

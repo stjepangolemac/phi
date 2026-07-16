@@ -7,9 +7,12 @@ phi status
 phi --json status
 phi doctor
 phi check-config
+phi update-plugins
 ```
 
 `status` reports the resolved composition and active `config.scm`. `doctor` checks installation health. `check-config` validates and smoke-replays the live configuration.
+
+Phi checks official and installed plugin sources on startup. Run `/update-plugins` in the TUI or `phi update-plugins` in the shell when an update notice appears, then `/reload` to adopt updated plugins in the current conversation.
 
 Direct file reads and edits normally allow the workspace and Phi home. Writes still require approval. `phi --yolo` removes approval and filesystem boundaries.
 

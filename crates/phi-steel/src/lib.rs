@@ -46,6 +46,12 @@ pub struct CompositionStatus {
     pub compactor: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RegisteredSkill {
+    pub plugin: String,
+    pub path: String,
+}
+
 const PLUGIN_PRELUDE: &str = include_str!("plugin_prelude.scm");
 
 impl Policy {
@@ -65,13 +71,7 @@ impl Policy {
         state: Option<String>,
     ) -> Result<Self> {
         let mut vm = Engine::new_sandboxed();
-        let mut source = String::from(PLUGIN_PRELUDE);
-        for plugin in plugins {
-            source.push('\n');
-            source.push_str(&fs::read_to_string(plugin)?);
-        }
-        source.push('\n');
-        source.push_str(&fs::read_to_string(config_file)?);
+        let source = policy_source(config_file, plugins)?;
         vm.compile_and_run_raw_program(source)
             .context("load Steel policy")?;
         eval_string(
@@ -112,6 +112,14 @@ impl Policy {
             &mut self.vm,
             &json_invocation("registered-command-specs", []),
             "decode plugin commands",
+        )
+    }
+
+    pub fn registered_skills(&mut self) -> Result<Vec<RegisteredSkill>> {
+        eval_json(
+            &mut self.vm,
+            &json_invocation("registered-skills", []),
+            "decode registered skills",
         )
     }
 
@@ -226,6 +234,47 @@ impl Policy {
         self.state = serde_json::to_string(&output.state)?;
         Ok(output.content)
     }
+}
+
+pub fn plugin_skills(config: &Path, plugins: &[PathBuf]) -> Result<Vec<RegisteredSkill>> {
+    let mut vm = Engine::new_sandboxed();
+    vm.compile_and_run_raw_program(policy_source(config, plugins)?)
+        .context("load Steel policy for skill discovery")?;
+    eval_json(
+        &mut vm,
+        &json_invocation("registered-skills", []),
+        "decode registered skills",
+    )
+}
+
+fn policy_source(config: &Path, plugins: &[PathBuf]) -> Result<String> {
+    let mut source = String::from(PLUGIN_PRELUDE);
+    for plugin in plugins {
+        source.push('\n');
+        source.push_str(&format!(
+            "(set-current-plugin! {})\n",
+            scheme_string(&plugin_name(plugin)?)
+        ));
+        source.push_str(&fs::read_to_string(plugin)?);
+    }
+    source.push_str("\n(set-current-plugin! \"\")\n");
+    source.push_str(&fs::read_to_string(config)?);
+    Ok(source)
+}
+
+fn plugin_name(entrypoint: &Path) -> Result<String> {
+    let manifest = entrypoint.parent().map(|root| root.join("plugin.json"));
+    if let Some(manifest) = manifest.filter(|path| path.is_file()) {
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(manifest)?)?;
+        if let Some(name) = value.get("name").and_then(|value| value.as_str()) {
+            return Ok(name.to_owned());
+        }
+    }
+    Ok(entrypoint
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .context("plugin entrypoint has no file stem")?
+        .to_owned())
 }
 
 pub fn composition_plugins(config: &Path) -> Result<Vec<String>> {
@@ -491,6 +540,33 @@ mod tests {
         assert_eq!(
             composition_plugins(&config).unwrap(),
             vec!["first".to_owned(), "second".to_owned()]
+        );
+    }
+
+    #[test]
+    fn plugins_register_package_relative_skills() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugin = temp.path().join("example");
+        fs::create_dir_all(&plugin).unwrap();
+        fs::write(
+            plugin.join("plugin.json"),
+            r#"{"name":"example","version":"0.1.0","entrypoint":"main.scm"}"#,
+        )
+        .unwrap();
+        fs::write(
+            plugin.join("main.scm"),
+            r#"(register-skill! (hash 'path "skills/review"))"#,
+        )
+        .unwrap();
+        let config = temp.path().join("config.scm");
+        fs::write(&config, "").unwrap();
+
+        assert_eq!(
+            plugin_skills(&config, &[plugin.join("main.scm")]).unwrap(),
+            vec![RegisteredSkill {
+                plugin: "example".into(),
+                path: "skills/review".into(),
+            }]
         );
     }
 

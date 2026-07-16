@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use include_dir::{Dir, DirEntry, include_dir};
 use phi_protocol::{Effect, Event, StreamRule, ToolCall, ToolExecution, ToolResult};
 use serde::{Deserialize, Serialize};
 use similar::TextDiff;
@@ -210,22 +211,7 @@ const DEFAULT_CONFIG: &str = r#"{
 }"#;
 
 const DEFAULT_SCHEME_CONFIG: &str = include_str!("../../../config.scm");
-const OFFICIAL_PLUGINS: &[(&str, &str)] = &[
-    ("responses", "policy/providers/responses.scm"),
-    ("openai", "policy/providers/openai.scm"),
-    ("openrouter", "policy/providers/openrouter.scm"),
-    ("openai-web-search", "policy/tools/openai-web-search.scm"),
-    (
-        "openrouter-web-search",
-        "policy/tools/openrouter-web-search.scm",
-    ),
-    ("skills", "policy/tools/skills.scm"),
-    ("dynamic-workflows", "policy/tools/dynamic-workflows"),
-    ("codex-patch", "policy/tools/codex-patch.scm"),
-    ("simple-prompt", "policy/prompts/simple.scm"),
-    ("simple-compaction", "policy/compaction/simple.scm"),
-    ("compaction-structured", "policy/compaction/structured.scm"),
-];
+static BUNDLED_POLICY: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../policy");
 const PHI_HARNESS_SKILL: &[(&str, &str)] = &[
     (
         "SKILL.md",
@@ -273,9 +259,13 @@ pub fn initialize_at(home: &phi_core::home::PhiHome) -> Result<()> {
 "#,
     )?;
     write_if_missing(&home.plugin_lock(), "{\n  \"plugins\": []\n}\n")?;
-    let repository = repository_root();
-    for (name, relative) in OFFICIAL_PLUGINS {
-        copy_official_plugin(home, &repository, name, relative)?;
+    let official = phi_core::plugin::official_catalog()?;
+    for plugin in &official.plugins {
+        copy_official_plugin(home, &plugin.name, &plugin.version, &plugin.path)?;
+    }
+    let commit = env!("PHI_BUILD_COMMIT");
+    if !commit.is_empty() {
+        phi_core::plugin::write_official_state(home, commit)?;
     }
     for (relative, content) in PHI_HARNESS_SKILL {
         write_bundled(
@@ -286,44 +276,63 @@ pub fn initialize_at(home: &phi_core::home::PhiHome) -> Result<()> {
     Ok(())
 }
 
-fn repository_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
 fn copy_official_plugin(
     home: &phi_core::home::PhiHome,
-    repository: &Path,
     name: &str,
+    version: &str,
     relative: &str,
 ) -> Result<()> {
-    let source = repository.join(relative);
-    if !source.exists() {
-        bail!(
-            "official plugin source is missing: {} (the repository used to install phi must remain available)",
-            source.display()
-        );
-    }
+    let relative = relative.strip_prefix("policy/").unwrap_or(relative);
     let plugin = home.builtins().join("plugins").join(name);
-    if source.is_dir() {
+    if let Some(source) = BUNDLED_POLICY.get_dir(relative) {
         if plugin.exists() {
             std::fs::remove_dir_all(&plugin)?;
         }
-        return phi_core::copy_package_tree(&source, &plugin, phi_core::SymlinkPolicy::Follow);
+        extract_bundled_dir(source, &plugin)?;
+        return Ok(());
     }
+    let source = BUNDLED_POLICY
+        .get_file(relative)
+        .with_context(|| format!("official plugin source is missing: policy/{relative}"))?;
     write_bundled(
         &plugin.join("plugin.json"),
         &serde_json::to_string_pretty(&serde_json::json!({
             "name": name,
-            "version": env!("CARGO_PKG_VERSION"),
+            "version": version,
             "entrypoint": "main.scm"
         }))?,
     )?;
     if let Some(parent) = plugin.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::copy(&source, plugin.join("main.scm"))
-        .with_context(|| format!("copy official plugin {name} from {}", source.display()))?;
+    std::fs::write(plugin.join("main.scm"), source.contents())
+        .with_context(|| format!("copy official plugin {name}"))?;
     Ok(())
+}
+
+fn extract_bundled_dir(source: &Dir<'_>, target: &Path) -> Result<()> {
+    fn extract(base: &Path, directory: &Dir<'_>, target: &Path) -> Result<()> {
+        for entry in directory.entries() {
+            let relative = entry.path().strip_prefix(base)?;
+            let path = target.join(relative);
+            match entry {
+                DirEntry::Dir(directory) => {
+                    std::fs::create_dir_all(&path)?;
+                    extract(base, directory, target)?;
+                }
+                DirEntry::File(file) => {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(path, file.contents())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    std::fs::create_dir_all(target)?;
+    extract(source.path(), source, target)
 }
 
 fn write_bundled(path: &Path, content: &str) -> Result<()> {
@@ -412,6 +421,34 @@ fn entrypoints(sources: &phi_core::session::ComposedSources) -> Vec<PathBuf> {
         .collect()
 }
 
+fn plugin_skill_roots(sources: &phi_core::session::ComposedSources) -> Result<Vec<PathBuf>> {
+    let registrations = phi_steel::plugin_skills(&sources.config, &entrypoints(sources))?;
+    let mut roots = Vec::new();
+    for registration in registrations {
+        let plugin = sources
+            .plugins
+            .iter()
+            .find(|plugin| plugin.name == registration.plugin)
+            .with_context(|| {
+                format!(
+                    "skill registered by unknown plugin: {}",
+                    registration.plugin
+                )
+            })?;
+        let package = plugin.root.canonicalize()?;
+        let root = package.join(&registration.path).canonicalize()?;
+        if !root.starts_with(&package) || !root.join("SKILL.md").is_file() {
+            bail!(
+                "plugin skill path is invalid: {}/{}",
+                registration.plugin,
+                registration.path
+            );
+        }
+        roots.push(root);
+    }
+    Ok(roots)
+}
+
 struct ResolvedPolicySources {
     sources: phi_core::session::ComposedSources,
     saved_state: Option<String>,
@@ -498,8 +535,13 @@ fn build_policy(
     session_id: &str,
     output_schema: Option<&serde_json::Value>,
 ) -> Result<PolicyBootstrap> {
-    let capabilities = Arc::new(capabilities(home, full_access));
-    let skills = discover_skills(home, workspace)?;
+    let plugin_skills = plugin_skill_roots(sources)?;
+    let capabilities = Arc::new(capabilities_with_plugin_skills(
+        home,
+        full_access,
+        plugin_skills.clone(),
+    ));
+    let skills = discover_skills_with_plugins(home, workspace, &plugin_skills)?;
     let policy = phi_steel::Policy::load_with_state(
         &sources.config,
         &entrypoints(sources),
@@ -690,6 +732,36 @@ pub fn execute_command(
             action: CommandAction::Display,
         });
     }
+    if invocation.name == "update-plugins" {
+        if !invocation.arguments.is_empty() {
+            bail!("usage: /update-plugins");
+        }
+        let updated = phi_core::plugin::update_all(&home)?;
+        for plugin in &updated {
+            let installed = phi_core::plugin::installed(&home, &plugin.name)?;
+            phi_steel::check_plugin(&installed.root.join(installed.manifest.entrypoint))?;
+        }
+        let mut bootstrap = build_policy(
+            &home,
+            &workspace,
+            &resolved.sources,
+            resolved.saved_state,
+            options.full_access,
+            resolved.session.id(),
+            None,
+        )?;
+        resolved.session.save_state(bootstrap.policy.state())?;
+        return Ok(CommandExecution {
+            session_id: resolved.session.id().into(),
+            content: format!(
+                "Updated {} plugins. Run /reload to use them in this conversation.",
+                updated.len()
+            ),
+            role: "note".into(),
+            catalog: catalog(&mut bootstrap.policy)?,
+            action: CommandAction::Display,
+        });
+    }
     let mut bootstrap = build_policy(
         &home,
         &workspace,
@@ -792,6 +864,12 @@ fn catalog(policy: &mut phi_steel::Policy) -> Result<CommandCatalog> {
             description: "Stop all background processes.".into(),
             source: "core".into(),
         },
+        CommandSpec {
+            name: "update-plugins".into(),
+            usage: "/update-plugins".into(),
+            description: "Update official and installed plugins.".into(),
+            source: "core".into(),
+        },
     ];
     commands.extend(policy.commands()?);
     let mut names = HashSet::new();
@@ -858,6 +936,27 @@ fn catalog(policy: &mut phi_steel::Policy) -> Result<CommandCatalog> {
         selected_reasoning,
         selected_service_tier,
     })
+}
+
+pub fn plugin_update_notice(options: &RunOptions) -> Option<String> {
+    let home = home_for_config(&options.config_path).ok()?;
+    match phi_core::plugin::check_updates(&home) {
+        Ok(report) if !report.updates.is_empty() => Some(format!(
+            "{} plugin update{} available. Run /update-plugins.",
+            report.updates.len(),
+            if report.updates.len() == 1 {
+                " is"
+            } else {
+                "s are"
+            }
+        )),
+        Ok(report) if !report.warnings.is_empty() => Some(format!(
+            "Plugin update check could not reach {} source{}.",
+            report.warnings.len(),
+            if report.warnings.len() == 1 { "" } else { "s" }
+        )),
+        _ => None,
+    }
 }
 
 fn valid_name(name: &str) -> bool {
@@ -1044,9 +1143,18 @@ fn policy_config_with_schema(
     value.to_string()
 }
 
+#[cfg(test)]
 fn capabilities(
     home: &phi_core::home::PhiHome,
     full_access: bool,
+) -> phi_core::capability::Registry {
+    capabilities_with_plugin_skills(home, full_access, Vec::new())
+}
+
+fn capabilities_with_plugin_skills(
+    home: &phi_core::home::PhiHome,
+    full_access: bool,
+    plugin_roots: Vec<PathBuf>,
 ) -> phi_core::capability::Registry {
     let mut capabilities = phi_core::capability::Registry::default();
     capabilities.register(phi_core::capability::ReadFile {
@@ -1056,15 +1164,30 @@ fn capabilities(
     capabilities.register_hidden(phi_core::skill::LoadSkill {
         system_root: home.builtin_skills(),
         personal_root: home.skills(),
+        plugin_roots,
     });
     capabilities
 }
 
+#[cfg(test)]
 fn discover_skills(
     home: &phi_core::home::PhiHome,
     workspace: &Path,
 ) -> Result<Vec<phi_core::skill::SkillSpec>> {
-    phi_core::skill::discover(&home.builtin_skills(), &home.skills(), workspace)
+    discover_skills_with_plugins(home, workspace, &[])
+}
+
+fn discover_skills_with_plugins(
+    home: &phi_core::home::PhiHome,
+    workspace: &Path,
+    plugin_roots: &[PathBuf],
+) -> Result<Vec<phi_core::skill::SkillSpec>> {
+    phi_core::skill::discover(
+        &home.builtin_skills(),
+        &home.skills(),
+        workspace,
+        plugin_roots,
+    )
 }
 
 pub fn start(options: RunOptions, prompt: String) -> Handle {
@@ -2517,6 +2640,7 @@ mod tests {
         .unwrap();
         assert!(execution.content.contains("- review: Review code."));
         assert!(execution.content.contains("- phi-harness:"));
+        assert!(execution.content.contains("- dynamic-workflows:"));
     }
 
     #[test]
@@ -3074,7 +3198,7 @@ mod tests {
                 let session = phi_core::session::Session::create_composed(
                     &workspace.path().join(".phi/sessions"),
                     &sources.config,
-                                        &sources.plugins,
+                    &sources.plugins,
                 )
                 .unwrap();
                 let registry = Arc::new(capabilities(&home, false));
@@ -3174,7 +3298,10 @@ mod tests {
         initialize_at(&home).unwrap();
         assert_eq!(
             std::fs::read_to_string(home.builtins().join("plugins/responses/main.scm")).unwrap(),
-            std::fs::read_to_string(repository_root().join("policy/providers/responses.scm"))
+            BUNDLED_POLICY
+                .get_file("providers/responses.scm")
+                .unwrap()
+                .contents_utf8()
                 .unwrap()
         );
         assert_eq!(
@@ -3183,7 +3310,10 @@ mod tests {
                     .join("plugins/compaction-structured/main.scm")
             )
             .unwrap(),
-            std::fs::read_to_string(repository_root().join("policy/compaction/structured.scm"))
+            BUNDLED_POLICY
+                .get_file("compaction/structured.scm")
+                .unwrap()
+                .contents_utf8()
                 .unwrap()
         );
         assert_eq!(
@@ -3193,6 +3323,16 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(home.builtin_skills().join("phi-harness/SKILL.md")).unwrap(),
             PHI_HARNESS_SKILL[0].1
+        );
+        assert!(
+            phi_core::plugin::read_lock(&home)
+                .unwrap()
+                .plugins
+                .is_empty()
+        );
+        assert_eq!(
+            phi_core::plugin::official_catalog().unwrap().plugins.len(),
+            11
         );
     }
 }

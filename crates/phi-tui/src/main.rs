@@ -1149,7 +1149,12 @@ impl App {
 
 pub async fn launch(options: RunOptions, prompt: Option<String>) -> Result<()> {
     let catalog = phi_runtime::command_catalog(&options)?;
+    let update_notice = phi_runtime::plugin_update_notice(&options);
     let mut app = App::new(options, catalog);
+    if let Some(notice) = update_notice {
+        app.transcript.push(("note".into(), notice));
+        app.transcript_cache.push(None);
+    }
     if let Some(prompt) = prompt {
         app.composer.set(prompt);
         app.submit();

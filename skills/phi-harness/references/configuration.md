@@ -12,7 +12,7 @@ Run `phi --json status` first to see the resolved composition and active configu
 - `plugins.lock.json`: Git sources and resolved commits.
 - `plugins/`: immutable installed plugin packages.
 - `skills/`: manually copied personal skills.
-- `builtins/<version>/`: official plugins copied from the build repository during home initialization, plus bundled system skills.
+- `builtins/<version>/`: the official plugin snapshot embedded in that Phi build, plus bundled system skills.
 
 Never put secret values in `config.scm`, plugin configuration, status output, or the repository. Secret handles in `config.json` point to separate files.
 
@@ -22,6 +22,8 @@ Do not edit installed or official plugin files to reconfigure Phi. All provider,
 
 - `.phi/skills/`: workspace skills; these override personal skills with the same name.
 - `.phi/sessions/`: session state and exact composition snapshots.
+
+Loaded plugins may register package-relative skills. Skill precedence is protected system skills, workspace skills, personal skills, then plugin skills.
 
 ## Reload behavior
 

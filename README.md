@@ -42,7 +42,7 @@ Phi keeps behavior in Scheme and data in JSON:
   plugins.lock.json    # Git sources and exact commits
   plugins/             # immutable installed plugin revisions
   skills/              # manually copied personal skills
-  builtins/<version>/  # official plugins copied from the install repository, plus system skills
+  builtins/<version>/  # official plugins embedded in this Phi build, plus system skills
 ```
 
 `config.scm` is the sole mutable Scheme configuration root:
@@ -112,7 +112,7 @@ Provider-neutral prompts contain `instructions`, `messages`, and `tools`; compac
 
 After changing `config.scm` or `config.json`, use `/reload`. The agent can call `reload_config` after reconfiguring itself. Reload validates the live composition, replaces the current session snapshot, and updates the catalog without discarding the conversation.
 
-Installed and official plugin files are implementation packages, not runtime configuration. For the current path-based Cargo installation, Phi copies official plugin sources from the repository used to build it into `~/.phi/builtins/<version>/` during home initialization; plugin source text is not embedded in the binary. The source repository must therefore remain at its build-time path. Configure providers, models, tools, prompts, compaction, and agent behavior only in the `config.scm` reported by `phi --json status`. If a plugin lacks a needed setting, extend its configuration interface instead of patching an installed copy.
+Installed and official plugin files are implementation packages, not runtime configuration. Phi embeds the official plugin snapshot and copies it into `~/.phi/builtins/<version>/` during home initialization, so the build checkout does not need to remain available. Configure providers, models, tools, prompts, compaction, and agent behavior only in the `config.scm` reported by `phi --json status`. If a plugin lacks a needed setting, extend its configuration interface instead of patching an installed copy.
 
 Tool implementations declare model compatibility. The configuration above prefers search hosted by the selected model's provider route, then explicitly falls back to a separate OpenAI search request. Put an OpenRouter key in `~/.phi/secrets/openrouter.json` as `{"api_key":"..."}` before selecting an `openrouter/...` model.
 
@@ -126,7 +126,7 @@ Copy standard `SKILL.md` directories into `~/.phi/skills/` for personal use or `
   references/
 ```
 
-Workspace skills override personal skills with the same frontmatter name. Phi initially exposes only names and descriptions; the official `skills` plugin loads `SKILL.md` or a referenced file when needed. Use `/skills` to list discovered skills or mention `$skill-name` to request one explicitly.
+Loaded plugins can register package-relative skill directories with `(register-skill! (hash 'path "skills/NAME"))`. Plugin skills have the lowest precedence, followed by personal and workspace skills; protected Phi system skills have the highest precedence. Phi initially exposes only names and descriptions, and the official `skills` plugin loads `SKILL.md` or a referenced file when needed. Use `/skills` to list discovered skills or mention `$skill-name` to request one explicitly.
 
 Phi also bundles an authoritative `phi-harness` skill describing its architecture, configuration, extension points, and operations. The agent loads it before inspecting or reconfiguring the harness. Use `phi status` for the human-readable active composition or `phi --json status` for machine-readable output.
 
@@ -197,11 +197,14 @@ phi plugin check example
 phi plugin update example --rev NEW_TAG_OR_COMMIT
 phi plugin sync
 phi plugin remove example
+phi update-plugins
 ```
 
 Installation records the resolved commit but does not activate the plugin. Add `(load-plugin! "example")` to `~/.phi/config.scm` and compose its registered behavior there.
 
-Plugins have no package-level type. Their entrypoints may register providers and models, prompt builders, compactors, or slash commands. The registration functions enforce the contract of each extension point.
+Plugins have no package-level type. Their entrypoints may register providers and models, tools, skills, prompt builders, compactors, file editors, or slash commands. Registered skill paths are contained within the plugin package. The registration functions enforce the contract of each extension point.
+
+Fresh Phi homes have an empty `plugins.lock.json`; the official plugins listed with versions in `official-plugins.json` are available from the embedded build snapshot. On startup Phi compares that snapshot and installed Git plugins with their configured sources. When updates are available the TUI suggests `/update-plugins`. Both `/update-plugins` and `phi update-plugins` resolve the official `latest` channel from the public repository's `main` branch, install exact commits, and retain those commits in the lock file. Existing sessions keep their snapshotted plugin sources until `/reload` or a new conversation.
 
 ## Optional features
 

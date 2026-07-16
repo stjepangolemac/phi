@@ -55,6 +55,8 @@ enum Command {
         #[command(subcommand)]
         command: PluginCommand,
     },
+    /// Update official and installed plugins from their configured sources.
+    UpdatePlugins,
     CheckConfig,
 }
 
@@ -175,6 +177,7 @@ async fn run() -> Result<()> {
                 )
             }
             Some(Command::Plugin { command }) => plugin(&home, command),
+            Some(Command::UpdatePlugins) => update_plugins(&home),
             Some(Command::CheckConfig) => {
                 phi_runtime::check_scheme_config(&home, &workspace)?;
                 println!("config ok");
@@ -186,6 +189,16 @@ async fn run() -> Result<()> {
     workflows.shutdown().await;
     processes.shutdown().await;
     result
+}
+
+fn update_plugins(home: &phi_core::home::PhiHome) -> Result<()> {
+    let updated = phi_core::plugin::update_all(home)?;
+    for plugin in &updated {
+        let installed = phi_core::plugin::installed(home, &plugin.name)?;
+        phi_steel::check_plugin(&installed.root.join(installed.manifest.entrypoint))?;
+    }
+    println!("updated {} plugins", updated.len());
+    Ok(())
 }
 
 async fn run_rpc(mut options: phi_runtime::RunOptions) -> Result<()> {
@@ -299,8 +312,24 @@ fn plugin(home: &phi_core::home::PhiHome, command: PluginCommand) -> Result<()> 
             println!("removed {name}");
         }
         PluginCommand::List => {
-            for plugin in phi_core::plugin::read_lock(home)?.plugins {
-                println!("{} {} {}", plugin.name, plugin.commit, plugin.url);
+            let lock = phi_core::plugin::read_lock(home)?;
+            for plugin in phi_core::plugin::official_catalog()?.plugins {
+                if let Some(locked) = lock.plugins.iter().find(|item| item.name == plugin.name) {
+                    let version = phi_core::plugin::installed(home, &plugin.name)?
+                        .manifest
+                        .version;
+                    println!("{} {} installed {}", plugin.name, version, locked.commit);
+                } else {
+                    println!("{} {} bundled", plugin.name, plugin.version);
+                }
+            }
+            let official = phi_core::plugin::official_catalog()?;
+            for plugin in lock
+                .plugins
+                .iter()
+                .filter(|plugin| !official.plugins.iter().any(|item| item.name == plugin.name))
+            {
+                println!("{} {} installed {}", plugin.name, plugin.commit, plugin.url);
             }
         }
         PluginCommand::Check { name } => {

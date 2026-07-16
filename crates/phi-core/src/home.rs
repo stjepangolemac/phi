@@ -49,4 +49,8 @@ impl PhiHome {
     pub fn builtin_skills(&self) -> PathBuf {
         self.builtins().join("skills")
     }
+
+    pub fn official_plugin_state(&self) -> PathBuf {
+        self.builtins().join("official-plugins-state.json")
+    }
 }

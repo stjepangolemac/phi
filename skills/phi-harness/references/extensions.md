@@ -14,7 +14,7 @@ Add model registrations and all provider or tool configuration to this compositi
 - File editors define the model-facing edit format and matching policy; Rust verifies revisions and writes files.
 - Hosted and callable tools declare compatible provider/model routes.
 - Slash commands register local user operations.
-- Skills expose metadata first and load Markdown resources progressively.
+- Skills expose metadata first and load Markdown resources progressively. Plugins register a package-relative skill directory with `(register-skill! (hash 'path "skills/NAME"))`.
 
 Provider-neutral prompts contain `instructions`, `messages`, and `tools`. A compactor may add `output_schema`; Responses-compatible providers map it to strict JSON-schema output.
 
@@ -29,13 +29,7 @@ Prefer Steel for configurable behavior. Add Rust only for trusted effects, conta
 
 The bundled `codex-patch` editor accepts locator text on an `@@` line or as a context-only hunk before a later changing hunk. Repeated plain update sections for one file run sequentially as one atomic edit. Each update must contain at least one syntactic change and must change file content or destination. Matching errors identify the file and hunk.
 
-## Dynamic workflows
-
-The official `dynamic-workflows` plugin keeps orchestration in named JavaScript modules while Rust owns background process lifecycle and the public one-shot agent transport. Workflows are discovered from `.phi/workflows/NAME.js`, `~/.phi/workflows/NAME.js`, then `workflows/NAME.js` in loaded plugins.
-
-Workflow modules export `meta` with `name` and `description`, plus a default async `({ args }) => value` function. They may import `agent`, `parallel`, `batch`, `pipeline`, `phase`, `log`, and `budget` from `phi:workflow`. `parallel(tasks, { concurrency? })` runs task functions with an optional continuously replenished concurrency limit. `batch(tasks, { size })` runs fixed-size waves and waits for each wave before starting the next. `agent(prompt, { label?, schema? })` launches a fresh `phi --workspace WORKSPACE --yolo rpc` child. Limits are 8 concurrent agents, 32 total agents, and 60 minutes. The model launches and manages workflows through `Workflow`, `TaskOutput`, and `TaskStop`; task state is stored under the parent session. `TaskOutput` requires nullable `wait_ms`: `null` uses the 15-second default, `0` checks immediately, and an integer selects a wait up to 300 seconds. It returns a summary containing the active phase, latest log, and agent counts.
-
-`phi rpc` accepts one line-framed JSON-RPC 2.0 `agent.run` request on stdin. Params contain `prompt` and optional `schema`; stdout contains `agent.event` notifications followed by a result with `value` and `sessionId`, or a JSON-RPC error. This interface is public and versioned through Phi releases.
+Plugin-specific operational instructions belong in plugin-registered skills. For example, load the `dynamic-workflows` skill before creating or troubleshooting workflows.
 
 ## Plugin workflow
 
@@ -43,6 +37,9 @@ Workflow modules export `meta` with `name` and `description`, plus a default asy
 phi plugin install URL --rev TAG_OR_COMMIT --path OPTIONAL_PATH
 phi plugin check NAME
 phi plugin list
+phi update-plugins
 ```
 
 Installation does not activate a plugin. Add `(load-plugin! "NAME")` to `~/.phi/config.scm`, then call `reload_config`. The old composition remains active if validation fails.
+
+Official plugins are listed with versions and source paths in `official-plugins.json`. Fresh homes use the embedded snapshot without adding lock entries. `/update-plugins` and `phi update-plugins` resolve the latest official `main` revision and refresh all installed plugins from their recorded moving revisions.
