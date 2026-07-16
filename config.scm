@@ -91,8 +91,8 @@
              (make-state messages compactions last-usage
                          context-budget model reasoning service-tier "ready" "" 0))
        (hash 'type "finish" 'content
-             (string-append "Model set to " model " · " reasoning
-                            " · " service-tier))]
+             (string-append "Model set to " model " " reasoning
+                            " " service-tier))]
       [(equal? event-type "http_completed")
        (cond
          [(not (hash-ref event 'success))

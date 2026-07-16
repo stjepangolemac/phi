@@ -501,6 +501,7 @@ impl App {
             },
             RuntimeEvent::ToolRouteSelected { .. } => {}
             RuntimeEvent::ModelDelta { content } => {
+                self.mark_response_start_after_tools();
                 self.current_model.push_str(&content);
                 self.current_model_changed();
             }
@@ -685,6 +686,7 @@ impl App {
                     && self.current_model.is_empty()
                     && !content.is_empty()
                 {
+                    self.mark_response_start_after_tools();
                     self.current_model = content;
                     self.current_model_changed();
                 }
@@ -733,6 +735,17 @@ impl App {
             let content = std::mem::take(&mut self.current_model);
             self.current_model_changed();
             self.push_transcript("phi", content);
+        }
+    }
+
+    fn mark_response_start_after_tools(&mut self) {
+        if self.current_model.is_empty()
+            && self
+                .transcript
+                .last()
+                .is_some_and(|(role, _)| matches!(role.as_str(), "tool" | "patch"))
+        {
+            self.push_transcript("response_start", "");
         }
     }
 
@@ -1275,38 +1288,22 @@ fn draw_command_suggestions(frame: &mut Frame, app: &App, composer: Rect) {
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let context = match (app.estimated_tokens, app.token_budget) {
         (Some(used), Some(budget)) => {
-            format!(
-                "context {}/{} tokens",
-                human_tokens(used),
-                human_tokens(budget)
-            )
+            format!("{}/{} tokens", human_tokens(used), human_tokens(budget))
         }
-        _ => "context —".into(),
+        _ => "—".into(),
     };
-    let cache = match (app.cached_tokens, app.cache_write_tokens) {
-        (Some(read), Some(written)) => format!("cache {read} read/{written} write"),
-        _ => "cache —".into(),
-    };
-    let output = app
-        .output_tokens
-        .map_or_else(|| "output —".into(), |tokens| format!("output {tokens}"));
     let model = app.catalog.selected_model.as_deref().unwrap_or("model —");
     let reasoning = app.catalog.selected_reasoning.as_deref().unwrap_or("—");
     let tier = app.catalog.selected_service_tier.as_deref();
     let selection = tier.map_or_else(
-        || format!("{model} · {reasoning}"),
-        |tier| format!("{model} · {reasoning} · {tier}"),
+        || format!("{model} {reasoning}"),
+        |tier| format!("{model} {reasoning} {tier}"),
     );
     let mut status = vec![selection];
     if app.status != "ready" {
         status.push(app.status.clone());
     }
-    status.extend([
-        context,
-        cache,
-        output,
-        format!("{} compactions", app.compactions),
-    ]);
+    status.extend([context, format!("{} compactions", app.compactions)]);
     frame.render_widget(
         Paragraph::new(status.join(" · ")).style(Style::default().fg(Color::DarkGray)),
         area,
@@ -1636,6 +1633,10 @@ fn push_message(lines: &mut Vec<Line<'static>>, role: &str, content: &str, width
         lines.push(Line::raw(" ".repeat(width)));
         return;
     }
+    if role == "response_start" {
+        lines.push(Line::raw(turn_divider("", width)));
+        return;
+    }
     if role == "tool" {
         push_tool(lines, content, width);
         return;
@@ -1689,11 +1690,11 @@ fn push_markdown(lines: &mut Vec<Line<'static>>, role: &str, content: &str, widt
     };
     let code_inset = usize::from(role == "processes") * 2;
     let code_padding = code_inset;
-    let marker = if role == "you" { "‣ " } else { "• " };
     lines.push(Line::styled(" ".repeat(width), block_style));
 
     let options = tui_markdown::Options::new(PhiMarkdown);
     let markdown = tui_markdown::from_str_with_options(content, &options);
+    let marker = if role == "you" { "‣ " } else { "• " };
     let content_width = width.saturating_sub(2).max(1);
     let mut marked = false;
     let mut in_code = false;
@@ -1709,7 +1710,10 @@ fn push_markdown(lines: &mut Vec<Line<'static>>, role: &str, content: &str, widt
             }
             continue;
         }
-        let line_width = if in_code && code_inset > 0 {
+        let ordered_list_line = !in_code && role != "you" && is_ordered_list_line(&plain);
+        let line_width = if ordered_list_line {
+            width.max(1)
+        } else if in_code && code_inset > 0 {
             width
                 .saturating_sub(code_inset * 2 + code_padding * 2)
                 .max(1)
@@ -1718,7 +1722,12 @@ fn push_markdown(lines: &mut Vec<Line<'static>>, role: &str, content: &str, widt
         };
         for wrapped in wrap_styled_line(&line, line_width) {
             let has_content = !wrapped.to_string().trim().is_empty();
-            let prefix = if !marked && has_content {
+            let prefix = if ordered_list_line {
+                if has_content {
+                    marked = true;
+                }
+                ""
+            } else if !marked && has_content {
                 marked = true;
                 marker
             } else {
@@ -1776,6 +1785,12 @@ fn push_markdown(lines: &mut Vec<Line<'static>>, role: &str, content: &str, widt
         ));
     }
     lines.push(Line::styled(" ".repeat(width), block_style));
+}
+
+fn is_ordered_list_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
+    digits > 0 && trimmed[digits..].starts_with(". ")
 }
 
 fn wrap_styled_line(line: &Line<'_>, width: usize) -> Vec<Line<'static>> {
@@ -1845,6 +1860,9 @@ fn push_patch(lines: &mut Vec<Line<'static>>, content: &str, width: usize) {
 }
 
 fn turn_divider(label: &str, width: usize) -> String {
+    if label.is_empty() {
+        return "─".repeat(width);
+    }
     let label_width = UnicodeWidthStr::width(label);
     if width <= label_width + 2 {
         return label.chars().take(width).collect();
@@ -2436,8 +2454,8 @@ mod tests {
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer.cell((0, 7)).unwrap().bg, Color::Rgb(30, 30, 34));
         assert_eq!(buffer.cell((2, 8)).unwrap().symbol(), "a");
-        assert_eq!(buffer.cell((3, 9)).unwrap().symbol(), "d");
-        assert_eq!(terminal.backend().cursor_position(), Position::new(8, 9));
+        assert_eq!(buffer.cell((2, 9)).unwrap().symbol(), "d");
+        assert_eq!(terminal.backend().cursor_position(), Position::new(7, 9));
     }
 
     #[test]
@@ -2494,7 +2512,7 @@ mod tests {
     }
 
     #[test]
-    fn shows_provider_usage_and_cache_counts() {
+    fn shows_context_without_cache_or_output_counts() {
         let mut app = app();
         app.on_runtime(RuntimeEvent::ContextUpdated {
             estimated_tokens: 1_500,
@@ -2508,9 +2526,10 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let content = terminal.backend().to_string();
-        assert!(content.contains("context 1.5K/6K tokens"));
-        assert!(content.contains("cache 1024 read/128 write"));
-        assert!(content.contains("output 50"));
+        assert!(content.contains("1.5K/6K tokens"));
+        assert!(!content.contains("context"));
+        assert!(!content.contains("cache"));
+        assert!(!content.contains("output"));
     }
 
     #[test]
@@ -3148,6 +3167,68 @@ mod tests {
         push_message(&mut lines, "turn_end", "Worked for 2m 32s", 40);
         assert_eq!(lines.len(), 2);
         assert!(lines[1].to_string().trim().is_empty());
+
+        assert_eq!(turn_divider("", 40), "─".repeat(40));
+    }
+
+    #[test]
+    fn separates_a_response_that_starts_after_tool_calls() {
+        let mut streaming_app = app();
+        streaming_app
+            .transcript
+            .push(("tool".into(), "Ran `test`".into()));
+
+        streaming_app.on_runtime(RuntimeEvent::ModelDelta {
+            content: "Final answer".into(),
+        });
+
+        assert_eq!(streaming_app.transcript.last().unwrap().0, "response_start");
+        let text = transcript_text(&mut streaming_app, 40);
+        assert!(
+            text.lines
+                .iter()
+                .any(|line| line.to_string() == "─".repeat(40))
+        );
+
+        let mut fallback_app = app();
+        fallback_app
+            .transcript
+            .push(("patch".into(), "Updated file".into()));
+        fallback_app.on_runtime(RuntimeEvent::Finished {
+            content: "Fallback final answer".into(),
+        });
+        assert_eq!(fallback_app.transcript[1].0, "response_start");
+        assert_eq!(fallback_app.transcript[2].0, "phi");
+    }
+
+    #[test]
+    fn keeps_ordered_list_markers_with_their_first_line() {
+        let mut lines = Vec::new();
+        push_message(
+            &mut lines,
+            "phi",
+            "Intro\n\n1. First numbered item\n2. Second numbered item",
+            12,
+        );
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.to_string().starts_with("• Intro"))
+        );
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.to_string().starts_with("1. First"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.to_string().contains("2. Second"))
+        );
+        assert!(!lines.iter().any(|line| line.to_string().trim() == "1."));
+        assert!(!lines.iter().any(|line| line.to_string().trim() == "2."));
     }
 
     #[test]
@@ -3321,8 +3402,8 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let content = terminal.backend().to_string();
-        assert!(content.contains("test/model · low · default"));
-        assert!(content.contains("context 0/1K tokens"));
+        assert!(content.contains("test/model low default"));
+        assert!(content.contains("0/1K tokens"));
         assert!(!content.contains(" · ready · "));
     }
 

@@ -244,6 +244,14 @@ fn wrap_line(text: &str, start: usize, end: usize, width: usize, rows: &mut Vec<
         let index = start + relative;
         let character_width = character.width().unwrap_or_default();
 
+        if character.is_whitespace() && row_width > 0 && row_width + character_width > width {
+            rows.push(row_start..index);
+            row_start = index + character.len_utf8();
+            row_width = 0;
+            last_break = None;
+            continue;
+        }
+
         while row_width + character_width > width && index > row_start {
             let split = if character.is_whitespace() {
                 index
@@ -301,10 +309,24 @@ mod tests {
             layout
                 .visible_rows(&composer.text, 0, 10)
                 .collect::<Vec<_>>(),
-            vec!["one two", " three"]
+            vec!["one two", "three"]
         );
         assert_eq!(layout.cursor_row(), 1);
-        assert_eq!(layout.cursor_column(), 6);
+        assert_eq!(layout.cursor_column(), 5);
+    }
+
+    #[test]
+    fn omits_a_space_that_soft_wraps_after_a_full_row() {
+        let mut composer = Composer::default();
+        composer.set("lastword next".into());
+        let layout = composer.layout(8);
+
+        assert_eq!(
+            layout
+                .visible_rows(&composer.text, 0, 10)
+                .collect::<Vec<_>>(),
+            vec!["lastword", "next"]
+        );
     }
 
     #[test]
@@ -327,7 +349,7 @@ mod tests {
         composer.set("ab 界 cd".into());
 
         composer.move_up(5);
-        assert_eq!(&composer.text[..composer.cursor], "ab ");
+        assert_eq!(&composer.text[..composer.cursor], "ab");
         composer.move_down(5);
         assert_eq!(composer.cursor, composer.text.len());
     }
