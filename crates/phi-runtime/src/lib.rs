@@ -3372,10 +3372,14 @@ mod tests {
         let planning =
             std::fs::read_to_string(home.builtin_skills().join("planning/SKILL.md")).unwrap();
         assert_eq!(planning, PLANNING_SKILL[0].1);
-        assert!(planning.contains("**Stage:** planning"));
-        assert!(planning.contains("**Current:**"));
+        assert!(planning.contains("**Stage:** writing"));
+        assert!(planning.contains("# Acceptance Criteria"));
+        assert!(planning.contains("[>]"));
+        assert!(!planning.contains("**Current:**"));
+        assert!(planning.contains("explicitly approves"));
         assert!(planning.contains("git rev-parse --git-path info/exclude"));
-        assert!(planning.contains("delete `.phi/PLAN.md`"));
+        assert!(planning.contains("Keep `.phi/PLAN.md`"));
+        assert!(planning.contains("never delete or commit it"));
         assert!(
             phi_core::plugin::read_lock(&home)
                 .unwrap()
