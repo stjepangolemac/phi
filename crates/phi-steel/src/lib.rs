@@ -1880,7 +1880,11 @@ mod tests {
             "model": "openai/gpt-5.6-luna",
             "reasoning": "low",
             "service_tier": "default",
-            "skills": [{ "name": "review", "description": "Review code." }]
+            "skills": [{
+                "name": "review",
+                "description": "Review code.",
+                "path": "skill://review/SKILL.md"
+            }]
         });
         let mut policy = Policy::load_with_state(
             &root.join("config.scm"),
@@ -1897,13 +1901,12 @@ mod tests {
         assert!(matches!(
             &output.effects[0],
             Effect::HttpRequest { body, .. }
-                if body["tools"].as_array().unwrap().iter().any(|tool|
-                    tool["name"] == "load_skill"
-                        && tool["description"].as_str().unwrap().contains("review"))
+                if !body["tools"].as_array().unwrap().iter().any(|tool|
+                    tool["name"] == "load_skill")
         ));
         assert_eq!(
             policy.run_command("skills", "").unwrap(),
-            "- review: Review code."
+            "- review: Review code. (skill://review/SKILL.md)"
         );
     }
 

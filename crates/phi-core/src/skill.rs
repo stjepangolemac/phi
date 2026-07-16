@@ -5,16 +5,13 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use phi_protocol::ToolSpec;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-
-use crate::capability::Tool;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SkillSpec {
     pub name: String,
     pub description: String,
+    pub path: String,
 }
 
 #[derive(Clone, Debug)]
@@ -23,76 +20,38 @@ struct Skill {
     root: PathBuf,
 }
 
+#[derive(Clone, Debug)]
+pub struct SkillCatalog {
+    pub skills: Vec<SkillSpec>,
+    resource_roots: BTreeMap<String, PathBuf>,
+}
+
+impl SkillCatalog {
+    pub fn resource_roots(&self) -> BTreeMap<String, PathBuf> {
+        self.resource_roots.clone()
+    }
+}
+
 pub fn discover(
     system_root: &Path,
     personal_root: &Path,
     workspace: &Path,
     plugin_roots: &[PathBuf],
-) -> Result<Vec<SkillSpec>> {
-    Ok(index(system_root, personal_root, workspace, plugin_roots)?
-        .into_values()
-        .map(|skill| skill.spec)
-        .collect())
+) -> Result<SkillCatalog> {
+    let skills = index(system_root, personal_root, workspace, plugin_roots)?;
+    let resource_roots = skills
+        .iter()
+        .map(|(name, skill)| (resource_prefix(name), skill.root.clone()))
+        .collect();
+    let skills = skills.into_values().map(|skill| skill.spec).collect();
+    Ok(SkillCatalog {
+        skills,
+        resource_roots,
+    })
 }
 
-pub struct LoadSkill {
-    pub system_root: PathBuf,
-    pub personal_root: PathBuf,
-    pub plugin_roots: Vec<PathBuf>,
-}
-
-impl Tool for LoadSkill {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "load_skill".into(),
-            description: "Load an installed skill resource.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string" },
-                    "path": { "type": "string" }
-                },
-                "required": ["name", "path"],
-                "additionalProperties": false
-            }),
-        }
-    }
-
-    fn execute(&self, workspace: &Path, arguments: Value) -> Result<Value> {
-        let name = arguments
-            .get("name")
-            .and_then(Value::as_str)
-            .context("load_skill requires a name")?;
-        let relative = arguments
-            .get("path")
-            .and_then(Value::as_str)
-            .unwrap_or("SKILL.md");
-        let skills = index(
-            &self.system_root,
-            &self.personal_root,
-            workspace,
-            &self.plugin_roots,
-        )?;
-        let skill = skills
-            .get(name)
-            .with_context(|| format!("skill not found: {name}"))?;
-        let path = fs::canonicalize(skill.root.join(relative))?;
-        if !path.starts_with(&skill.root) {
-            bail!("path is outside skill: {name}");
-        }
-        if !path.is_file() {
-            bail!("skill resource is not a file: {relative}");
-        }
-        Ok(json!({
-            "name": name,
-            "path": path.strip_prefix(&skill.root)?.display().to_string(),
-            "content": fs::read_to_string(path)?,
-        }))
-    }
-
-    fn parallel_safe(&self) -> bool {
-        true
-    }
+fn resource_prefix(name: &str) -> String {
+    format!("skill://{name}/")
 }
 
 fn index(
@@ -212,7 +171,12 @@ fn parse_metadata(source: &str) -> Result<SkillSpec> {
     let description = description
         .filter(|value| !value.is_empty())
         .context("skill description is required")?;
-    Ok(SkillSpec { name, description })
+    let path = format!("{}SKILL.md", resource_prefix(&name));
+    Ok(SkillSpec {
+        name,
+        description,
+        path,
+    })
 }
 
 fn yaml_scalar(value: &str) -> Result<String> {
@@ -228,7 +192,8 @@ fn yaml_scalar(value: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capability::Registry;
+    use crate::capability::{ReadFile, Tool};
+    use serde_json::json;
 
     fn skill(root: &Path, directory: &str, name: &str, description: &str) {
         let root = root.join(directory);
@@ -256,48 +221,21 @@ mod tests {
         );
 
         assert_eq!(
-            discover(&system, &personal, &workspace, &[]).unwrap(),
+            discover(&system, &personal, &workspace, &[])
+                .unwrap()
+                .skills,
             vec![SkillSpec {
                 name: "review".into(),
                 description: "Workspace review.".into(),
+                path: "skill://review/SKILL.md".into(),
             }]
         );
 
-        let mut registry = Registry::default();
-        registry.register_hidden(LoadSkill {
-            system_root: system,
-            personal_root: personal,
-            plugin_roots: Vec::new(),
-        });
-        let result = registry
-            .execute(
-                &workspace,
-                "load_skill",
-                json!({ "name": "review", "path": "references/details.md" }),
-            )
-            .unwrap();
-        assert_eq!(result["content"], "Details.");
-        assert!(registry.specs().is_empty());
-    }
-
-    #[test]
-    fn skill_reads_cannot_escape_the_skill_directory() {
-        let temp = tempfile::tempdir().unwrap();
-        let personal = temp.path().join("personal");
-        let system = temp.path().join("system");
-        let workspace = temp.path().join("workspace");
-        skill(&personal, "review", "review", "Review code.");
-        fs::write(personal.join("secret"), "nope").unwrap();
-        let tool = LoadSkill {
-            system_root: system,
-            personal_root: personal,
-            plugin_roots: Vec::new(),
-        };
-        assert!(
-            tool.execute(&workspace, json!({ "name": "review", "path": "../secret" }),)
-                .unwrap_err()
-                .to_string()
-                .contains("outside skill")
+        assert_eq!(
+            discover(&system, &personal, &workspace, &[])
+                .unwrap()
+                .resource_roots()["skill://review/"],
+            fs::canonicalize(workspace.join(".phi/skills/review")).unwrap()
         );
     }
 
@@ -316,11 +254,20 @@ mod tests {
         );
 
         assert_eq!(
-            discover(&system, &personal, &workspace, &[]).unwrap(),
+            discover(&system, &personal, &workspace, &[])
+                .unwrap()
+                .skills,
             vec![SkillSpec {
                 name: "phi-harness".into(),
                 description: "System manual.".into(),
+                path: "skill://phi-harness/SKILL.md".into(),
             }]
+        );
+        assert_eq!(
+            discover(&system, &personal, &workspace, &[])
+                .unwrap()
+                .resource_roots()["skill://phi-harness/"],
+            fs::canonicalize(system.join("phi-harness")).unwrap()
         );
     }
 
@@ -335,12 +282,86 @@ mod tests {
         skill(&personal, "review", "review", "Personal review.");
 
         assert_eq!(
-            discover(&system, &personal, &workspace, &[plugin]).unwrap(),
+            discover(
+                &system,
+                &personal,
+                &workspace,
+                std::slice::from_ref(&plugin),
+            )
+            .unwrap()
+            .skills,
             vec![SkillSpec {
                 name: "review".into(),
                 description: "Personal review.".into(),
+                path: "skill://review/SKILL.md".into(),
             }]
         );
+        assert_eq!(
+            discover(
+                &system,
+                &personal,
+                &workspace,
+                std::slice::from_ref(&plugin),
+            )
+            .unwrap()
+            .resource_roots()["skill://review/"],
+            fs::canonicalize(personal.join("review")).unwrap()
+        );
+    }
+
+    #[test]
+    fn resolved_resources_read_system_workspace_personal_and_plugin_skills() {
+        let temp = tempfile::tempdir().unwrap();
+        let system = temp.path().join("system");
+        let personal = temp.path().join("personal");
+        let workspace = temp.path().join("workspace");
+        let plugin = temp.path().join("plugin-skill");
+        skill(&system, "system", "system", "System skill.");
+        skill(
+            &workspace.join(".phi/skills"),
+            "workspace",
+            "workspace",
+            "Workspace skill.",
+        );
+        skill(&personal, "personal", "personal", "Personal skill.");
+        skill(temp.path(), "plugin-skill", "plugin", "Plugin skill.");
+
+        let catalog = discover(&system, &personal, &workspace, &[plugin]).unwrap();
+        assert_eq!(
+            catalog
+                .skills
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["personal", "plugin", "system", "workspace"]
+        );
+        let reader = ReadFile {
+            full_access: false,
+            additional_root: None,
+            resource_roots: catalog.resource_roots(),
+            resource_help: None,
+        };
+        for name in ["system", "workspace", "personal", "plugin"] {
+            let instructions = reader
+                .execute(
+                    &workspace,
+                    json!({ "path": format!("skill://{name}/SKILL.md") }),
+                )
+                .unwrap();
+            assert!(
+                instructions["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Instructions.")
+            );
+            let reference = reader
+                .execute(
+                    &workspace,
+                    json!({ "path": format!("skill://{name}/references/details.md") }),
+                )
+                .unwrap();
+            assert_eq!(reference["content"], "Details.");
+        }
     }
 
     #[test]
@@ -353,6 +374,7 @@ mod tests {
             SkillSpec {
                 name: "review".into(),
                 description: "Review code for correctness and maintainability.".into(),
+                path: "skill://review/SKILL.md".into(),
             }
         );
     }

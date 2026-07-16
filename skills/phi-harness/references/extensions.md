@@ -14,7 +14,7 @@ Add model registrations and all provider or tool configuration to this compositi
 - File editors define the model-facing edit format and matching policy; Rust verifies revisions and writes files.
 - Hosted and callable tools declare compatible provider/model routes.
 - Slash commands register local user operations.
-- Skills expose metadata first and load Markdown resources progressively. Plugins register a package-relative skill directory with `(register-skill! (hash 'path "skills/NAME"))`.
+- Skills expose their name, description, and precedence-resolved `skill://NAME/SKILL.md` resource first. Read that file and its relative Markdown resources progressively with `read_file`; resource reads stay contained within the selected skill root. Plugins register a package-relative skill directory with `(register-skill! (hash 'path "skills/NAME"))`.
 
 Provider-neutral prompts contain `instructions`, `messages`, and `tools`. A compactor may add `output_schema`; Responses-compatible providers map it to strict JSON-schema output.
 
@@ -29,7 +29,7 @@ Prefer Steel for configurable behavior. Add Rust only for trusted effects, conta
 
 The bundled `codex-patch` editor accepts locator text on an `@@` line or as a context-only hunk before a later changing hunk. Repeated plain update sections for one file run sequentially as one atomic edit. Each update must contain at least one syntactic change and must change file content or destination. Matching errors identify the file and hunk.
 
-Plugin-specific operational instructions belong in plugin-registered skills. For example, load the `dynamic-workflows` skill before creating or troubleshooting workflows.
+Plugin-specific operational instructions belong in plugin-registered skills. For example, read the `dynamic-workflows` skill before creating or troubleshooting workflows.
 
 ## Plugin workflow
 

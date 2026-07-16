@@ -150,6 +150,8 @@ async fn run() -> Result<()> {
                 registry.register(phi_core::capability::ReadFile {
                     full_access: cli.yolo,
                     additional_root: Some(home.root.clone()),
+                    resource_roots: Default::default(),
+                    resource_help: None,
                 });
                 print_json(&registry.execute(
                     &workspace,

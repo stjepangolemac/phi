@@ -71,6 +71,8 @@ impl Registry {
 pub struct ReadFile {
     pub full_access: bool,
     pub additional_root: Option<PathBuf>,
+    pub resource_roots: BTreeMap<String, PathBuf>,
+    pub resource_help: Option<String>,
 }
 
 const DEFAULT_READ_LINES: usize = 200;
@@ -79,16 +81,25 @@ const MAX_READ_BYTES: usize = 16 * 1024;
 
 impl Tool for ReadFile {
     fn spec(&self) -> ToolSpec {
+        let allowed_files = if self.full_access {
+            "any file"
+        } else if self.additional_root.is_some() {
+            "the workspace, Phi home, or a listed resource"
+        } else if self.resource_roots.is_empty() {
+            "the workspace"
+        } else {
+            "the workspace or a listed resource"
+        };
+        let mut description = format!(
+            "Read a bounded range of complete UTF-8 lines from {allowed_files}. Use next_line to continue."
+        );
+        if let Some(help) = &self.resource_help {
+            description.push_str("\n\n");
+            description.push_str(help);
+        }
         ToolSpec {
             name: "read_file".into(),
-            description: if self.full_access {
-                "Read a bounded range of complete UTF-8 lines from any file. Use next_line to continue."
-            } else if self.additional_root.is_some() {
-                "Read a bounded range of complete UTF-8 lines inside the workspace or Phi home. Use next_line to continue."
-            } else {
-                "Read a bounded range of complete UTF-8 lines inside the workspace. Use next_line to continue."
-            }
-            .into(),
+            description,
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -108,15 +119,40 @@ impl Tool for ReadFile {
             .and_then(Value::as_str)
             .context("read_file requires a path")?;
         let root = fs::canonicalize(workspace)?;
-        let path = fs::canonicalize(root.join(requested))?;
-        let in_additional_root = self
-            .additional_root
-            .as_ref()
-            .and_then(|root| fs::canonicalize(root).ok())
-            .is_some_and(|root| path.starts_with(root));
-        if !self.full_access && !path.starts_with(&root) && !in_additional_root {
-            bail!("path is outside allowed roots");
-        }
+        let resource = self
+            .resource_roots
+            .iter()
+            .find(|(prefix, _)| requested.starts_with(prefix.as_str()));
+        let (path, display_path) = if let Some((prefix, resource_root)) = resource {
+            let resource_root = fs::canonicalize(resource_root)?;
+            let relative = requested.strip_prefix(prefix).unwrap();
+            let path = fs::canonicalize(resource_root.join(relative))?;
+            if !path.starts_with(&resource_root) {
+                bail!("resource path is outside its allowed root");
+            }
+            if !path.is_file() {
+                bail!("resource is not a file: {requested}");
+            }
+            (path, requested.to_owned())
+        } else {
+            if requested.contains("://") {
+                bail!("unknown resource: {requested}");
+            }
+            let path = fs::canonicalize(root.join(requested))?;
+            let in_additional_root = self
+                .additional_root
+                .as_ref()
+                .and_then(|root| fs::canonicalize(root).ok())
+                .is_some_and(|root| path.starts_with(root));
+            if !self.full_access && !path.starts_with(&root) && !in_additional_root {
+                bail!("path is outside allowed roots");
+            }
+            let display_path = path.strip_prefix(&root).map_or_else(
+                |_| path.display().to_string(),
+                |path| path.display().to_string(),
+            );
+            (path, display_path)
+        };
 
         let start_line = arguments
             .get("start_line")
@@ -164,10 +200,6 @@ impl Tool for ReadFile {
         let end_index = first + lines_read;
         let end_line = (lines_read > 0).then_some(end_index);
         let next_line = (end_index < lines.len()).then_some(end_index + 1);
-        let display_path = path.strip_prefix(&root).map_or_else(
-            |_| path.display().to_string(),
-            |path| path.display().to_string(),
-        );
         Ok(json!({
             "path": display_path,
             "content": selected,
@@ -276,6 +308,8 @@ mod tests {
         registry.register(ReadFile {
             full_access: false,
             additional_root: None,
+            resource_roots: BTreeMap::new(),
+            resource_help: None,
         });
         let result = registry
             .execute(dir.path(), "read_file", json!({ "path": "a.txt" }))
@@ -300,6 +334,8 @@ mod tests {
         let tool = ReadFile {
             full_access: false,
             additional_root: None,
+            resource_roots: BTreeMap::new(),
+            resource_help: None,
         };
 
         let first = tool
@@ -333,6 +369,8 @@ mod tests {
         let tool = ReadFile {
             full_access: false,
             additional_root: None,
+            resource_roots: BTreeMap::new(),
+            resource_help: None,
         };
 
         let result = tool
@@ -366,6 +404,8 @@ mod tests {
         let restricted = ReadFile {
             full_access: false,
             additional_root: None,
+            resource_roots: BTreeMap::new(),
+            resource_help: None,
         };
         assert!(
             restricted
@@ -375,6 +415,8 @@ mod tests {
         let unrestricted = ReadFile {
             full_access: true,
             additional_root: None,
+            resource_roots: BTreeMap::new(),
+            resource_help: None,
         };
         let result = unrestricted
             .execute(workspace.path(), json!({ "path": path }))
@@ -383,6 +425,52 @@ mod tests {
         assert_eq!(
             result["path"],
             fs::canonicalize(path).unwrap().display().to_string()
+        );
+    }
+
+    #[test]
+    fn read_file_reads_contained_named_resources() {
+        let workspace = tempfile::tempdir().unwrap();
+        let container = tempfile::tempdir().unwrap();
+        let resource = container.path().join("review");
+        fs::create_dir_all(resource.join("references")).unwrap();
+        fs::write(resource.join("SKILL.md"), "Instructions.\n").unwrap();
+        fs::write(resource.join("references/details.md"), "Details.\n").unwrap();
+        let outside = container.path().join("secret");
+        fs::write(&outside, "nope\n").unwrap();
+        let tool = ReadFile {
+            full_access: false,
+            additional_root: None,
+            resource_roots: BTreeMap::from([("skill://review/".into(), resource)]),
+            resource_help: Some("Available skills:\n- review".into()),
+        };
+
+        let result = tool
+            .execute(
+                workspace.path(),
+                json!({ "path": "skill://review/references/details.md" }),
+            )
+            .unwrap();
+        assert_eq!(result["content"], "Details.\n");
+        assert_eq!(result["path"], "skill://review/references/details.md");
+        assert!(tool.spec().description.contains("Available skills"));
+        assert!(
+            tool.execute(
+                workspace.path(),
+                json!({ "path": "skill://review/../secret" }),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("outside its allowed root")
+        );
+        assert!(
+            tool.execute(
+                workspace.path(),
+                json!({ "path": "skill://missing/SKILL.md" }),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("unknown resource")
         );
     }
 }

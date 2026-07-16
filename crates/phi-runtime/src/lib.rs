@@ -536,12 +536,13 @@ fn build_policy(
     output_schema: Option<&serde_json::Value>,
 ) -> Result<PolicyBootstrap> {
     let plugin_skills = plugin_skill_roots(sources)?;
-    let capabilities = Arc::new(capabilities_with_plugin_skills(
+    let skills = discover_skills_with_plugins(home, workspace, &plugin_skills)?;
+    let capabilities = Arc::new(capabilities_for_skills(
         home,
         full_access,
-        plugin_skills.clone(),
+        &skills,
+        sources.plugins.iter().any(|plugin| plugin.name == "skills"),
     ));
-    let skills = discover_skills_with_plugins(home, workspace, &plugin_skills)?;
     let policy = phi_steel::Policy::load_with_state(
         &sources.config,
         &entrypoints(sources),
@@ -549,7 +550,7 @@ fn build_policy(
             &capabilities,
             session_id,
             &load_user_state(home)?,
-            &skills,
+            &skills.skills,
             output_schema,
         ),
         saved_state,
@@ -1145,32 +1146,53 @@ fn capabilities(
     home: &phi_core::home::PhiHome,
     full_access: bool,
 ) -> phi_core::capability::Registry {
-    capabilities_with_plugin_skills(home, full_access, Vec::new())
+    let skills =
+        phi_core::skill::discover(&home.builtin_skills(), &home.skills(), &home.root, &[]).unwrap();
+    capabilities_for_skills(home, full_access, &skills, true)
 }
 
-fn capabilities_with_plugin_skills(
+fn capabilities_for_skills(
     home: &phi_core::home::PhiHome,
     full_access: bool,
-    plugin_roots: Vec<PathBuf>,
+    skills: &phi_core::skill::SkillCatalog,
+    expose_skills: bool,
 ) -> phi_core::capability::Registry {
     let mut capabilities = phi_core::capability::Registry::default();
     capabilities.register(phi_core::capability::ReadFile {
         full_access,
         additional_root: Some(home.root.clone()),
-    });
-    capabilities.register_hidden(phi_core::skill::LoadSkill {
-        system_root: home.builtin_skills(),
-        personal_root: home.skills(),
-        plugin_roots,
+        resource_roots: skills.resource_roots(),
+        resource_help: expose_skills
+            .then(|| skill_resource_help(&skills.skills))
+            .flatten(),
     });
     capabilities
+}
+
+fn skill_resource_help(skills: &[phi_core::skill::SkillSpec]) -> Option<String> {
+    if skills.is_empty() {
+        return None;
+    }
+    let entries = skills
+        .iter()
+        .map(|skill| {
+            format!(
+                "- {}: {} Read `{}`.",
+                skill.name, skill.description, skill.path
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!(
+        "Load a relevant skill before acting by reading its listed SKILL.md resource. If the user writes $skill-name, read that skill before responding. Resolve referenced paths beneath the same skill://NAME/ prefix; reads remain contained within that skill. Available skills:\n{entries}"
+    ))
 }
 
 #[cfg(test)]
 fn discover_skills(
     home: &phi_core::home::PhiHome,
     workspace: &Path,
-) -> Result<Vec<phi_core::skill::SkillSpec>> {
+) -> Result<phi_core::skill::SkillCatalog> {
     discover_skills_with_plugins(home, workspace, &[])
 }
 
@@ -1178,7 +1200,7 @@ fn discover_skills_with_plugins(
     home: &phi_core::home::PhiHome,
     workspace: &Path,
     plugin_roots: &[PathBuf],
-) -> Result<Vec<phi_core::skill::SkillSpec>> {
+) -> Result<phi_core::skill::SkillCatalog> {
     phi_core::skill::discover(
         &home.builtin_skills(),
         &home.skills(),
@@ -2763,7 +2785,12 @@ mod tests {
         let mut policy = phi_steel::Policy::load_with_state(
             &sources.config,
             &plugins,
-            &policy_config(&capabilities, session.id(), &UserState::default(), &skills),
+            &policy_config(
+                &capabilities,
+                session.id(),
+                &UserState::default(),
+                &skills.skills,
+            ),
             Some(session.load_state().unwrap()),
         )
         .unwrap();
@@ -2780,9 +2807,13 @@ mod tests {
                     && body["service_tier"] == "priority"
                     && body["prompt_cache_key"] == execution.session_id
                     && headers["session_id"] == execution.session_id
-                    && body["tools"].as_array().unwrap().len() == 12
+                    && body["tools"].as_array().unwrap().len() == 11
                     && body["tools"].as_array().unwrap().iter()
-                        .any(|tool| tool["name"] == "read_file")
+                        .any(|tool| tool["name"] == "read_file"
+                            && tool["description"].as_str().unwrap()
+                                .contains("phi-harness: Inspect, explain")
+                            && tool["description"].as_str().unwrap()
+                                .contains("skill://phi-harness/SKILL.md"))
                     && body["tools"].as_array().unwrap().iter()
                         .any(|tool| tool["name"] == "exec_command")
                     && body["tools"].as_array().unwrap().iter()
@@ -2793,7 +2824,7 @@ mod tests {
                         .any(|tool| tool["name"] == "terminate_process")
                     && body["tools"].as_array().unwrap().iter()
                         .any(|tool| tool["name"] == "reload_config")
-                    && body["tools"].as_array().unwrap().iter()
+                    && !body["tools"].as_array().unwrap().iter()
                         .any(|tool| tool["name"] == "load_skill")
                     && body["tools"].as_array().unwrap().iter()
                         .any(|tool| tool["name"] == "patch")

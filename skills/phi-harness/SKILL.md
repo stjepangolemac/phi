@@ -7,7 +7,7 @@ description: Inspect, explain, configure, extend, or modify the Phi agent harnes
 
 Run `phi --json status` before explaining or changing Phi. Treat its output, the active config file, and session snapshots as authoritative.
 
-Read only the references needed for the task. Load them through `load_skill` using these paths; do not resolve them from the workspace:
+Read only the references needed for the task. Use `read_file` with this skill's listed `skill://phi-harness/` resource prefix; do not resolve these files from the workspace or Phi's installation layout:
 
 - [architecture](references/architecture.md) for crate ownership and the request lifecycle.
 - [configuration](references/configuration.md) for paths, state, and precedence.

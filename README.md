@@ -126,9 +126,9 @@ Copy standard `SKILL.md` directories into `~/.phi/skills/` for personal use or `
   references/
 ```
 
-Loaded plugins can register package-relative skill directories with `(register-skill! (hash 'path "skills/NAME"))`. Plugin skills have the lowest precedence, followed by personal and workspace skills; protected Phi system skills have the highest precedence. Phi initially exposes only names and descriptions, and the official `skills` plugin loads `SKILL.md` or a referenced file when needed. Use `/skills` to list discovered skills or mention `$skill-name` to request one explicitly.
+Loaded plugins can register package-relative skill directories with `(register-skill! (hash 'path "skills/NAME"))`. Plugin skills have the lowest precedence, followed by personal and workspace skills; protected Phi system skills have the highest precedence. Phi initially exposes each resolved skill's name, description, and stable `skill://NAME/SKILL.md` resource. The normal `read_file` tool reads that file and referenced resources such as `skill://NAME/references/details.md`; every such read is contained within the precedence-selected skill root without exposing Phi's installation or plugin-cache layout. Use `/skills` to list discovered skills or mention `$skill-name` to request one explicitly.
 
-Phi also bundles an authoritative `phi-harness` skill describing its architecture, configuration, extension points, and operations. The agent loads it before inspecting or reconfiguring the harness. Use `phi status` for the human-readable active composition or `phi --json status` for machine-readable output.
+Phi also bundles an authoritative `phi-harness` skill describing its architecture, configuration, extension points, and operations. The agent reads it before inspecting or reconfiguring the harness. Use `phi status` for the human-readable active composition or `phi --json status` for machine-readable output.
 
 ## Dynamic workflows
 

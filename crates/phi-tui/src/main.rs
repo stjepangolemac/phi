@@ -616,15 +616,11 @@ impl App {
                     "write_stdin" => "Checked background process".into(),
                     "list_processes" => "Checking background processes".into(),
                     "terminate_process" => "Stopping background process".into(),
-                    "read_file" => format!(
-                        "Read {}",
-                        display_relative_path(
-                            &self.options.workspace,
-                            arguments["path"].as_str().unwrap_or("file")
-                        )
+                    "read_file" => read_file_label(
+                        &self.options.workspace,
+                        arguments["path"].as_str().unwrap_or("file"),
                     ),
                     "web_search" => "Searching the web".into(),
-                    "load_skill" => skill_resource_label("Loading", &arguments),
                     "patch" => "Applying patch".into(),
                     "reload_config" => "Reloading configuration".into(),
                     "Workflow" => format!(
@@ -723,16 +719,6 @@ impl App {
                             content.push_str(&format!("\n\n{sources} sources"));
                         }
                         self.status = "working".into();
-                    } else if name == "load_skill" {
-                        if let Some(error) = result["error"].as_str() {
-                            *content = format!("Failed to load skill\n\n{error}");
-                        } else {
-                            *content = format!(
-                                "{} · {}",
-                                skill_resource_label("Loaded", &result),
-                                human_duration(elapsed)
-                            );
-                        }
                     } else if name == "patch" {
                         *role = "patch".into();
                         *content = patch_result(&result, elapsed);
@@ -2248,14 +2234,15 @@ fn patch_result(result: &serde_json::Value, elapsed: Duration) -> String {
     )
 }
 
-fn skill_resource_label(action: &str, value: &serde_json::Value) -> String {
-    let name = value["name"].as_str().unwrap_or("unknown");
-    let path = value["path"].as_str().unwrap_or("SKILL.md");
-    if path == "SKILL.md" {
-        format!("{action} skill `{name}`")
-    } else {
-        format!("{action} `{name}/{path}`")
+fn read_file_label(workspace: &Path, path: &str) -> String {
+    if let Some(resource) = path.strip_prefix("skill://") {
+        if resource.ends_with("/SKILL.md") {
+            let name = resource.trim_end_matches("/SKILL.md");
+            return format!("Read skill `{name}`");
+        }
+        return format!("Read skill resource `{resource}`");
     }
+    format!("Read {}", display_relative_path(workspace, path))
 }
 
 fn workflow_action_label(
@@ -2619,47 +2606,43 @@ mod tests {
     }
 
     #[test]
-    fn shows_skill_loading_without_echoing_instructions() {
+    fn shows_skill_reads_without_echoing_instructions() {
         let mut app = app();
         app.on_runtime(RuntimeEvent::ToolStarted {
             call_id: "skill".into(),
-            name: "load_skill".into(),
-            arguments: serde_json::json!({ "name": "review", "path": "SKILL.md" }),
+            name: "read_file".into(),
+            arguments: serde_json::json!({ "path": "skill://review/SKILL.md" }),
         });
-        assert_eq!(app.transcript[0].1, "Loading skill `review`");
+        assert_eq!(app.transcript[0].1, "Read skill `review`");
         app.on_runtime(RuntimeEvent::ToolCompleted {
             call_id: "skill".into(),
-            name: "load_skill".into(),
+            name: "read_file".into(),
             result: serde_json::json!({
-                "name": "review",
-                "path": "SKILL.md",
+                "path": "skill://review/SKILL.md",
                 "content": "secret instructions"
             }),
         });
-        assert_eq!(app.transcript[0].1, "Loaded skill `review` · 0s");
+        assert_eq!(app.transcript[0].1, "Read skill `review`");
         assert!(!app.transcript[0].1.contains("secret instructions"));
 
         app.on_runtime(RuntimeEvent::ToolStarted {
             call_id: "reference".into(),
-            name: "load_skill".into(),
-            arguments: serde_json::json!({
-                "name": "review",
-                "path": "references/details.md"
-            }),
+            name: "read_file".into(),
+            arguments: serde_json::json!({ "path": "skill://review/references/details.md" }),
         });
         app.on_runtime(RuntimeEvent::ToolCompleted {
             call_id: "reference".into(),
-            name: "load_skill".into(),
+            name: "read_file".into(),
             result: serde_json::json!({
-                "name": "review",
-                "path": "references/details.md",
+                "path": "skill://review/references/details.md",
                 "content": "more secret instructions"
             }),
         });
         assert_eq!(
             app.transcript[1].1,
-            "Loaded `review/references/details.md` · 0s"
+            "Read skill resource `review/references/details.md`"
         );
+        assert!(!app.transcript[1].1.contains("more secret instructions"));
     }
 
     #[test]
