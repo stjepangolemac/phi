@@ -34,6 +34,7 @@ struct Change<'a> {
 }
 
 pub(super) fn push(lines: &mut Vec<Line<'static>>, content: &str, width: usize) {
+    lines.push(Line::raw(" ".repeat(width)));
     let Some(changes) = parse_changes(content) else {
         push_fallback(lines, content, width);
         return;
@@ -45,7 +46,6 @@ pub(super) fn push(lines: &mut Vec<Line<'static>>, content: &str, width: usize) 
             (total.0 + count.0, total.1 + count.1)
         });
 
-    lines.push(Line::raw(" ".repeat(width)));
     if changes.len() == 1 {
         push_header(lines, "• ", changes[0].action, &changes[0].path, totals);
         render_diff(lines, changes[0].diff, &changes[0].path, width);
@@ -63,7 +63,6 @@ pub(super) fn push(lines: &mut Vec<Line<'static>>, content: &str, width: usize) 
             render_diff(lines, change.diff, &change.path, width);
         }
     }
-    lines.push(Line::raw(" ".repeat(width)));
 }
 
 fn push_file_header(

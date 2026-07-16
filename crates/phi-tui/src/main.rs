@@ -1852,7 +1852,6 @@ fn push_tool(lines: &mut Vec<Line<'static>>, content: &str, width: usize) {
             lines.push(Line::styled(format!("{prefix}{output}"), output_style));
         }
     }
-    lines.push(Line::styled(" ".repeat(width), command_style));
 }
 
 fn push_patch(lines: &mut Vec<Line<'static>>, content: &str, width: usize) {
@@ -1975,10 +1974,11 @@ fn display_relative_path(workspace: &Path, path: &str) -> String {
 
 fn patch_result(result: &serde_json::Value, elapsed: Duration) -> String {
     if let Some(error) = result.get("error").and_then(serde_json::Value::as_str) {
+        let error = error.split_whitespace().collect::<Vec<_>>().join(" ");
         return format!(
-            "Patch failed · {}\n\n{}",
+            "Patch failed · {} · {}",
             human_duration(elapsed),
-            truncate_display(error, 2_000)
+            truncate_display(&error, 2_000)
         );
     }
     let changes = result
@@ -2388,6 +2388,26 @@ mod tests {
                 "Deleted `unused.rs`\n--- unused.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-unused"
             )
         );
+    }
+
+    #[test]
+    fn keeps_patch_failures_on_one_line() {
+        let content = patch_result(
+            &serde_json::json!({
+                "error": "failed to match hunk\nexpected nearby context"
+            }),
+            Duration::from_secs(2),
+        );
+        assert_eq!(
+            content,
+            "Patch failed · 2s · failed to match hunk expected nearby context"
+        );
+
+        let mut lines = Vec::new();
+        push_message(&mut lines, "patch", &content, 80);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].to_string().trim().is_empty());
+        assert_eq!(lines[1].to_string(), content);
     }
 
     #[test]
@@ -2904,6 +2924,19 @@ mod tests {
     }
 
     #[test]
+    fn leaves_one_blank_line_between_tool_calls() {
+        let mut lines = Vec::new();
+        push_tool(&mut lines, "Ran `one`", 40);
+        push_tool(&mut lines, "Ran `two`", 40);
+
+        assert_eq!(lines.len(), 4);
+        assert!(lines[0].to_string().trim().is_empty());
+        assert!(lines[1].to_string().contains("Ran `one`"));
+        assert!(lines[2].to_string().trim().is_empty());
+        assert!(lines[3].to_string().contains("Ran `two`"));
+    }
+
+    #[test]
     fn streams_shell_output_without_repeating_it_on_completion() {
         let mut app = app();
         app.on_runtime(RuntimeEvent::ToolStarted {
@@ -2957,7 +2990,7 @@ mod tests {
             &format!("Ran `json`\n\n{}", "x".repeat(200)),
             40,
         );
-        assert_eq!(single_long_line.len(), 5);
+        assert_eq!(single_long_line.len(), 4);
         assert_eq!(
             UnicodeWidthStr::width(single_long_line[3].to_string().as_str()),
             40
