@@ -16,6 +16,8 @@ Add model registrations and all provider or tool configuration to this compositi
 - Slash commands register local user operations.
 - Skills expose their name, description, and precedence-resolved `skill://NAME/SKILL.md` resource first. Read that file and its relative Markdown resources progressively with `read_file`; resource reads stay contained within the selected skill root. Plugins register a package-relative skill directory with `(register-skill! (hash 'path "skills/NAME"))`.
 
+The official `context-management` plugin provides `context_mark`, `context_inspect`, and `context_compact`. They are generic focus-management tools, not planning-specific APIs. Item IDs and safe boundaries are runtime assigned; models select only IDs returned by `context_inspect`, never message offsets or arbitrary event ranges.
+
 Provider-neutral prompts contain `instructions`, `messages`, and `tools`. A compactor may add `output_schema`; Responses-compatible providers map it to strict JSON-schema output.
 
 Provider plugins may register default models. Because plugin entrypoints are evaluated before `config.scm`, configuration can customize those defaults with the same extension API:

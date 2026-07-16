@@ -2818,7 +2818,7 @@ mod tests {
                     && body["service_tier"] == "priority"
                     && body["prompt_cache_key"] == execution.session_id
                     && headers["session_id"] == execution.session_id
-                    && body["tools"].as_array().unwrap().len() == 11
+                    && body["tools"].as_array().unwrap().len() == 14
                     && body["tools"].as_array().unwrap().iter()
                         .any(|tool| tool["name"] == "read_file"
                             && tool["description"].as_str().unwrap()
@@ -2835,6 +2835,12 @@ mod tests {
                         .any(|tool| tool["name"] == "terminate_process")
                     && body["tools"].as_array().unwrap().iter()
                         .any(|tool| tool["name"] == "reload_config")
+                    && body["tools"].as_array().unwrap().iter()
+                        .any(|tool| tool["name"] == "context_mark")
+                    && body["tools"].as_array().unwrap().iter()
+                        .any(|tool| tool["name"] == "context_inspect")
+                    && body["tools"].as_array().unwrap().iter()
+                        .any(|tool| tool["name"] == "context_compact")
                     && !body["tools"].as_array().unwrap().iter()
                         .any(|tool| tool["name"] == "load_skill")
                     && body["tools"].as_array().unwrap().iter()
@@ -3378,7 +3384,7 @@ mod tests {
         );
         assert_eq!(
             phi_core::plugin::official_catalog().unwrap().plugins.len(),
-            11
+            12
         );
     }
 }

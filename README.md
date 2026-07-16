@@ -54,6 +54,7 @@ Phi keeps behavior in Scheme and data in JSON:
 (load-plugin! "openai-web-search")
 (load-plugin! "openrouter-web-search")
 (load-plugin! "skills")
+(load-plugin! "context-management")
 (load-plugin! "dynamic-workflows")
 (load-plugin! "codex-patch")
 (load-plugin! "simple-prompt")
@@ -109,6 +110,8 @@ Provider plugins may register a useful default model catalog. Configuration is e
 ```
 
 Provider-neutral prompts contain `instructions`, `messages`, and `tools`; compactors may also attach `output_schema`. Models verified to support strict schema decoding register `strict_json_schema_capable` as true. Structured compaction uses native schemas for those models, otherwise prompts for JSON, validates the result, and makes up to four repair attempts.
+
+The official `context-management` plugin exposes three generic model-facing tools. `context_mark` closes the current raw span and starts a labeled span at a tool-safe boundary. `context_inspect` reports provider-anchored or estimated usage, fixed prompt tokens, and the ordered active `S*` raw and `C*` summary items. `context_compact` replaces one or more ordered, adjacent, closed items with one summary while retaining direct and nested provenance. The fixed prompt and current open span are never selectable. These boundaries are independent of planning and can represent investigation, implementation, debugging, review, user-directed scope changes, or any other focus shift. Automatic threshold compaction and `/compact` remain the safety net when no markers exist, and immutable session events retain the complete raw history while only the active model-facing projection is reduced.
 
 After changing `config.scm` or `config.json`, use `/reload`. The agent can call `reload_config` after reconfiguring itself. Reload validates the live composition, replaces the current session snapshot, and updates the catalog without discarding the conversation.
 

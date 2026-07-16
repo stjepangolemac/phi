@@ -22,6 +22,10 @@ Rust owns mechanisms that require containment or reliability. Steel owns provide
 4. Let the selected provider plugin build and stream the request.
 5. Execute returned tool calls through Rust capabilities or configured callable tools.
 6. Feed results back until the policy finishes the turn.
-7. Compact after a completed model/tool cycle when the selected model threshold is crossed, or immediately when the user runs `/compact`.
+7. Compact after a completed model/tool cycle when the selected model threshold is crossed, immediately when the user runs `/compact`, or selectively when the model compacts closed context items.
+
+## Active context
+
+The active model-facing context is an ordered reduction over immutable session history. `context_mark` closes a raw `S*` span and starts a labeled one without requiring a plan. `context_inspect` reports fixed prompt tokens separately from ordered raw and summary items. `context_compact` accepts only ordered, adjacent, closed items and creates one `C*` summary with token sizes and nested provenance. The current open item and fixed instructions/tools are not selectable. Automatic compaction still handles unmarked histories and preserves a recent tool-safe tail. Selective or forced compaction changes only the active projection; `.phi/sessions/*/events.jsonl` remains the durable raw record.
 
 Sessions preserve their original configuration and plugin sources. Changes apply to new sessions, not already-open ones.

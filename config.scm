@@ -1,6 +1,11 @@
 (set-agent-instructions!
   "You are a coding agent running inside a Phi harness in the user's current workspace. Work directly on the user's requests using the available tools. Inspect before editing, verify changes, and continue until the requested outcome is complete. Keep responses concise. When working on or reconfiguring the Phi harness itself, read the phi-harness skill with read_file before acting. The user can already see tool calls and their output, so do not repeat them verbatim; state only the conclusion or necessary interpretation. When reconfiguring Phi, edit the active config.scm, validate the change, and reload it into the current conversation.")
 
+(define active-context-items '())
+(define next-context-span 2)
+(define next-context-summary 1)
+(define pending-context (hash))
+
 (define (init encoded-config)
   (define config (string->jsexpr encoded-config))
   (define model (or (hash-try-get config 'model) ""))
@@ -45,6 +50,12 @@
   (define event (string->jsexpr encoded-event))
   (define event-type (hash-ref event 'type))
   (define messages (hash-ref state 'messages))
+  (set! active-context-items
+        (or (hash-try-get state 'context_items)
+            (context-initial-items messages)))
+  (set! next-context-span (or (hash-try-get state 'next_context_span) 2))
+  (set! next-context-summary (or (hash-try-get state 'next_context_summary) 1))
+  (set! pending-context (or (hash-try-get state 'pending_context) (hash)))
   (define compactions (hash-ref state 'compactions))
   (define last-usage (hash-ref state 'last_usage))
   (define model (hash-ref state 'model))
@@ -96,10 +107,59 @@
       [(equal? event-type "http_completed")
        (cond
          [(not (hash-ref event 'success))
+          (if (equal? activity "selective_compacting")
+              (let* ([call-id (hash-ref pending-context 'call_id)]
+                     [result (hash 'error (hash-ref event 'error))])
+                (set! messages
+                      (append messages
+                              (list (hash 'kind "tool_result" 'call_id call-id
+                                          'content (value->jsexpr-string result)))))
+                (set! pending-context (hash))
+                (set! next-state
+                      (make-state messages compactions last-usage context-budget
+                                  model reasoning service-tier "working" "" 0))
+                (request-effect messages model reasoning service-tier))
+              (begin
+                (set! next-state
+                      (make-state messages compactions last-usage context-budget
+                                  model reasoning service-tier "ready" "" 0))
+                (hash 'type "finish" 'content (hash-ref event 'error))))]
+         [(equal? activity "selective_compacting")
+          (define ids (hash-ref pending-context 'items))
+          (define selected (context-selection active-context-items ids))
+          (define summary-text (complete-context-summary (hash-ref event 'events) model))
+          (define summary-message
+            (hash 'kind "message" 'role "user"
+                  'content (string-append "Context summary:\n" summary-text)))
+          (define summary-id
+            (context-runtime-id "C" next-context-summary))
+          (define summary
+            (context-summary-item
+              summary-id (hash-ref pending-context 'label) summary-message
+              (context-sum-from-tokens selected) ids selected
+              (context-selection-after selected)))
+          (set! next-context-summary (+ next-context-summary 1))
+          (set! active-context-items
+                (context-replace-selection active-context-items ids summary))
+          (set! messages (context-flatten-items active-context-items))
+          (define result
+            (hash 'created (context-public-item summary)
+                  'usage
+                  (hash-ref
+                    (context-inspection active-context-items messages last-usage
+                                        (hash-ref (model-spec model) 'context_window))
+                    'usage)))
+          (set! messages
+                (append messages
+                        (list (hash 'kind "tool_result"
+                                    'call_id (hash-ref pending-context 'call_id)
+                                    'content (value->jsexpr-string result)))))
+          (set! pending-context (hash))
+          (set! compactions (+ compactions 1))
           (set! next-state
                 (make-state messages compactions last-usage context-budget
-                            model reasoning service-tier "ready" "" 0))
-          (hash 'type "finish" 'content (hash-ref event 'error))]
+                            model reasoning service-tier "working" "" 0))
+          (request-effect messages model reasoning service-tier)]
          [(equal? activity "compacting")
           (define result
             (complete-selected-compaction
@@ -138,7 +198,63 @@
           (if usage (set! last-usage usage))
           (set! messages (append messages preserved))
           (if (not (null? calls))
-              (begin
+              (if (and (null? (cdr calls))
+                       (context-tool-name? (hash-ref (car calls) 'name)))
+                  (let* ([call (car calls)]
+                         [name (hash-ref call 'name)]
+                         [arguments (provider-arguments-for model call)])
+                    (set! messages (append messages calls))
+                    (set! active-context-items
+                          (context-sync-items active-context-items messages))
+                    (cond
+                      [(equal? name "context_inspect")
+                       (define result
+                         (context-inspection
+                           active-context-items messages last-usage
+                           (hash-ref (model-spec model) 'context_window)))
+                       (set! messages
+                             (append messages (list (context-tool-result call result))))
+                       (set! next-state
+                             (make-state messages compactions last-usage
+                                         context-budget model reasoning service-tier
+                                         "working" "" 0))
+                       (request-effect messages model reasoning service-tier)]
+                      [(equal? name "context_mark")
+                       (define label (hash-ref arguments 'label))
+                       (define result
+                         (hash 'closed (hash-ref (context-last-item active-context-items) 'id)
+                               'opened (context-runtime-id "S" next-context-span)
+                               'label label))
+                       (set! messages
+                             (append messages (list (context-tool-result call result))))
+                       (set! active-context-items
+                             (context-sync-items active-context-items messages))
+                       (set! active-context-items
+                             (context-mark-items
+                               active-context-items
+                               (context-runtime-id "S" next-context-span)
+                               label (hash-ref call 'call_id)))
+                       (set! next-context-span (+ next-context-span 1))
+                       (set! next-state
+                             (make-state messages compactions last-usage
+                                         context-budget model reasoning service-tier
+                                         "working" "" 0))
+                       (request-effect messages model reasoning service-tier)]
+                      [else
+                       (define ids (hash-ref arguments 'items))
+                       (define selected (context-selection active-context-items ids))
+                       (set! pending-context
+                             (hash 'call_id (hash-ref call 'call_id)
+                                   'items ids
+                                   'label (hash-ref arguments 'label)))
+                       (set! next-state
+                             (make-state messages compactions last-usage
+                                         context-budget model reasoning service-tier
+                                         "selective_compacting" "" 0))
+                       (start-context-summary
+                         (context-selected-messages selected)
+                         model reasoning service-tier)]))
+                  (begin
                 (set! messages (append messages calls))
                 (set! next-state
                       (make-state messages compactions last-usage
@@ -147,7 +263,7 @@
                 (hash 'type "run_tools"
                       'calls (map (lambda (call)
                                     (tool-call-execution model call))
-                                  calls)))
+                                  calls))))
               (let* ([content (provider-output-for model events)]
                      [finished-content (if (equal? content "")
                                            "Model returned no output."
@@ -212,6 +328,8 @@
         (hash-insert last-usage '_message_tokens
                      (estimated-message-tokens messages))
         last-usage))
+  (set! active-context-items
+        (context-sync-items active-context-items messages))
   (hash 'messages messages
         'estimated_tokens (estimated-context-tokens messages usage)
         'compactions compactions
@@ -222,6 +340,10 @@
         'activity activity
         'pending_finish pending-finish
         'compaction_attempt compaction-attempt
+        'context_items active-context-items
+        'next_context_span next-context-span
+        'next_context_summary next-context-summary
+        'pending_context pending-context
         'context_window (hash-ref (model-spec model) 'context_window)))
 
 (load-plugin! "responses")
@@ -230,6 +352,7 @@
 (load-plugin! "openai-web-search")
 (load-plugin! "openrouter-web-search")
 (load-plugin! "skills")
+(load-plugin! "context-management")
 (load-plugin! "dynamic-workflows")
 (load-plugin! "codex-patch")
 (load-plugin! "simple-prompt")

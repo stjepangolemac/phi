@@ -8,6 +8,7 @@
     { "name": "openai-web-search", "version": "0.1.0", "path": "policy/tools/openai-web-search.scm" },
     { "name": "openrouter-web-search", "version": "0.1.0", "path": "policy/tools/openrouter-web-search.scm" },
     { "name": "skills", "version": "0.1.0", "path": "policy/tools/skills.scm" },
+    { "name": "context-management", "version": "0.1.0", "path": "policy/tools/context.scm" },
     { "name": "dynamic-workflows", "version": "0.1.0", "path": "policy/tools/dynamic-workflows" },
     { "name": "codex-patch", "version": "0.1.0", "path": "policy/tools/codex-patch.scm" },
     { "name": "simple-prompt", "version": "0.1.0", "path": "policy/prompts/simple.scm" },

@@ -124,6 +124,222 @@
         'compactor selected-compactor))
 (define (load-plugin! _) #t)
 
+;; Context primitives live in the prelude so config-only plugin discovery can
+;; compile the default agent loop before the selected plugin sources are loaded.
+(define (context-tool-name? name)
+  (or (equal? name "context_mark")
+      (equal? name "context_inspect")
+      (equal? name "context_compact")))
+
+(define (context-runtime-id prefix number)
+  (define raw (number->string number))
+  (define length (string-length raw))
+  (define normalized
+    (if (and (>= length 2)
+             (equal? (substring raw (- length 2) length) ".0"))
+        (substring raw 0 (- length 2))
+        raw))
+  (string-append prefix normalized))
+
+(define (context-item-messages item) (hash-ref item 'messages))
+
+(define (context-token-count messages)
+  (estimated-message-tokens messages))
+
+(define (context-raw-item id label messages closed)
+  (hash 'id id 'label label 'type "raw" 'messages messages
+        'tokens (context-token-count messages)
+        'from_tokens (context-token-count messages)
+        'closed closed 'covers '() 'after '()))
+
+(define (context-summary-item id label message from-tokens covers sources after)
+  (hash 'id id 'label label 'type "summary" 'messages (list message)
+        'tokens (context-token-count (list message))
+        'from_tokens from-tokens 'closed #t 'covers covers 'sources sources
+        'after after))
+
+(define (context-initial-items messages)
+  (list (context-raw-item "S1" "Initial context" messages #f)))
+
+(define (context-flatten-items items)
+  (if (null? items)
+      '()
+      (append (context-item-messages (car items))
+              (hash-ref (car items) 'after)
+              (context-flatten-items (cdr items)))))
+
+(define (context-drop values count)
+  (if (or (<= count 0) (null? values))
+      values
+      (context-drop (cdr values) (- count 1))))
+
+(define (context-replace-last items replacement)
+  (cond
+    [(null? items) (list replacement)]
+    [(null? (cdr items)) (list replacement)]
+    [else (cons (car items) (context-replace-last (cdr items) replacement))]))
+
+(define (context-append-to-open items added)
+  (define item (car (reverse items)))
+  (define messages (append (context-item-messages item) added))
+  (define updated
+    (hash-insert
+      (hash-insert
+        (hash-insert item 'messages messages)
+        'tokens (context-token-count messages))
+      'from_tokens (context-token-count messages)))
+  (context-replace-last items updated))
+
+(define (context-sync-items items messages)
+  (if (null? items)
+      (context-initial-items messages)
+      (let ([projected (context-flatten-items items)])
+        (cond
+          [(equal? projected messages) items]
+          [(<= (length projected) (length messages))
+           (context-append-to-open items
+                                   (context-drop messages (length projected)))]
+          [else (context-initial-items messages)]))))
+
+(define (context-last-item items) (car (reverse items)))
+
+(define (context-close-last items)
+  (define item (context-last-item items))
+  (context-replace-last items (hash-insert item 'closed #t)))
+
+(define (context-control-message? message call-id)
+  (and (or (equal? (hash-ref message 'kind) "tool_call")
+           (equal? (hash-ref message 'kind) "tool_result"))
+       (equal? (hash-ref message 'call_id) call-id)))
+
+(define (context-without-control messages call-id)
+  (cond
+    [(null? messages) '()]
+    [(context-control-message? (car messages) call-id)
+     (context-without-control (cdr messages) call-id)]
+    [else
+     (cons (car messages) (context-without-control (cdr messages) call-id))]))
+
+(define (context-control-messages messages call-id)
+  (cond
+    [(null? messages) '()]
+    [(context-control-message? (car messages) call-id)
+     (cons (car messages) (context-control-messages (cdr messages) call-id))]
+    [else (context-control-messages (cdr messages) call-id)]))
+
+(define (context-mark-items items id label call-id)
+  (define current (context-last-item items))
+  (define messages (context-item-messages current))
+  (define remaining (context-without-control messages call-id))
+  (define controls (context-control-messages messages call-id))
+  (define boundary
+    (hash-insert
+      (hash-insert
+        (hash-insert
+          (hash-insert current 'messages remaining)
+          'tokens (context-token-count remaining))
+        'from_tokens (context-token-count remaining))
+      'after controls))
+  (append
+    (context-replace-last items (hash-insert boundary 'closed #t))
+    (list (context-raw-item id label '() #f))))
+
+(define (context-public-item item)
+  (hash 'id (hash-ref item 'id)
+        'label (hash-ref item 'label)
+        'type (hash-ref item 'type)
+        'tokens (hash-ref item 'tokens)
+        'from_tokens (hash-ref item 'from_tokens)
+        'closed (hash-ref item 'closed)
+        'covers (hash-ref item 'covers)))
+
+(define (context-public-items items)
+  (if (null? items)
+      '()
+      (cons (context-public-item (car items))
+            (context-public-items (cdr items)))))
+
+(define (context-inspection items messages usage limit)
+  (define used (estimated-context-tokens messages usage))
+  (define percent (if (<= limit 0) 0 (quotient (* used 100) limit)))
+  (hash 'usage (hash 'used used 'limit limit 'percent percent)
+        'fixed_tokens (estimated-fixed-tokens messages usage)
+        'items (context-public-items items)))
+
+(define (context-tool-result call result)
+  (hash 'kind "tool_result" 'call_id (hash-ref call 'call_id)
+        'content (value->jsexpr-string result)))
+
+(define (context-find-start items first-id)
+  (cond
+    [(null? items) (error! (string-append "unknown context item: " first-id))]
+    [(equal? first-id (hash-ref (car items) 'id)) items]
+    [else (context-find-start (cdr items) first-id)]))
+
+(define (context-selected-items remaining ids selected)
+  (cond
+    [(null? ids) (reverse selected)]
+    [(null? remaining)
+     (error! "context items must be ordered and adjacent in the active context")]
+    [(not (equal? (car ids) (hash-ref (car remaining) 'id)))
+     (error! "context items must be ordered and adjacent in the active context")]
+    [(not (hash-ref (car remaining) 'closed))
+     (error! (string-append "context item is still open: " (car ids)
+                            "; call context_mark before compacting it"))]
+    [else
+     (context-selected-items (cdr remaining) (cdr ids)
+                             (cons (car remaining) selected))]))
+
+(define (context-selection items ids)
+  (if (null? ids) (error! "context_compact requires at least one item"))
+  (context-selected-items (context-find-start items (car ids)) ids '()))
+
+(define (context-sum-from-tokens items)
+  (if (null? items)
+      0
+      (+ (hash-ref (car items) 'from_tokens)
+         (context-sum-from-tokens (cdr items)))))
+
+(define (context-selected-messages items)
+  (context-flatten-items items))
+
+(define (context-selection-after items)
+  (hash-ref (context-last-item items) 'after))
+
+(define context-summary-instructions
+  "Summarize only the supplied closed context items for a model that will continue the conversation. Preserve durable user requirements, instructions, findings, decisions, rejected alternatives, implementation outcomes, exact paths and identifiers, verification, failures, unresolved work, and handoff state. Global user instructions must remain accessible. Be concise and return only the summary.")
+
+(define (context-compatible-messages messages provider)
+  (cond
+    [(null? messages) '()]
+    [(and (equal? (hash-ref (car messages) 'kind) "provider_item")
+          (not (equal? (hash-ref (car messages) 'provider) provider)))
+     (context-compatible-messages (cdr messages) provider)]
+    [else
+     (cons (car messages)
+           (context-compatible-messages (cdr messages) provider))]))
+
+(define (start-context-summary messages model reasoning service-tier)
+  (define provider (hash-ref (model-spec model) 'provider))
+  (provider-request
+    (hash 'instructions context-summary-instructions
+          'messages (context-compatible-messages messages provider) 'tools '())
+    model reasoning service-tier))
+
+(define (complete-context-summary events model)
+  (define output (provider-output-for model events))
+  (if (equal? output "")
+      (error! "selective context compactor returned no summary")
+      output))
+
+(define (context-replace-selection items ids summary)
+  (cond
+    [(null? items) '()]
+    [(equal? (hash-ref (car items) 'id) (car ids))
+     (cons summary (context-drop items (length ids)))]
+    [else
+     (cons (car items) (context-replace-selection (cdr items) ids summary))]))
+
 (define (registered-command-specs)
   (map (lambda (entry) (hash-ref entry 'spec)) command-registry))
 

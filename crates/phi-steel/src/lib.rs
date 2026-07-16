@@ -411,6 +411,7 @@ mod tests {
             root.join("policy/tools/openai-web-search.scm"),
             root.join("policy/tools/openrouter-web-search.scm"),
             root.join("policy/tools/skills.scm"),
+            root.join("policy/tools/context.scm"),
             root.join("policy/tools/codex-patch.scm"),
             root.join("policy/prompts/simple.scm"),
             root.join("policy/compaction/structured.scm"),
@@ -444,6 +445,35 @@ mod tests {
         let mut sources = plugins(root);
         sources[1] = provider;
         Policy::load(&root.join("config.scm"), &sources).unwrap()
+    }
+
+    fn response_call(name: &str, call_id: &str, arguments: serde_json::Value) -> Event {
+        Event::HttpCompleted {
+            success: true,
+            status: 200,
+            events: vec![serde_json::json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": arguments.to_string()
+                }
+            })],
+            error: String::new(),
+        }
+    }
+
+    fn response_text(content: &str) -> Event {
+        Event::HttpCompleted {
+            success: true,
+            status: 200,
+            events: vec![serde_json::json!({
+                "type": "response.output_text.delta",
+                "delta": content
+            })],
+            error: String::new(),
+        }
     }
 
     #[test]
@@ -707,6 +737,7 @@ mod tests {
             root.join("policy/providers/openrouter.scm"),
             root.join("policy/tools/openai-web-search.scm"),
             root.join("policy/tools/openrouter-web-search.scm"),
+            root.join("policy/tools/context.scm"),
             root.join("policy/tools/codex-patch.scm"),
             prompt,
             root.join("policy/compaction/structured.scm"),
@@ -763,6 +794,230 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(&output.effects[0], Effect::HttpRequest { .. }));
+    }
+
+    #[test]
+    fn context_tools_mark_and_inspect_without_a_plan() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut policy = policy(&root);
+        let output = policy
+            .on_event(&Event::UserMessage {
+                content: "investigate".into(),
+            })
+            .unwrap();
+        assert!(
+            matches!(&output.effects[0], Effect::HttpRequest { body, .. }
+            if ["context_mark", "context_inspect", "context_compact"].iter().all(|name|
+                body["tools"].as_array().unwrap().iter().any(|tool| tool["name"] == *name)))
+        );
+
+        let output = policy
+            .on_event(&response_call(
+                "context_mark",
+                "mark-1",
+                serde_json::json!({ "label": "Implementation" }),
+            ))
+            .unwrap();
+        assert!(matches!(&output.effects[0], Effect::HttpRequest { .. }));
+        let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
+        let items = state["context_items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["id"], "S1");
+        assert_eq!(items[0]["closed"], true);
+        assert_eq!(items[1]["id"], "S2");
+        assert_eq!(items[1]["label"], "Implementation");
+        assert_eq!(items[1]["closed"], false);
+        let boundary = items[0]["after"].as_array().unwrap();
+        assert!(
+            boundary.iter().any(|message| {
+                message["kind"] == "tool_call" && message["call_id"] == "mark-1"
+            })
+        );
+        assert!(
+            boundary.iter().any(|message| {
+                message["kind"] == "tool_result" && message["call_id"] == "mark-1"
+            })
+        );
+
+        policy
+            .on_event(&response_call(
+                "context_inspect",
+                "inspect-1",
+                serde_json::json!({}),
+            ))
+            .unwrap();
+        let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
+        let result = state["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|message| message["call_id"] == "inspect-1")
+            .unwrap();
+        let inspected: serde_json::Value =
+            serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+        assert!(inspected["usage"]["used"].is_number());
+        assert!(inspected["usage"]["limit"].is_number());
+        assert!(inspected["usage"]["percent"].is_number());
+        assert!(inspected["fixed_tokens"].is_number());
+        assert_eq!(inspected["items"][0]["id"], "S1");
+        assert_eq!(inspected["items"][1]["id"], "S2");
+        assert!(inspected.get("messages").is_none());
+    }
+
+    #[test]
+    fn context_compaction_rejects_nonadjacent_and_open_items() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut marked_policy = policy(&root);
+        marked_policy
+            .on_event(&Event::UserMessage {
+                content: "first".into(),
+            })
+            .unwrap();
+        marked_policy
+            .on_event(&response_call(
+                "context_mark",
+                "mark-1",
+                serde_json::json!({ "label": "second" }),
+            ))
+            .unwrap();
+        marked_policy
+            .on_event(&response_text("second work"))
+            .unwrap();
+        marked_policy
+            .on_event(&Event::UserMessage {
+                content: "continue".into(),
+            })
+            .unwrap();
+        marked_policy
+            .on_event(&response_call(
+                "context_mark",
+                "mark-2",
+                serde_json::json!({ "label": "third" }),
+            ))
+            .unwrap();
+
+        let nonadjacent = marked_policy
+            .on_event(&response_call(
+                "context_compact",
+                "compact-bad",
+                serde_json::json!({ "items": ["S1", "S3"], "label": "bad" }),
+            ))
+            .unwrap_err();
+        assert!(
+            nonadjacent
+                .to_string()
+                .contains("ordered and adjacent in the active context")
+        );
+
+        let mut open_policy = policy(&root);
+        open_policy
+            .on_event(&Event::UserMessage {
+                content: "open".into(),
+            })
+            .unwrap();
+        let open = open_policy
+            .on_event(&response_call(
+                "context_compact",
+                "compact-open",
+                serde_json::json!({ "items": ["S1"], "label": "bad" }),
+            ))
+            .unwrap_err();
+        assert!(open.to_string().contains("context item is still open: S1"));
+        assert!(open.to_string().contains("context_mark"));
+    }
+
+    #[test]
+    fn summaries_can_be_compacted_again_with_nested_provenance() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut policy = policy(&root);
+        policy
+            .on_event(&Event::UserMessage {
+                content: "planning details".into(),
+            })
+            .unwrap();
+        policy
+            .on_event(&response_call(
+                "context_mark",
+                "mark-1",
+                serde_json::json!({ "label": "implementation" }),
+            ))
+            .unwrap();
+        policy
+            .on_event(&response_text("implementation details"))
+            .unwrap();
+        policy
+            .on_event(&Event::UserMessage {
+                content: "continue implementation".into(),
+            })
+            .unwrap();
+        policy
+            .on_event(&response_call(
+                "context_mark",
+                "mark-2",
+                serde_json::json!({ "label": "review" }),
+            ))
+            .unwrap();
+        let output = policy
+            .on_event(&response_call(
+                "context_compact",
+                "compact-1",
+                serde_json::json!({
+                    "items": ["S1", "S2"],
+                    "label": "planning and implementation"
+                }),
+            ))
+            .unwrap();
+        assert!(
+            matches!(&output.effects[0], Effect::HttpRequest { body, .. }
+            if body["instructions"].as_str().unwrap().contains("supplied closed context items"))
+        );
+        policy
+            .on_event(&response_text("durable first summary"))
+            .unwrap();
+        let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
+        assert_eq!(state["context_items"][0]["id"], "C1");
+        assert_eq!(
+            state["context_items"][0]["covers"],
+            serde_json::json!(["S1", "S2"])
+        );
+        assert!(state["context_items"][0]["from_tokens"].as_f64().unwrap() > 0.0);
+
+        policy.on_event(&response_text("review details")).unwrap();
+        policy
+            .on_event(&Event::UserMessage {
+                content: "finish review".into(),
+            })
+            .unwrap();
+        policy
+            .on_event(&response_call(
+                "context_mark",
+                "mark-3",
+                serde_json::json!({ "label": "final" }),
+            ))
+            .unwrap();
+        policy
+            .on_event(&response_call(
+                "context_compact",
+                "compact-2",
+                serde_json::json!({
+                    "items": ["C1", "S3"],
+                    "label": "completed work"
+                }),
+            ))
+            .unwrap();
+        policy
+            .on_event(&response_text("durable nested summary"))
+            .unwrap();
+        let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
+        let summary = &state["context_items"][0];
+        assert_eq!(summary["id"], "C2");
+        assert_eq!(summary["covers"], serde_json::json!(["C1", "S3"]));
+        assert_eq!(summary["sources"][0]["id"], "C1");
+        assert_eq!(
+            summary["sources"][0]["covers"],
+            serde_json::json!(["S1", "S2"])
+        );
     }
 
     #[test]
@@ -2064,6 +2319,7 @@ mod tests {
             root.join("policy/providers/openrouter.scm"),
             root.join("policy/tools/openai-web-search.scm"),
             root.join("policy/tools/openrouter-web-search.scm"),
+            root.join("policy/tools/context.scm"),
             root.join("policy/tools/codex-patch.scm"),
             root.join("policy/prompts/simple.scm"),
             root.join("policy/compaction/structured.scm"),
