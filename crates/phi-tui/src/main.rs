@@ -1698,7 +1698,19 @@ fn push_markdown(lines: &mut Vec<Line<'static>>, role: &str, content: &str, widt
     let content_width = width.saturating_sub(2).max(1);
     let mut marked = false;
     let mut in_code = false;
-    for line in markdown.lines {
+    let mut markdown_lines = markdown.lines.into_iter().peekable();
+    while let Some(mut line) = markdown_lines.next() {
+        let marker_text = line.to_string();
+        if is_ordered_list_marker(&marker_text)
+            && let Some(next) = markdown_lines.peek()
+            && !next.to_string().trim().is_empty()
+        {
+            let item = markdown_lines.next().expect("peeked ordered list item");
+            if !marker_text.chars().last().is_some_and(char::is_whitespace) {
+                line.spans.push(Span::raw(" "));
+            }
+            line.spans.extend(item.spans);
+        }
         let plain = line.to_string();
         if plain.trim_start().starts_with("```") {
             if in_code {
@@ -1791,6 +1803,12 @@ fn is_ordered_list_line(line: &str) -> bool {
     let trimmed = line.trim_start();
     let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
     digits > 0 && trimmed[digits..].starts_with(". ")
+}
+
+fn is_ordered_list_marker(line: &str) -> bool {
+    let trimmed = line.trim();
+    let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
+    digits > 0 && &trimmed[digits..] == "."
 }
 
 fn wrap_styled_line(line: &Line<'_>, width: usize) -> Vec<Line<'static>> {
@@ -3262,6 +3280,32 @@ mod tests {
         );
         assert!(!lines.iter().any(|line| line.to_string().trim() == "1."));
         assert!(!lines.iter().any(|line| line.to_string().trim() == "2."));
+    }
+
+    #[test]
+    fn keeps_spaced_ordered_list_markers_with_their_items() {
+        let mut lines = Vec::new();
+        push_message(
+            &mut lines,
+            "phi",
+            "1. one\n\n2. two\n\n3. three\n4. four",
+            40,
+        );
+
+        let rendered = lines.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert!(
+            rendered.iter().any(|line| line.starts_with("1. one")),
+            "rendered lines: {rendered:#?}"
+        );
+        assert!(rendered.iter().any(|line| line.starts_with("2. two")));
+        assert!(rendered.iter().any(|line| line.starts_with("3. three")));
+        assert!(rendered.iter().any(|line| line.starts_with("4. four")));
+        assert!(
+            !rendered
+                .iter()
+                .any(|line| matches!(line.trim(), "1." | "2." | "3." | "4.")),
+            "rendered lines: {rendered:#?}"
+        );
     }
 
     #[test]
