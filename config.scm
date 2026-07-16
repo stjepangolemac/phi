@@ -128,38 +128,63 @@
           (define ids (hash-ref pending-context 'items))
           (define selected (context-selection active-context-items ids))
           (define summary-text (complete-context-summary (hash-ref event 'events) model))
-          (define summary-message
-            (hash 'kind "message" 'role "user"
-                  'content (string-append "Context summary:\n" summary-text)))
-          (define summary-id
-            (context-runtime-id "C" next-context-summary))
-          (define summary
-            (context-summary-item
-              summary-id (hash-ref pending-context 'label) summary-message
-              (context-sum-from-tokens selected) ids selected
-              (context-selection-after selected)))
-          (set! next-context-summary (+ next-context-summary 1))
-          (set! active-context-items
-                (context-replace-selection active-context-items ids summary))
-          (set! messages (context-flatten-items active-context-items))
-          (define result
-            (hash 'created (context-public-item summary)
-                  'usage
-                  (hash-ref
-                    (context-inspection active-context-items messages last-usage
-                                        (hash-ref (model-spec model) 'context_window))
-                    'usage)))
-          (set! messages
-                (append messages
-                        (list (hash 'kind "tool_result"
-                                    'call_id (hash-ref pending-context 'call_id)
-                                    'content (value->jsexpr-string result)))))
-          (set! pending-context (hash))
-          (set! compactions (+ compactions 1))
-          (set! next-state
-                (make-state messages compactions last-usage context-budget
-                            model reasoning service-tier "working" "" 0))
-          (request-effect messages model reasoning service-tier)]
+          (if (equal? summary-text "")
+              (if (< compaction-attempt 4)
+                  (begin
+                    (set! next-state
+                          (make-state messages compactions last-usage context-budget
+                                      model reasoning service-tier
+                                      "selective_compacting" ""
+                                      (+ compaction-attempt 1)))
+                    (start-context-summary-repair
+                      (context-selected-messages selected)
+                      model reasoning service-tier))
+                  (let* ([call-id (hash-ref pending-context 'call_id)]
+                         [result
+                          (hash 'error
+                                "selective context compactor returned no summary after 4 repair attempts")])
+                    (set! messages
+                          (append messages
+                                  (list (hash 'kind "tool_result" 'call_id call-id
+                                              'content (value->jsexpr-string result)))))
+                    (set! pending-context (hash))
+                    (set! next-state
+                          (make-state messages compactions last-usage context-budget
+                                      model reasoning service-tier "working" "" 0))
+                    (request-effect messages model reasoning service-tier)))
+              (begin
+                (define summary-message
+                  (hash 'kind "message" 'role "user"
+                        'content (string-append "Context summary:\n" summary-text)))
+                (define summary-id
+                  (context-runtime-id "C" next-context-summary))
+                (define summary
+                  (context-summary-item
+                    summary-id (hash-ref pending-context 'label) summary-message
+                    (context-sum-from-tokens selected) ids selected
+                    (context-selection-after selected)))
+                (set! next-context-summary (+ next-context-summary 1))
+                (set! active-context-items
+                      (context-replace-selection active-context-items ids summary))
+                (set! messages (context-flatten-items active-context-items))
+                (define result
+                  (hash 'created (context-public-item summary)
+                        'usage
+                        (hash-ref
+                          (context-inspection active-context-items messages last-usage
+                                              (hash-ref (model-spec model) 'context_window))
+                          'usage)))
+                (set! messages
+                      (append messages
+                              (list (hash 'kind "tool_result"
+                                          'call_id (hash-ref pending-context 'call_id)
+                                          'content (value->jsexpr-string result)))))
+                (set! pending-context (hash))
+                (set! compactions (+ compactions 1))
+                (set! next-state
+                      (make-state messages compactions last-usage context-budget
+                                  model reasoning service-tier "working" "" 0))
+                (request-effect messages model reasoning service-tier)))]
          [(equal? activity "compacting")
           (define result
             (complete-selected-compaction
