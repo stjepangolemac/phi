@@ -1,4 +1,5 @@
 import { readFile, writeFile, mkdir, rename, appendFile, copyFile } from "node:fs/promises"
+import { randomUUID } from "node:crypto"
 import { join } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import { configure } from "./api.mjs"
@@ -21,7 +22,7 @@ const summary = {
 }
 
 async function atomicJson(path, value) {
-  const temporary = `${path}.tmp`
+  const temporary = `${path}.${nodeProcess.pid}.${randomUUID()}.tmp`
   await writeFile(temporary, JSON.stringify(value, null, 2) + "\n")
   await rename(temporary, path)
 }
@@ -69,29 +70,6 @@ function stopChildren() {
 nodeProcess.on("SIGTERM", () => { stopChildren(); nodeProcess.exit(143) })
 nodeProcess.on("SIGINT", () => { stopChildren(); nodeProcess.exit(130) })
 
-function safeName(name) {
-  return typeof name === "string"
-    && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)
-    && name !== "." && name !== ".."
-}
-
-async function readable(path) {
-  try { await readFile(path); return true } catch { return false }
-}
-
-async function resolveWorkflow(name) {
-  if (!safeName(name)) throw new Error(`invalid workflow name: ${name}`)
-  const candidates = [
-    join(request.workspace, ".phi", "workflows", `${name}.js`),
-    join(request.home, "workflows", `${name}.js`),
-    ...request.pluginDirs.map(root => join(root, "workflows", `${name}.js`))
-  ]
-  for (const candidate of candidates) {
-    if (await readable(candidate)) return candidate
-  }
-  throw new Error(`workflow not found: ${name}`)
-}
-
 function prepareSource(source, apiUrl) {
   if (/\bimport\s*\(/.test(source)) throw new Error("dynamic imports are not allowed")
   const imports = [...source.matchAll(/\bfrom\s*(["'])([^"']+)\1/g)]
@@ -116,7 +94,10 @@ await atomicJson(statePath, {
 await atomicJson(summaryPath, summary)
 
 try {
-  const sourcePath = await resolveWorkflow(request.name)
+  const sourcePath = request.workflowPath
+  if (typeof sourcePath !== "string" || sourcePath.length === 0) {
+    throw new Error("workflow runner requires a resolved workflow path")
+  }
   const persistedPath = join(taskDir, "workflow.js")
   await copyFile(sourcePath, persistedPath)
   const source = await readFile(sourcePath, "utf8")

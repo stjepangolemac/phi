@@ -41,6 +41,7 @@ impl WorkflowTasks {
             .and_then(Value::as_str)
             .context("Workflow requires name")?;
         validate_name(name)?;
+        let workflow_path = resolve_workflow(workspace, home, plugin_roots, name)?;
         let args = arguments.get("args").cloned().unwrap_or(Value::Null);
         let plugin = plugin_roots
             .get("dynamic-workflows")
@@ -64,16 +65,14 @@ impl WorkflowTasks {
             }),
         )?;
         let phi = std::env::current_exe().context("resolve Phi executable")?;
-        let mut roots = plugin_roots.values().cloned().collect::<Vec<_>>();
-        roots.sort();
         let request = json!({
             "taskId": task_id,
             "name": name,
+            "workflowPath": workflow_path,
             "args": args,
             "workspace": workspace,
             "home": home,
             "taskDir": dir,
-            "pluginDirs": roots,
             "phi": phi,
             "startedAt": started_at,
             "limits": {
@@ -276,6 +275,30 @@ fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn resolve_workflow(
+    workspace: &Path,
+    home: &Path,
+    plugin_roots: &HashMap<String, PathBuf>,
+    name: &str,
+) -> Result<PathBuf> {
+    let filename = format!("{name}.js");
+    let mut candidates = vec![
+        workspace.join(".phi/workflows").join(&filename),
+        home.join("workflows").join(&filename),
+    ];
+    let mut roots = plugin_roots.values().collect::<Vec<_>>();
+    roots.sort();
+    candidates.extend(
+        roots
+            .into_iter()
+            .map(|root| root.join("workflows").join(&filename)),
+    );
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .with_context(|| format!("workflow not found: {name}"))
+}
+
 fn task_id(arguments: &Value) -> Result<&str> {
     let id = arguments
         .get("task_id")
@@ -294,13 +317,7 @@ fn now_ms() -> Result<u128> {
 }
 
 fn write_json(path: &Path, value: &Value) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let temporary = path.with_extension("tmp");
-    fs::write(&temporary, serde_json::to_vec_pretty(value)?)?;
-    fs::rename(temporary, path)?;
-    Ok(())
+    phi_core::write_json_atomic(path, value, phi_core::AtomicWriteMode::Overwrite)
 }
 
 fn read_json(path: &Path) -> Result<Value> {
@@ -352,13 +369,60 @@ mod tests {
 
     #[test]
     fn workflow_names_are_single_safe_components() {
-        assert!(validate_name("review-changes").is_ok());
-        assert!(validate_name("../escape").is_err());
-        assert!(validate_name("nested/name").is_err());
+        for name in ["review-changes", ".hidden", "with.dot", "with_underscore"] {
+            assert!(validate_name(name).is_ok(), "expected valid name: {name:?}");
+        }
+        for name in ["", ".", "..", "../escape", "nested/name", "nested\\name"] {
+            assert!(
+                validate_name(name).is_err(),
+                "expected invalid name: {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolves_workflows_in_discovery_order() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let plugins_root = tempfile::tempdir().unwrap();
+        let first_plugin = plugins_root.path().join("a-plugin");
+        let second_plugin = plugins_root.path().join("z-plugin");
+        let workspace_workflow = workspace.path().join(".phi/workflows/.hidden.js");
+        let home_workflow = home.path().join("workflows/.hidden.js");
+        let first_plugin_workflow = first_plugin.join("workflows/.hidden.js");
+        let second_plugin_workflow = second_plugin.join("workflows/.hidden.js");
+        for path in [
+            &workspace_workflow,
+            &home_workflow,
+            &first_plugin_workflow,
+            &second_plugin_workflow,
+        ] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "export default async () => null").unwrap();
+        }
+        let plugins = HashMap::from([
+            ("z-plugin".into(), second_plugin),
+            ("a-plugin".into(), first_plugin),
+        ]);
+
+        assert_eq!(
+            resolve_workflow(workspace.path(), home.path(), &plugins, ".hidden").unwrap(),
+            workspace_workflow
+        );
+        fs::remove_file(&workspace_workflow).unwrap();
+        assert_eq!(
+            resolve_workflow(workspace.path(), home.path(), &plugins, ".hidden").unwrap(),
+            home_workflow
+        );
+        fs::remove_file(&home_workflow).unwrap();
+        assert_eq!(
+            resolve_workflow(workspace.path(), home.path(), &plugins, ".hidden").unwrap(),
+            first_plugin_workflow
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn launches_and_inspects_a_plugin_workflow() {
+    async fn launches_and_inspects_a_leading_dot_workflow() {
         if Command::new("node")
             .arg("--version")
             .output()
@@ -372,6 +436,16 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let session = workspace.path().join(".phi/sessions/test");
         fs::create_dir_all(&session).unwrap();
+        let workflow = workspace.path().join(".phi/workflows/.hidden.js");
+        fs::create_dir_all(workflow.parent().unwrap()).unwrap();
+        fs::write(
+            workflow,
+            r#"
+                export const meta = { name: ".hidden", description: "test workflow" }
+                export default async function ({ args }) { return args }
+            "#,
+        )
+        .unwrap();
         let mut plugins = HashMap::new();
         plugins.insert(
             "dynamic-workflows".into(),
@@ -384,7 +458,7 @@ mod tests {
                 home.path(),
                 &session,
                 &plugins,
-                &json!({ "name": "example", "args": { "ok": true } }),
+                &json!({ "name": ".hidden", "args": { "ok": true } }),
             )
             .await
             .unwrap();
@@ -394,7 +468,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(output["status"], "completed");
-        assert_eq!(output["workflow"], "example");
+        assert_eq!(output["workflow"], ".hidden");
         assert_eq!(output["result"]["value"], json!({ "ok": true }));
         assert!(
             output["progress"]

@@ -2199,31 +2199,16 @@ fn workflow_summary(result: &serde_json::Value) -> Vec<String> {
 }
 
 fn tool_result(result: &serde_json::Value) -> String {
-    if let Some(error) = result.get("error").and_then(serde_json::Value::as_str) {
-        return truncate_display(error, 2_000);
-    }
-    let mut output = String::new();
-    for field in ["stdout", "stderr"] {
-        if let Some(value) = result.get(field).and_then(serde_json::Value::as_str)
-            && !value.trim().is_empty()
-        {
-            if !output.is_empty() {
-                output.push('\n');
-            }
-            output.push_str(value.trim_end());
-        }
-    }
-    if output.is_empty()
-        && let Some(code) = result.get("exit_code").and_then(serde_json::Value::as_i64)
-    {
-        output = format!("Exited with code {code}");
-    }
-    truncate_display(&output, 2_000)
+    truncate_display(&raw_process_result(result), 2_000)
 }
 
 fn shell_result(result: &serde_json::Value) -> String {
+    compact_shell_output(&raw_process_result(result))
+}
+
+fn raw_process_result(result: &serde_json::Value) -> String {
     if let Some(error) = result.get("error").and_then(serde_json::Value::as_str) {
-        return truncate_display(error, 2_000);
+        return error.to_owned();
     }
     let mut output = String::new();
     for field in ["stdout", "stderr"] {
@@ -2241,7 +2226,7 @@ fn shell_result(result: &serde_json::Value) -> String {
     {
         output = format!("Exited with code {code}");
     }
-    compact_shell_output(&output)
+    output
 }
 
 fn compact_shell_output(value: &str) -> String {
@@ -3154,6 +3139,60 @@ mod tests {
             40
         );
         assert!(single_long_line[3].to_string().contains('…'));
+    }
+
+    #[test]
+    fn normalizes_process_errors() {
+        let result = serde_json::json!({
+            "error": "command failed",
+            "stdout": "ignored output",
+            "stderr": "ignored error"
+        });
+
+        assert_eq!(raw_process_result(&result), "command failed");
+        assert_eq!(tool_result(&result), "command failed");
+        assert_eq!(shell_result(&result), "command failed");
+    }
+
+    #[test]
+    fn joins_process_stdout_and_stderr() {
+        let result = serde_json::json!({
+            "exit_code": 1,
+            "stdout": "standard output\n",
+            "stderr": "standard error\n"
+        });
+
+        assert_eq!(
+            raw_process_result(&result),
+            "standard output\nstandard error"
+        );
+        assert_eq!(tool_result(&result), "standard output\nstandard error");
+        assert_eq!(shell_result(&result), "standard output\nstandard error");
+    }
+
+    #[test]
+    fn leaves_empty_process_output_empty() {
+        let result = serde_json::json!({
+            "stdout": " \n",
+            "stderr": ""
+        });
+
+        assert_eq!(raw_process_result(&result), "");
+        assert_eq!(tool_result(&result), "");
+        assert_eq!(shell_result(&result), "");
+    }
+
+    #[test]
+    fn falls_back_to_nonzero_process_exit_code() {
+        let result = serde_json::json!({
+            "exit_code": 7,
+            "stdout": "",
+            "stderr": "\n"
+        });
+
+        assert_eq!(raw_process_result(&result), "Exited with code 7");
+        assert_eq!(tool_result(&result), "Exited with code 7");
+        assert_eq!(shell_result(&result), "Exited with code 7");
     }
 
     #[test]

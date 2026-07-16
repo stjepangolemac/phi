@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::home::PhiHome;
+use crate::{AtomicWriteMode, SymlinkPolicy, copy_package_tree, home::PhiHome, write_json_atomic};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PluginManifest {
@@ -67,7 +67,7 @@ pub fn install(home: &PhiHome, url: &str, revision: &str, path: &str) -> Result<
         let parent = target.parent().context("plugin target has no parent")?;
         fs::create_dir_all(parent)?;
         let staged = tempfile::tempdir_in(parent)?;
-        copy_tree(&source, staged.path())?;
+        copy_package_tree(&source, staged.path(), SymlinkPolicy::Reject)?;
         let staged = staged.keep();
         fs::rename(staged, &target)?;
     }
@@ -136,12 +136,7 @@ pub fn install_root(home: &PhiHome, name: &str, commit: &str) -> PathBuf {
 }
 
 fn write_lock(home: &PhiHome, lock: &PluginLock) -> Result<()> {
-    fs::create_dir_all(&home.root)?;
-    let mut temp = tempfile::NamedTempFile::new_in(&home.root)?;
-    serde_json::to_writer_pretty(&mut temp, lock)?;
-    temp.persist(home.plugin_lock())
-        .map_err(|error| error.error)?;
-    Ok(())
+    write_json_atomic(&home.plugin_lock(), lock, AtomicWriteMode::Overwrite)
 }
 
 fn validate_name(name: &str) -> Result<()> {
@@ -160,23 +155,6 @@ fn validate_entrypoint(root: &Path, manifest: &PluginManifest) -> Result<()> {
     let entrypoint = root.join(&manifest.entrypoint).canonicalize()?;
     if !entrypoint.starts_with(&root) || !entrypoint.is_file() {
         bail!("plugin entrypoint escapes its package");
-    }
-    Ok(())
-}
-
-fn copy_tree(source: &Path, target: &Path) -> Result<()> {
-    fs::create_dir_all(target)?;
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let kind = entry.file_type()?;
-        let destination = target.join(entry.file_name());
-        if kind.is_symlink() {
-            bail!("plugin packages may not contain symlinks");
-        } else if kind.is_dir() {
-            copy_tree(&entry.path(), &destination)?;
-        } else if kind.is_file() {
-            fs::copy(entry.path(), destination)?;
-        }
     }
     Ok(())
 }

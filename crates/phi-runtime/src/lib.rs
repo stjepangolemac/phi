@@ -300,7 +300,7 @@ fn copy_official_plugin(
         if plugin.exists() {
             std::fs::remove_dir_all(&plugin)?;
         }
-        return copy_tree(&source, &plugin);
+        return phi_core::copy_package_tree(&source, &plugin, phi_core::SymlinkPolicy::Follow);
     }
     write_bundled(
         &plugin.join("plugin.json"),
@@ -315,20 +315,6 @@ fn copy_official_plugin(
     }
     std::fs::copy(&source, plugin.join("main.scm"))
         .with_context(|| format!("copy official plugin {name} from {}", source.display()))?;
-    Ok(())
-}
-
-fn copy_tree(source: &Path, target: &Path) -> Result<()> {
-    std::fs::create_dir_all(target)?;
-    for entry in std::fs::read_dir(source)? {
-        let entry = entry?;
-        let destination = target.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_tree(&entry.path(), &destination)?;
-        } else {
-            std::fs::copy(entry.path(), destination)?;
-        }
-    }
     Ok(())
 }
 
@@ -418,6 +404,112 @@ fn entrypoints(sources: &phi_core::session::ComposedSources) -> Vec<PathBuf> {
         .collect()
 }
 
+struct ResolvedPolicySources {
+    sources: phi_core::session::ComposedSources,
+    saved_state: Option<String>,
+}
+
+struct SessionBootstrap {
+    session: phi_core::session::Session,
+    sources: phi_core::session::ComposedSources,
+    saved_state: Option<String>,
+}
+
+struct PolicyBootstrap {
+    policy: phi_steel::Policy,
+    capabilities: Arc<phi_core::capability::Registry>,
+}
+
+fn resolve_policy_sources(
+    home: &phi_core::home::PhiHome,
+    workspace: &Path,
+    session_id: Option<&str>,
+) -> Result<ResolvedPolicySources> {
+    match session_id {
+        Some(id) => {
+            let session = phi_core::session::Session::open(&workspace.join(".phi/sessions"), id)?;
+            let sources = session
+                .composed_sources()?
+                .context("session has no composition snapshot")?;
+            Ok(ResolvedPolicySources {
+                sources,
+                saved_state: Some(session.load_state()?),
+            })
+        }
+        None => Ok(ResolvedPolicySources {
+            sources: resolve_sources(home, workspace)?,
+            saved_state: None,
+        }),
+    }
+}
+
+fn resolve_session(
+    home: &phi_core::home::PhiHome,
+    workspace: &Path,
+    session_id: Option<&str>,
+) -> Result<SessionBootstrap> {
+    let sessions = workspace.join(".phi/sessions");
+    match session_id {
+        Some(id) => {
+            let session = phi_core::session::Session::open(&sessions, id)?;
+            let sources = session
+                .composed_sources()?
+                .context("session has no composition snapshot")?;
+            let saved_state = Some(session.load_state()?);
+            Ok(SessionBootstrap {
+                session,
+                sources,
+                saved_state,
+            })
+        }
+        None => {
+            let current = resolve_sources(home, workspace)?;
+            let session = phi_core::session::Session::create_composed(
+                &sessions,
+                &current.config,
+                &current.plugins,
+            )?;
+            let sources = session
+                .composed_sources()?
+                .context("missing composition snapshot")?;
+            Ok(SessionBootstrap {
+                session,
+                sources,
+                saved_state: None,
+            })
+        }
+    }
+}
+
+fn build_policy(
+    home: &phi_core::home::PhiHome,
+    workspace: &Path,
+    sources: &phi_core::session::ComposedSources,
+    saved_state: Option<String>,
+    full_access: bool,
+    session_id: &str,
+    output_schema: Option<&serde_json::Value>,
+) -> Result<PolicyBootstrap> {
+    let capabilities = Arc::new(capabilities(home, full_access));
+    let skills = discover_skills(home, workspace)?;
+    let policy = phi_steel::Policy::load_with_state(
+        &sources.config,
+        &entrypoints(sources),
+        &policy_config_with_schema(
+            &capabilities,
+            session_id,
+            &load_user_state(home)?,
+            &skills,
+            output_schema,
+        ),
+        saved_state,
+    )?;
+    Ok(PolicyBootstrap {
+        policy,
+        capabilities,
+    })
+}
+
 fn reload_composition(
     home: &phi_core::home::PhiHome,
     config_path: &Path,
@@ -425,25 +517,22 @@ fn reload_composition(
     session: &phi_core::session::Session,
     state: Option<String>,
     full_access: bool,
-) -> Result<(phi_steel::Policy, CommandCatalog)> {
+    output_schema: Option<&serde_json::Value>,
+) -> Result<(PolicyBootstrap, CommandCatalog)> {
     let _config = load_config(config_path)?;
     let sources = resolve_sources(home, workspace)?;
-    let capabilities = capabilities(home, full_access);
-    let skills = discover_skills(home, workspace)?;
-    let mut policy = phi_steel::Policy::load_with_state(
-        &sources.config,
-        &entrypoints(&sources),
-        &policy_config(
-            &capabilities,
-            session.id(),
-            &load_user_state(home)?,
-            &skills,
-        ),
+    let mut bootstrap = build_policy(
+        home,
+        workspace,
+        &sources,
         state,
+        full_access,
+        session.id(),
+        output_schema,
     )?;
-    let catalog = catalog(&mut policy)?;
+    let catalog = catalog(&mut bootstrap.policy)?;
     session.replace_composition(&sources.config, &sources.plugins)?;
-    Ok((policy, catalog))
+    Ok((bootstrap, catalog))
 }
 
 pub fn check_scheme_config(home: &phi_core::home::PhiHome, workspace: &Path) -> Result<()> {
@@ -460,57 +549,45 @@ fn load_user_state(home: &phi_core::home::PhiHome) -> Result<UserState> {
 }
 
 fn save_user_state(home: &phi_core::home::PhiHome, state: &UserState) -> Result<()> {
-    std::fs::write(home.state(), serde_json::to_vec_pretty(state)?)?;
-    Ok(())
+    phi_core::write_json_atomic(&home.state(), state, phi_core::AtomicWriteMode::Overwrite)
 }
 
 pub fn command_catalog(options: &RunOptions) -> Result<CommandCatalog> {
     let workspace = options.workspace.canonicalize()?;
     let _config = load_config(&options.config_path)?;
     let home = home_for_config(&options.config_path)?;
-    let (sources, state) = match &options.session_id {
-        Some(id) => {
-            let session = phi_core::session::Session::open(&workspace.join(".phi/sessions"), id)?;
-            let sources = session
-                .composed_sources()?
-                .context("session has no composition snapshot")?;
-            (sources, Some(session.load_state()?))
-        }
-        None => (resolve_sources(&home, &workspace)?, None),
-    };
-    let capabilities = capabilities(&home, options.full_access);
-    let skills = discover_skills(&home, &workspace)?;
-    let mut policy = phi_steel::Policy::load_with_state(
-        &sources.config,
-        &entrypoints(&sources),
-        &policy_config(
-            &capabilities,
-            options.session_id.as_deref().unwrap_or("catalog"),
-            &load_user_state(&home)?,
-            &skills,
-        ),
-        state,
+    let resolved = resolve_policy_sources(&home, &workspace, options.session_id.as_deref())?;
+    let mut bootstrap = build_policy(
+        &home,
+        &workspace,
+        &resolved.sources,
+        resolved.saved_state,
+        options.full_access,
+        options.session_id.as_deref().unwrap_or("catalog"),
+        None,
     )?;
-    catalog(&mut policy)
+    catalog(&mut bootstrap.policy)
 }
 
 pub fn harness_status(options: &RunOptions) -> Result<HarnessStatus> {
     let workspace = options.workspace.canonicalize()?;
     let _config = load_config(&options.config_path)?;
     let home = home_for_config(&options.config_path)?;
-    let sources = resolve_sources(&home, &workspace)?;
-    let capabilities = capabilities(&home, options.full_access);
-    let skills = discover_skills(&home, &workspace)?;
+    let resolved = resolve_policy_sources(&home, &workspace, None)?;
     let user_state = load_user_state(&home)?;
-    let mut policy = phi_steel::Policy::load_with_state(
-        &sources.config,
-        &entrypoints(&sources),
-        &policy_config(&capabilities, "status", &user_state, &skills),
+    let mut bootstrap = build_policy(
+        &home,
+        &workspace,
+        &resolved.sources,
+        resolved.saved_state,
+        options.full_access,
+        "status",
         None,
     )?;
-    let composition = policy.composition_status()?;
+    let composition = bootstrap.policy.composition_status()?;
     let lock = phi_core::plugin::read_lock(&home)?;
-    let plugins = sources
+    let plugins = resolved
+        .sources
         .plugins
         .iter()
         .map(|plugin| {
@@ -541,7 +618,7 @@ pub fn harness_status(options: &RunOptions) -> Result<HarnessStatus> {
         reasoning: selection.as_ref().map(|model| model.reasoning.clone()),
         service_tier: selection.as_ref().map(|model| model.service_tier.clone()),
         config: SchemeConfigStatus {
-            path: sources.config.display().to_string(),
+            path: resolved.sources.config.display().to_string(),
         },
         plugins,
         composition,
@@ -555,103 +632,67 @@ pub fn execute_command(
     let workspace = options.workspace.canonicalize()?;
     let _config = load_config(&options.config_path)?;
     let home = home_for_config(&options.config_path)?;
-    let sessions = workspace.join(".phi/sessions");
     if invocation.name == "new" {
         if !invocation.arguments.is_empty() {
             bail!("usage: /new");
         }
-        let current = resolve_sources(&home, &workspace)?;
-        let session = phi_core::session::Session::create_composed(
-            &sessions,
-            &current.config,
-            &current.plugins,
-        )?;
-        let sources = session
-            .composed_sources()?
-            .context("missing composition snapshot")?;
-        let capabilities = capabilities(&home, options.full_access);
-        let skills = discover_skills(&home, &workspace)?;
-        let mut policy = phi_steel::Policy::load_with_state(
-            &sources.config,
-            &entrypoints(&sources),
-            &policy_config(
-                &capabilities,
-                session.id(),
-                &load_user_state(&home)?,
-                &skills,
-            ),
+        let resolved = resolve_session(&home, &workspace, None)?;
+        let mut bootstrap = build_policy(
+            &home,
+            &workspace,
+            &resolved.sources,
+            resolved.saved_state,
+            options.full_access,
+            resolved.session.id(),
             None,
         )?;
-        session.save_state(policy.state())?;
+        resolved.session.save_state(bootstrap.policy.state())?;
         return Ok(CommandExecution {
-            session_id: session.id().into(),
+            session_id: resolved.session.id().into(),
             content: "Started a new chat.".into(),
             role: "note".into(),
-            catalog: catalog(&mut policy)?,
+            catalog: catalog(&mut bootstrap.policy)?,
             action: CommandAction::NewSession,
         });
     }
-    let (session, sources, saved_state) = match &options.session_id {
-        Some(id) => {
-            let session = phi_core::session::Session::open(&sessions, id)?;
-            let sources = session
-                .composed_sources()?
-                .context("session has no composition snapshot")?;
-            let state = session.load_state()?;
-            (session, sources, Some(state))
-        }
-        None => {
-            let current = resolve_sources(&home, &workspace)?;
-            let session = phi_core::session::Session::create_composed(
-                &sessions,
-                &current.config,
-                &current.plugins,
-            )?;
-            let sources = session
-                .composed_sources()?
-                .context("missing composition snapshot")?;
-            (session, sources, None)
-        }
-    };
+    let resolved = resolve_session(&home, &workspace, options.session_id.as_deref())?;
     if invocation.name == "reload" {
         if !invocation.arguments.is_empty() {
             bail!("usage: /reload");
         }
-        let (mut policy, reloaded_catalog) = reload_composition(
+        let (mut bootstrap, reloaded_catalog) = reload_composition(
             &home,
             &options.config_path,
             &workspace,
-            &session,
-            saved_state,
+            &resolved.session,
+            resolved.saved_state,
             options.full_access,
+            None,
         )?;
-        session.save_state(policy.state())?;
+        resolved.session.save_state(bootstrap.policy.state())?;
         return Ok(CommandExecution {
-            session_id: session.id().into(),
+            session_id: resolved.session.id().into(),
             content: format!(
                 "Reloaded configuration · {} models · {} commands",
                 reloaded_catalog.models.len(),
                 reloaded_catalog.commands.len()
             ),
             role: "note".into(),
-            catalog: catalog(&mut policy)?,
+            catalog: catalog(&mut bootstrap.policy)?,
             action: CommandAction::Display,
         });
     }
-    let capabilities = capabilities(&home, options.full_access);
-    let skills = discover_skills(&home, &workspace)?;
-    let mut policy = phi_steel::Policy::load_with_state(
-        &sources.config,
-        &entrypoints(&sources),
-        &policy_config(
-            &capabilities,
-            session.id(),
-            &load_user_state(&home)?,
-            &skills,
-        ),
-        saved_state,
+    let mut bootstrap = build_policy(
+        &home,
+        &workspace,
+        &resolved.sources,
+        resolved.saved_state,
+        options.full_access,
+        resolved.session.id(),
+        None,
     )?;
-    let initial_catalog = catalog(&mut policy)?;
+    let policy = &mut bootstrap.policy;
+    let initial_catalog = catalog(policy)?;
     let role = if invocation.name == "ps" {
         "processes"
     } else {
@@ -672,8 +713,8 @@ pub fn execute_command(
         }
         "model" => model_command(
             &home,
-            &session,
-            &mut policy,
+            &resolved.session,
+            policy,
             &initial_catalog,
             &invocation.arguments,
         )?,
@@ -689,12 +730,12 @@ pub fn execute_command(
             policy.run_command(name, &invocation.arguments)?
         }
     };
-    session.save_state(policy.state())?;
+    resolved.session.save_state(policy.state())?;
     Ok(CommandExecution {
-        session_id: session.id().into(),
+        session_id: resolved.session.id().into(),
         content,
         role: role.into(),
-        catalog: catalog(&mut policy)?,
+        catalog: catalog(policy)?,
         action: CommandAction::Display,
     })
 }
@@ -955,6 +996,7 @@ fn model_command(
     }
 }
 
+#[cfg(test)]
 fn policy_config(
     capabilities: &phi_core::capability::Registry,
     session_id: &str,
@@ -1062,36 +1104,14 @@ async fn run(
     let workspace = options.workspace.canonicalize()?;
     let mut config = load_config(&options.config_path)?;
     let home = home_for_config(&options.config_path)?;
-    let sessions = workspace.join(".phi/sessions");
-    let (session, sources, saved_state) = match options.session_id {
-        Some(id) => {
-            let session = phi_core::session::Session::open(&sessions, &id)?;
-            let sources = session
-                .composed_sources()?
-                .context("session has no composition snapshot")?;
-            let state = session.load_state()?;
-            (session, sources, Some(state))
-        }
-        None => {
-            let current = resolve_sources(&home, &workspace)?;
-            let session = phi_core::session::Session::create_composed(
-                &sessions,
-                &current.config,
-                &current.plugins,
-            )?;
-            let sources = session
-                .composed_sources()?
-                .context("missing composition snapshot")?;
-            (session, sources, None)
-        }
-    };
-    let mut plugin_roots = sources
+    let resolved = resolve_session(&home, &workspace, options.session_id.as_deref())?;
+    let session = resolved.session;
+    let mut plugin_roots = resolved
+        .sources
         .plugins
         .iter()
         .map(|plugin| (plugin.name.clone(), plugin.root.clone()))
         .collect::<std::collections::HashMap<_, _>>();
-    let mut capabilities = Arc::new(capabilities(&home, options.full_access));
-    let skills = discover_skills(&home, &workspace)?;
     send(
         events,
         RuntimeEvent::Session {
@@ -1106,18 +1126,17 @@ async fn run(
             },
         )?;
     }
-    let mut policy = phi_steel::Policy::load_with_state(
-        &sources.config,
-        &entrypoints(&sources),
-        &policy_config_with_schema(
-            &capabilities,
-            session.id(),
-            &load_user_state(&home)?,
-            &skills,
-            options.output_schema.as_ref(),
-        ),
-        saved_state,
+    let bootstrap = build_policy(
+        &home,
+        &workspace,
+        &resolved.sources,
+        resolved.saved_state,
+        options.full_access,
+        session.id(),
+        options.output_schema.as_ref(),
     )?;
+    let mut capabilities = bootstrap.capabilities;
+    let mut policy = bootstrap.policy;
     let mut file_editor_tool = policy.file_editor_tool_name()?;
     let selected_model = state_string(policy.state(), "model")?;
     let tool_routes = policy.resolved_tool_routes(&selected_model)?;
@@ -1195,6 +1214,7 @@ async fn run(
                     events,
                     cancellation,
                     full_access: options.full_access,
+                    output_schema: options.output_schema.as_ref(),
                     workflows: Arc::clone(&options.workflows),
                     plugin_roots: &plugin_roots,
                 };
@@ -1219,20 +1239,17 @@ async fn run(
                         .map(|plugin| (plugin.name.clone(), plugin.root.clone()))
                         .collect();
                     config = load_config(&options.config_path)?;
-                    capabilities = Arc::new(crate::capabilities(&home, options.full_access));
-                    let skills = discover_skills(&home, &workspace)?;
-                    policy = phi_steel::Policy::load_with_state(
-                        &sources.config,
-                        &entrypoints(&sources),
-                        &policy_config_with_schema(
-                            &capabilities,
-                            session.id(),
-                            &load_user_state(&home)?,
-                            &skills,
-                            options.output_schema.as_ref(),
-                        ),
+                    let bootstrap = build_policy(
+                        &home,
+                        &workspace,
+                        &sources,
                         Some(state),
+                        options.full_access,
+                        session.id(),
+                        options.output_schema.as_ref(),
                     )?;
+                    capabilities = bootstrap.capabilities;
+                    policy = bootstrap.policy;
                     file_editor_tool = policy.file_editor_tool_name()?;
                 }
                 event = Event::ToolsCompleted { results };
@@ -1307,6 +1324,7 @@ struct ToolBatchExecutor<'a> {
     events: &'a mpsc::UnboundedSender<RuntimeEvent>,
     cancellation: &'a CancellationToken,
     full_access: bool,
+    output_schema: Option<&'a serde_json::Value>,
     workflows: Arc<WorkflowTasks>,
     plugin_roots: &'a std::collections::HashMap<String, PathBuf>,
 }
@@ -1368,6 +1386,7 @@ async fn execute_tool_calls(
                 executor.session,
                 Some(policy.state().to_owned()),
                 executor.full_access,
+                executor.output_schema,
             )
             .map(|(_, catalog)| {
                 let _ = executor.events.send(RuntimeEvent::CatalogUpdated {
@@ -2072,6 +2091,13 @@ mod tests {
         std::fs::write(home.scheme_config(), main).unwrap();
     }
 
+    fn assert_same_catalog(left: &CommandCatalog, right: &CommandCatalog) {
+        assert_eq!(
+            serde_json::to_value(left).unwrap(),
+            serde_json::to_value(right).unwrap()
+        );
+    }
+
     #[test]
     fn catalog_combines_core_commands_and_provider_models() {
         let (_workspace, options) = options();
@@ -2103,6 +2129,105 @@ mod tests {
                 .any(|command| command.name == "stop")
         );
         assert_eq!(catalog.models[0].id, "openai/gpt-5.6-luna");
+    }
+
+    #[test]
+    fn fresh_and_resumed_catalog_match_command_initialization() {
+        let (_workspace, mut options) = options();
+
+        let fresh_catalog = command_catalog(&options).unwrap();
+        let fresh_command = execute_command(
+            &options,
+            &CommandInvocation {
+                name: "help".into(),
+                arguments: String::new(),
+            },
+        )
+        .unwrap();
+        assert_same_catalog(&fresh_catalog, &fresh_command.catalog);
+
+        options.session_id = Some(fresh_command.session_id);
+        let resumed_catalog = command_catalog(&options).unwrap();
+        let resumed_command = execute_command(
+            &options,
+            &CommandInvocation {
+                name: "help".into(),
+                arguments: String::new(),
+            },
+        )
+        .unwrap();
+        assert_same_catalog(&resumed_catalog, &resumed_command.catalog);
+    }
+
+    #[test]
+    fn fresh_and_resumed_command_and_run_policy_initialization_match() {
+        let (workspace, options) = options();
+        let workspace = workspace.path().canonicalize().unwrap();
+        let home = home_for_config(&options.config_path).unwrap();
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "answer": { "type": "string" } }
+        });
+
+        let command_session = resolve_session(&home, &workspace, None).unwrap();
+        let run_session = resolve_session(&home, &workspace, None).unwrap();
+        let mut command = build_policy(
+            &home,
+            &workspace,
+            &command_session.sources,
+            command_session.saved_state,
+            options.full_access,
+            command_session.session.id(),
+            None,
+        )
+        .unwrap();
+        let mut run = build_policy(
+            &home,
+            &workspace,
+            &run_session.sources,
+            run_session.saved_state,
+            options.full_access,
+            run_session.session.id(),
+            Some(&schema),
+        )
+        .unwrap();
+        assert_same_catalog(
+            &catalog(&mut command.policy).unwrap(),
+            &catalog(&mut run.policy).unwrap(),
+        );
+
+        command_session
+            .session
+            .save_state(command.policy.state())
+            .unwrap();
+        let resumed_command =
+            resolve_session(&home, &workspace, Some(command_session.session.id())).unwrap();
+        let resumed_run =
+            resolve_session(&home, &workspace, Some(command_session.session.id())).unwrap();
+        let mut command = build_policy(
+            &home,
+            &workspace,
+            &resumed_command.sources,
+            resumed_command.saved_state,
+            options.full_access,
+            resumed_command.session.id(),
+            None,
+        )
+        .unwrap();
+        let mut run = build_policy(
+            &home,
+            &workspace,
+            &resumed_run.sources,
+            resumed_run.saved_state,
+            options.full_access,
+            resumed_run.session.id(),
+            Some(&schema),
+        )
+        .unwrap();
+        assert_same_catalog(
+            &catalog(&mut command.policy).unwrap(),
+            &catalog(&mut run.policy).unwrap(),
+        );
     }
 
     #[test]
@@ -2715,6 +2840,7 @@ mod tests {
                     events: &event_tx,
                     cancellation: &cancellation,
                     full_access: false,
+                    output_schema: None,
                     workflows: Arc::new(WorkflowTasks::default()),
                     plugin_roots: &plugin_roots,
                 };
@@ -2788,6 +2914,7 @@ mod tests {
                     events: &event_tx,
                     cancellation: &cancellation,
                     full_access: false,
+                    output_schema: None,
                     workflows: Arc::new(WorkflowTasks::default()),
                     plugin_roots: &plugin_roots,
                 };

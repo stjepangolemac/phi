@@ -1,12 +1,13 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::Write,
     path::{Component, Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+
+use crate::{AtomicWriteMode, write_atomic_with_permissions};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EditTarget {
@@ -239,18 +240,16 @@ fn persist(
     permissions: Option<fs::Permissions>,
     overwrite: bool,
 ) -> Result<()> {
-    let parent = path.parent().context("file has no parent")?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    temp.write_all(content.as_bytes())?;
-    if let Some(permissions) = permissions {
-        temp.as_file().set_permissions(permissions)?;
-    }
-    if overwrite {
-        temp.persist(path).map_err(|error| error.error)?;
-    } else {
-        temp.persist_noclobber(path).map_err(|error| error.error)?;
-    }
-    Ok(())
+    write_atomic_with_permissions(
+        path,
+        content.as_bytes(),
+        if overwrite {
+            AtomicWriteMode::Overwrite
+        } else {
+            AtomicWriteMode::NoClobber
+        },
+        permissions,
+    )
 }
 
 fn revision(bytes: &[u8]) -> String {

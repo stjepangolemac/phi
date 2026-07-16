@@ -254,13 +254,7 @@ fn jwt_expires_soon(token: &str) -> Result<bool> {
 }
 
 fn write_secret(path: &std::path::Path, value: &Value) -> Result<()> {
-    let parent = path.parent().context("secret path has no parent")?;
-    let permissions = fs::metadata(path)?.permissions();
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    serde_json::to_writer_pretty(&mut temp, value)?;
-    temp.as_file().set_permissions(permissions)?;
-    temp.persist(path).map_err(|error| error.error)?;
-    Ok(())
+    crate::write_json_atomic(path, value, crate::AtomicWriteMode::Overwrite)
 }
 
 fn pointer_string<'a>(value: &'a Value, pointer: &str) -> Result<&'a str> {
