@@ -299,8 +299,9 @@ pub fn composition_plugins(config: &Path) -> Result<Vec<String>> {
 pub fn check_plugin(entrypoint: &Path) -> Result<()> {
     let mut vm = Engine::new_sandboxed();
     vm.compile_and_run_raw_program(format!(
-        "{}\n{}",
+        "{}\n(set-current-plugin! {})\n{}",
         PLUGIN_PRELUDE,
+        scheme_string(&plugin_name(entrypoint)?),
         fs::read_to_string(entrypoint)?
     ))
     .context("load Steel plugin")?;
