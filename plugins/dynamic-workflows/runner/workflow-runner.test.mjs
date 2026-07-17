@@ -148,3 +148,19 @@ export default async function () {
     await rm(value.base, { recursive: true, force: true })
   }
 })
+
+test("runner rejects a meta.name that differs from the requested name", async () => {
+  const value = await fixture(`
+export const meta = { name: "different", description: "wrong name" }
+export default async function () { return null }
+`)
+  try {
+    const result = await run(value.requestPath)
+    assert.equal(result.code, 1, result.stderr)
+    const state = JSON.parse(await readFile(join(value.taskDir, "state.json")))
+    assert.equal(state.status, "failed")
+    assert.match(state.error, /meta\.name must match requested name: managed-test/)
+  } finally {
+    await rm(value.base, { recursive: true, force: true })
+  }
+})

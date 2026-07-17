@@ -6,11 +6,14 @@
     'name "Workflow"
     'strict_mode "loose"
     'description
-    "Launch a named JavaScript workflow in the background. Workflows are discovered from .phi/workflows, ~/.phi/workflows, then loaded plugins. Use TaskOutput to wait for or inspect the task and TaskStop to cancel it."
+    "Launch a JavaScript workflow in the background. Name-only calls discover ~/.phi/workflows, .phi/workflows, then loaded plugins; path selects an exact file in one of those roots. Use TaskOutput to wait for or inspect the task and TaskStop to cancel it."
     'parameters
     (hash 'type "object"
           'properties
-          (hash 'name (hash 'type "string" 'description "Named workflow to run.")
+          (hash 'name (hash 'type "string" 'description "Declared workflow name to run.")
+                'path
+                (hash 'type "string"
+                      'description "Optional exact .js workflow path. Relative paths resolve from the workspace; absolute paths are also accepted within allowed workflow roots.")
                 'args
                 (hash 'type "object"
                       'description "JSON object passed to the workflow function."

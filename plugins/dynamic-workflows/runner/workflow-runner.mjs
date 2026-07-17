@@ -153,6 +153,9 @@ try {
       || typeof module.meta.description !== "string") {
     throw new Error("workflow must export meta with name and description")
   }
+  if (module.meta.name !== request.name) {
+    throw new Error(`workflow meta.name must match requested name: ${request.name}`)
+  }
   if (typeof module.default !== "function") {
     throw new Error("workflow must default-export an async function")
   }

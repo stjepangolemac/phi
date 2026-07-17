@@ -143,13 +143,17 @@ During writing, the agent gathers relevant user and workspace context and may pe
 
 ## Dynamic workflows
 
-The official `dynamic-workflows` plugin exposes background `Workflow`, `TaskOutput`, and `TaskStop` tools. Workflows are named JavaScript modules discovered in this order:
+The official `dynamic-workflows` plugin exposes background `Workflow`, `TaskOutput`, and `TaskStop` tools. Reusable workflow definitions are JavaScript modules. Global definitions live in `~/.phi/workflows/`, workspace-specific definitions in `.phi/workflows/`, and packaged definitions in the `workflows/` directory of a loaded plugin. Name-only calls discover them in this order:
 
 ```text
-.phi/workflows/NAME.js
 ~/.phi/workflows/NAME.js
+.phi/workflows/NAME.js
 LOADED_PLUGIN/workflows/NAME.js
 ```
+
+`Workflow` also accepts an optional exact `path` to select a same-named definition regardless of discovery precedence. Relative paths resolve from the current workspace; absolute paths are accepted too. Exact paths must name a regular `.js` file contained in the global, current-workspace, or a loaded-plugin workflow root. Parent traversal, escaping symlinks, unloaded-plugin paths, and paths outside those roots are rejected. The module's `meta.name` must equal the requested `name`.
+
+Create project-specific definitions in `.phi/workflows/`. Copy or promote one to `~/.phi/workflows/` only when the user explicitly asks to make it global.
 
 Each module exports `meta` and a default async function. The `phi:workflow` module supplies `agent`, `parallel`, `batch`, `pipeline`, `phase`, `log`, and `budget`:
 
@@ -175,7 +179,7 @@ export default async function ({ args }) {
 
 `parallel(tasks, { concurrency })` continuously fills up to the requested number of task slots while preserving result order. `batch(tasks, { size })` runs fixed-size waves through `parallel()` and waits for each wave before starting the next. Tasks are functions so their work does not start before the scheduler invokes them. Both APIs remain subject to the workflow runtime's global agent concurrency limit.
 
-`agent(prompt, { label?, schema?, branch?, branch_off? })` starts a fresh one-shot Phi child in the same workspace and Phi home. Child agents run with `--yolo`; workflows are therefore trusted local code. A schema requests strict JSON-schema output and makes `agent()` return the parsed JSON value. The initial runtime limits are 8 concurrent agents, 32 agents total per workflow, and 60 minutes per workflow. Workflow task files, progress, logs, results, and managed-worktree ownership metadata live under the parent session's `workflows/tasks/` directory. Background tasks live for the duration of the parent Phi process and are cancelled when it exits.
+`agent(prompt, { label?, schema?, branch?, branch_off? })` starts a fresh one-shot Phi child in the same workspace and Phi home. Child agents run with `--yolo`; workflows are therefore trusted local code. A schema requests strict JSON-schema output and makes `agent()` return the parsed JSON value. The initial runtime limits are 8 concurrent agents, 32 agents total per workflow, and 60 minutes per workflow. Workflow runs are distinct from definitions: task files, progress, logs, results, and managed-worktree ownership metadata live under `.phi/sessions/<session-id>/workflows/tasks/<task-id>/`. Every launch receives a unique task ID and directory, including launches of same-named definitions. Background tasks live for the duration of the parent Phi process and are cancelled when it exits.
 
 For isolated edits, set `branch` to a workflow-local logical name. Phi creates a task-owned `phi/...` branch and deterministic temporary Git worktree from the workflow's launch commit, then starts that child in the corresponding repository-relative subdirectory. `branch_off` is valid only with `branch` and can name either an external Git ref or a completed managed logical branch. Integration agents receive the logical-to-actual branch map so they can merge completed managed work. Branched agents should commit and return commit hashes through schemas. All managed worktrees and refs are deleted on every workflow exit, including errors, timeouts, cancellation, and stale-task cleanup; wanted commits must therefore be promoted to a non-managed ref before exit, normally by a final explicit unbranched `agent()` call. Cleanup only operates on paths and refs recorded as created by that workflow task and never adopts pre-existing branches or worktrees.
 

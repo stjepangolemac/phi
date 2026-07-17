@@ -35,6 +35,8 @@ The bundled `codex-patch` editor accepts locator text on an `@@` line or as a co
 
 Plugin-specific operational instructions belong in conventional plugin skills. For example, read the `dynamic-workflows` skill before creating or troubleshooting workflows.
 
+The official dynamic-workflows extension discovers name-only definitions globally from `~/.phi/workflows/`, then from workspace `.phi/workflows/`, then from loaded plugins. Its `Workflow` tool can instead select an exact regular `.js` definition with `path`, provided the resolved path remains in one of those loaded roots and `meta.name` matches the requested name. Relative paths resolve from the workspace. Workflow runs remain unique, session-local task directories under `.phi/sessions/<session-id>/workflows/tasks/`; they are not stored with reusable definitions.
+
 ## Plugin workflow
 
 ```sh

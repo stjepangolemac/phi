@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{Command as StdCommand, Stdio},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -40,7 +40,11 @@ impl WorkflowTasks {
             .and_then(Value::as_str)
             .context("Workflow requires name")?;
         validate_name(name)?;
-        let workflow_path = resolve_workflow(workspace, home, plugin_roots, name)?;
+        let requested_path = arguments
+            .get("path")
+            .map(|path| path.as_str().context("Workflow path must be a string"))
+            .transpose()?;
+        let workflow_path = resolve_workflow(workspace, home, plugin_roots, name, requested_path)?;
         let args = arguments.get("args").cloned().unwrap_or(Value::Null);
         let plugin = plugin_roots
             .get("dynamic-workflows")
@@ -562,11 +566,16 @@ fn resolve_workflow(
     home: &Path,
     plugin_roots: &HashMap<String, PathBuf>,
     name: &str,
+    requested_path: Option<&str>,
 ) -> Result<PathBuf> {
+    if let Some(requested_path) = requested_path {
+        return resolve_exact_workflow(workspace, home, plugin_roots, requested_path);
+    }
+
     let filename = format!("{name}.js");
     let mut candidates = vec![
-        workspace.join(".phi/workflows").join(&filename),
         home.join("workflows").join(&filename),
+        workspace.join(".phi/workflows").join(&filename),
     ];
     let mut roots = plugin_roots.values().collect::<Vec<_>>();
     roots.sort();
@@ -578,7 +587,97 @@ fn resolve_workflow(
     candidates
         .into_iter()
         .find(|candidate| candidate.is_file())
+        .map(|candidate| candidate.canonicalize())
+        .transpose()?
         .with_context(|| format!("workflow not found: {name}"))
+}
+
+fn resolve_exact_workflow(
+    workspace: &Path,
+    home: &Path,
+    plugin_roots: &HashMap<String, PathBuf>,
+    requested_path: &str,
+) -> Result<PathBuf> {
+    if requested_path.is_empty() {
+        bail!("workflow path must not be empty");
+    }
+    let requested_path = Path::new(requested_path);
+    if requested_path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        bail!("workflow path traversal is not allowed");
+    }
+    if requested_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        != Some("js")
+    {
+        bail!("workflow path must have a .js extension");
+    }
+    let candidate = if requested_path.is_absolute() {
+        requested_path.to_owned()
+    } else {
+        workspace.join(requested_path)
+    };
+    let candidate = candidate
+        .canonicalize()
+        .with_context(|| format!("workflow path does not exist: {}", candidate.display()))?;
+    if !candidate.is_file() {
+        bail!(
+            "workflow path is not a regular file: {}",
+            candidate.display()
+        );
+    }
+
+    let allowed = workflow_roots(workspace, home, plugin_roots)
+        .into_iter()
+        .filter_map(|(scope, root)| canonical_workflow_root(&scope, &root))
+        .any(|root| candidate.starts_with(root));
+    if !allowed {
+        bail!(
+            "workflow path is outside global, workspace, and loaded plugin workflow roots: {}",
+            candidate.display()
+        );
+    }
+    Ok(candidate)
+}
+
+fn workflow_roots(
+    workspace: &Path,
+    home: &Path,
+    plugin_roots: &HashMap<String, PathBuf>,
+) -> Vec<(PathBuf, PathBuf)> {
+    let mut roots = vec![
+        (home.to_owned(), home.join("workflows")),
+        (workspace.to_owned(), workspace.join(".phi/workflows")),
+    ];
+    let mut plugins = plugin_roots.values().collect::<Vec<_>>();
+    plugins.sort();
+    roots.extend(
+        plugins
+            .into_iter()
+            .map(|plugin| (plugin.clone(), plugin.join("workflows"))),
+    );
+    roots
+}
+
+fn canonical_workflow_root(scope: &Path, root: &Path) -> Option<PathBuf> {
+    let relative = root.strip_prefix(scope).ok()?;
+    let mut current = scope.to_owned();
+    for component in relative.components() {
+        current.push(component);
+        if fs::symlink_metadata(&current)
+            .ok()?
+            .file_type()
+            .is_symlink()
+        {
+            return None;
+        }
+    }
+    let scope = scope.canonicalize().ok()?;
+    let root = root.canonicalize().ok()?;
+    root.starts_with(scope).then_some(root)
 }
 
 fn task_id(arguments: &Value) -> Result<&str> {
@@ -696,19 +795,145 @@ mod tests {
         ]);
 
         assert_eq!(
-            resolve_workflow(workspace.path(), home.path(), &plugins, ".hidden").unwrap(),
-            workspace_workflow
-        );
-        fs::remove_file(&workspace_workflow).unwrap();
-        assert_eq!(
-            resolve_workflow(workspace.path(), home.path(), &plugins, ".hidden").unwrap(),
-            home_workflow
+            resolve_workflow(workspace.path(), home.path(), &plugins, ".hidden", None).unwrap(),
+            home_workflow.canonicalize().unwrap()
         );
         fs::remove_file(&home_workflow).unwrap();
         assert_eq!(
-            resolve_workflow(workspace.path(), home.path(), &plugins, ".hidden").unwrap(),
-            first_plugin_workflow
+            resolve_workflow(workspace.path(), home.path(), &plugins, ".hidden", None).unwrap(),
+            workspace_workflow.canonicalize().unwrap()
         );
+        fs::remove_file(&workspace_workflow).unwrap();
+        assert_eq!(
+            resolve_workflow(workspace.path(), home.path(), &plugins, ".hidden", None).unwrap(),
+            first_plugin_workflow.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn exact_workflow_paths_are_resolved_and_contained() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let plugins_root = tempfile::tempdir().unwrap();
+        let loaded_plugin = plugins_root.path().join("loaded");
+        let unloaded_plugin = plugins_root.path().join("unloaded");
+        let outside = tempfile::tempdir().unwrap();
+        let workspace_workflow = workspace.path().join(".phi/workflows/review.js");
+        let home_workflow = home.path().join("workflows/review.js");
+        let loaded_workflow = loaded_plugin.join("workflows/review.js");
+        let unloaded_workflow = unloaded_plugin.join("workflows/review.js");
+        let outside_workflow = outside.path().join("review.js");
+        for path in [
+            &workspace_workflow,
+            &home_workflow,
+            &loaded_workflow,
+            &unloaded_workflow,
+            &outside_workflow,
+        ] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "export default async () => null").unwrap();
+        }
+        let plugins = HashMap::from([("loaded".into(), loaded_plugin)]);
+
+        assert_eq!(
+            resolve_workflow(
+                workspace.path(),
+                home.path(),
+                &plugins,
+                "review",
+                Some(".phi/workflows/review.js"),
+            )
+            .unwrap(),
+            workspace_workflow.canonicalize().unwrap()
+        );
+        for path in [&home_workflow, &loaded_workflow] {
+            assert_eq!(
+                resolve_workflow(
+                    workspace.path(),
+                    home.path(),
+                    &plugins,
+                    "review",
+                    Some(path.to_str().unwrap()),
+                )
+                .unwrap(),
+                path.canonicalize().unwrap()
+            );
+        }
+
+        let directory = workspace.path().join(".phi/workflows/directory.js");
+        fs::create_dir_all(&directory).unwrap();
+        let wrong_extension = workspace.path().join(".phi/workflows/review.mjs");
+        fs::write(&wrong_extension, "").unwrap();
+        for path in [
+            "".to_owned(),
+            "missing.js".to_owned(),
+            ".phi/workflows/directory.js".to_owned(),
+            ".phi/workflows/review.mjs".to_owned(),
+            ".phi/workflows/../workflows/review.js".to_owned(),
+            outside_workflow.to_string_lossy().into_owned(),
+            unloaded_workflow.to_string_lossy().into_owned(),
+        ] {
+            assert!(
+                resolve_workflow(
+                    workspace.path(),
+                    home.path(),
+                    &plugins,
+                    "review",
+                    Some(&path),
+                )
+                .is_err(),
+                "expected exact path to be rejected: {path}"
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            let symlink = workspace.path().join(".phi/workflows/escape.js");
+            std::os::unix::fs::symlink(&outside_workflow, &symlink).unwrap();
+            assert!(
+                resolve_workflow(
+                    workspace.path(),
+                    home.path(),
+                    &plugins,
+                    "review",
+                    Some(".phi/workflows/escape.js"),
+                )
+                .is_err()
+            );
+
+            let symlinked_root_workspace = tempfile::tempdir().unwrap();
+            fs::create_dir(symlinked_root_workspace.path().join(".phi")).unwrap();
+            let escaped = symlinked_root_workspace.path().join("root-escape.js");
+            fs::write(&escaped, "export default async () => null").unwrap();
+            std::os::unix::fs::symlink(
+                symlinked_root_workspace.path(),
+                symlinked_root_workspace.path().join(".phi/workflows"),
+            )
+            .unwrap();
+            assert!(
+                resolve_workflow(
+                    symlinked_root_workspace.path(),
+                    home.path(),
+                    &plugins,
+                    "review",
+                    Some(".phi/workflows/root-escape.js"),
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_workflow_skill_documents_global_first_lookup_and_promotion() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let skill = fs::read_to_string(
+            root.join("plugins/dynamic-workflows/skills/dynamic-workflows/SKILL.md"),
+        )
+        .unwrap();
+        assert!(skill.contains("inspect global workflows first"));
+        assert!(skill.contains("global → workspace → plugin precedence"));
+        assert!(skill.contains("user explicitly asks to make one global"));
+        assert!(skill.contains(".phi/sessions/<session-id>/workflows/tasks/<task-id>/"));
     }
 
     #[test]
@@ -941,6 +1166,105 @@ mod tests {
                 .unwrap()
                 .contains("workflow_started")
         );
+        tasks.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn exact_paths_launch_same_named_workflows_independently() {
+        if Command::new("node")
+            .arg("--version")
+            .output()
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let plugins_root = tempfile::tempdir().unwrap();
+        let session = workspace.path().join(".phi/sessions/test");
+        fs::create_dir_all(&session).unwrap();
+        let global = home.path().join("workflows/same.js");
+        let workspace_definition = workspace.path().join(".phi/workflows/same.js");
+        let first_plugin = plugins_root.path().join("first");
+        let second_plugin = plugins_root.path().join("second");
+        let first_plugin_definition = first_plugin.join("workflows/same.js");
+        let second_plugin_definition = second_plugin.join("workflows/same.js");
+        for (path, value) in [
+            (&global, "global"),
+            (&workspace_definition, "workspace"),
+            (&first_plugin_definition, "first-plugin"),
+            (&second_plugin_definition, "second-plugin"),
+        ] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(
+                path,
+                format!(
+                    r#"
+                        export const meta = {{ name: "same", description: "test workflow" }}
+                        export default async function () {{ return "{value}" }}
+                    "#
+                ),
+            )
+            .unwrap();
+        }
+        let plugins = HashMap::from([
+            (
+                "dynamic-workflows".into(),
+                root.join("plugins/dynamic-workflows"),
+            ),
+            ("first".into(), first_plugin),
+            ("second".into(), second_plugin),
+        ]);
+        let tasks = WorkflowTasks::default();
+        let requests = [
+            (global.to_string_lossy().into_owned(), "global", &global),
+            (
+                ".phi/workflows/same.js".to_owned(),
+                "workspace",
+                &workspace_definition,
+            ),
+            (
+                first_plugin_definition.to_string_lossy().into_owned(),
+                "first-plugin",
+                &first_plugin_definition,
+            ),
+            (
+                second_plugin_definition.to_string_lossy().into_owned(),
+                "second-plugin",
+                &second_plugin_definition,
+            ),
+        ];
+        let mut task_ids = std::collections::HashSet::new();
+        for (path, expected, source) in requests {
+            let launched = tasks
+                .launch(
+                    workspace.path(),
+                    home.path(),
+                    &session,
+                    &plugins,
+                    &json!({ "name": "same", "path": path, "args": {} }),
+                )
+                .await
+                .unwrap();
+            let task_id = launched["task_id"].as_str().unwrap();
+            assert!(task_ids.insert(task_id.to_owned()));
+            let task_dir = session.join("workflows/tasks").join(task_id);
+            let request = read_json(&task_dir.join("request.json")).unwrap();
+            assert_eq!(
+                PathBuf::from(request["workflowPath"].as_str().unwrap()),
+                source.canonicalize().unwrap()
+            );
+            let output = tasks
+                .output(&session, &json!({ "task_id": task_id }))
+                .await
+                .unwrap();
+            assert_eq!(output["status"], "completed");
+            assert_eq!(output["result"]["value"], expected);
+            assert!(task_dir.is_dir());
+        }
+        assert_eq!(task_ids.len(), 4);
         tasks.shutdown().await;
     }
 

@@ -5,7 +5,16 @@ description: Create, run, inspect, and troubleshoot Phi JavaScript workflows and
 
 # Dynamic workflows
 
-Use named JavaScript workflows for multi-agent orchestration. Workflows are discovered from `.phi/workflows/NAME.js`, `~/.phi/workflows/NAME.js`, then `workflows/NAME.js` in loaded plugins.
+Use named JavaScript workflows for multi-agent orchestration. Keep workflow definitions separate from their runs:
+
+- `~/.phi/workflows/` contains global reusable definitions.
+- `.phi/workflows/` contains workspace-specific definitions.
+- Loaded plugins may package definitions under `workflows/`.
+- `.phi/sessions/<session-id>/workflows/tasks/<task-id>/` contains session-local run state, copied source, progress, logs, and results.
+
+When looking for an existing definition, inspect global workflows first, then workspace and loaded-plugin workflows. Name-only `Workflow` calls use that same global → workspace → plugin precedence. Create workspace-specific definitions in `.phi/workflows/` normally. Only when the user explicitly asks to make one global, copy or promote it into `~/.phi/workflows/`.
+
+Pass optional `path` to select an exact same-named definition instead of using discovery precedence. Relative paths resolve from the current workspace, while absolute paths are accepted within the same allowed roots. The path must be a regular `.js` file inside the global, current-workspace, or a loaded-plugin workflow root; traversal, escaping symlinks, unloaded-plugin paths, and outside paths are rejected. The module's `meta.name` must match the requested `name`. Each launch still gets a unique session-local task ID and run directory.
 
 Modules export `meta` with `name` and `description`, plus a default async `({ args }) => value` function. Import `agent`, `parallel`, `batch`, `pipeline`, `phase`, `log`, and `budget` from `phi:workflow`.
 
@@ -27,7 +36,7 @@ export default async function ({ args }) {
 
 Tasks passed to `parallel` or `batch` must be functions so work starts only when scheduled. `parallel` continuously fills its concurrency limit; `batch` runs fixed-size waves. Workflows are limited to 8 concurrent agents, 32 total agents, and 60 minutes.
 
-`agent(prompt, { label?, schema?, branch?, branch_off? })` starts a fresh `phi --workspace WORKSPACE --yolo rpc` child. A schema requests strict JSON-schema output. Use `Workflow` to launch, `TaskOutput` to inspect or wait, and `TaskStop` to cancel.
+`agent(prompt, { label?, schema?, branch?, branch_off? })` starts a fresh `phi --workspace WORKSPACE --yolo rpc` child. A schema requests strict JSON-schema output. Use `Workflow` with `name`, optional exact `path`, and `args` to launch; use `TaskOutput` to inspect or wait and `TaskStop` to cancel.
 
 ## Managed Git branches
 

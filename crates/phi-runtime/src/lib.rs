@@ -3518,7 +3518,11 @@ mod tests {
                     && body["tools"].as_array().unwrap().iter()
                         .any(|tool| tool["name"] == "patch")
                     && body["tools"].as_array().unwrap().iter()
-                        .any(|tool| tool["name"] == "Workflow" && tool["strict"] == false)
+                        .any(|tool| tool["name"] == "Workflow"
+                            && tool["strict"] == false
+                            && tool["parameters"]["properties"]["path"]["type"] == "string"
+                            && tool["parameters"]["required"]
+                                == serde_json::json!(["name", "args"]))
                     && body["tools"].as_array().unwrap().iter()
                         .any(|tool| tool["name"] == "TaskOutput"
                             && tool["strict"] == true
