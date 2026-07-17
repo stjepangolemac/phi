@@ -147,7 +147,45 @@ struct ShellStream {
 
 struct RenderedTranscriptBlock {
     width: usize,
+    kind: TranscriptBlockKind,
+    previous_kind: Option<TranscriptBlockKind>,
     lines: Vec<Line<'static>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TranscriptBlockKind {
+    User,
+    Assistant,
+    Reasoning,
+    Tool,
+    Patch,
+    Note,
+    Error,
+    ProcessOutput,
+    ResponseStart,
+    TurnEnd,
+    CompactionEnd,
+    TurnWorking,
+    Activity,
+}
+
+impl TranscriptBlockKind {
+    fn from_role(role: &str) -> Self {
+        match role {
+            "you" => Self::User,
+            "phi" => Self::Assistant,
+            "reasoning_summary" => Self::Reasoning,
+            "tool" => Self::Tool,
+            "patch" => Self::Patch,
+            "error" => Self::Error,
+            "processes" => Self::ProcessOutput,
+            "response_start" => Self::ResponseStart,
+            "turn_end" => Self::TurnEnd,
+            "compaction_end" => Self::CompactionEnd,
+            "turn_working" => Self::TurnWorking,
+            _ => Self::Note,
+        }
+    }
 }
 
 struct RenderedLiveModel {
@@ -1641,22 +1679,32 @@ fn sync_transcript_cache(app: &mut App, width: usize) {
     app.transcript_cache.truncate(app.transcript.len());
     app.transcript_cache
         .resize_with(app.transcript.len(), || None);
+    let mut previous_kind = None;
     for (index, (role, content)) in app.transcript.iter().enumerate() {
-        let stale = app.transcript_cache[index]
-            .as_ref()
-            .is_none_or(|cache| cache.width != width);
+        let kind = TranscriptBlockKind::from_role(role);
+        let stale = app.transcript_cache[index].as_ref().is_none_or(|cache| {
+            cache.width != width || cache.kind != kind || cache.previous_kind != previous_kind
+        });
         if stale {
             first_changed = Some(first_changed.map_or(index, |changed| changed.min(index)));
             let mut lines = Vec::new();
-            if role == "response_start" && index > 0 {
-                lines.push(Line::raw(" ".repeat(width)));
-            }
-            push_message(&mut lines, role, content, width);
-            app.transcript_cache[index] = Some(RenderedTranscriptBlock { width, lines });
+            push_transcript_block(&mut lines, previous_kind, kind, role, content, width);
+            app.transcript_cache[index] = Some(RenderedTranscriptBlock {
+                width,
+                kind,
+                previous_kind,
+                lines,
+            });
             #[cfg(test)]
             {
                 app.transcript_render_count += 1;
             }
+        }
+        if app.transcript_cache[index]
+            .as_ref()
+            .is_some_and(|cache| !cache.lines.is_empty())
+        {
+            previous_kind = Some(kind);
         }
     }
     if let Some(first_changed) = first_changed {
@@ -1678,16 +1726,34 @@ fn cached_transcript_height(app: &App) -> usize {
 
 fn sync_live_model_cache(app: &mut App, width: usize) {
     if !app.current_model.is_empty() {
+        let previous_kind = app
+            .transcript_cache
+            .iter()
+            .rev()
+            .filter_map(Option::as_ref)
+            .find(|block| !block.lines.is_empty())
+            .map(|block| block.kind);
         let stale = app.current_model_cache.as_ref().is_none_or(|cache| {
-            cache.revision != app.current_model_revision || cache.block.width != width
+            cache.revision != app.current_model_revision
+                || cache.block.width != width
+                || cache.block.previous_kind != previous_kind
         });
         if stale {
             let mut model_lines = Vec::new();
-            push_message(&mut model_lines, "phi", &app.current_model, width);
+            push_transcript_block(
+                &mut model_lines,
+                previous_kind,
+                TranscriptBlockKind::Assistant,
+                "phi",
+                &app.current_model,
+                width,
+            );
             app.current_model_cache = Some(RenderedLiveModel {
                 revision: app.current_model_revision,
                 block: RenderedTranscriptBlock {
                     width,
+                    kind: TranscriptBlockKind::Assistant,
+                    previous_kind,
                     lines: model_lines,
                 },
             });
@@ -1707,23 +1773,20 @@ fn cached_live_model_height(app: &App) -> usize {
 
 fn live_transcript_tail(app: &App, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
+    let mut previous_kind = app
+        .current_model_cache
+        .as_ref()
+        .filter(|cache| !cache.block.lines.is_empty())
+        .map(|cache| cache.block.kind)
+        .or_else(|| {
+            app.transcript_cache
+                .iter()
+                .rev()
+                .filter_map(Option::as_ref)
+                .find(|block| !block.lines.is_empty())
+                .map(|block| block.kind)
+        });
     if let Some(turn_started) = app.turn_started {
-        let last_line = app
-            .current_model_cache
-            .as_ref()
-            .and_then(|cache| cache.block.lines.last())
-            .or_else(|| {
-                app.transcript_cache
-                    .iter()
-                    .rev()
-                    .filter_map(Option::as_ref)
-                    .find_map(|block| block.lines.last())
-            });
-        if last_line
-            .is_some_and(|line| !line.to_string().trim().is_empty() || line.style.bg.is_some())
-        {
-            lines.push(Line::raw(" ".repeat(width)));
-        }
         let (activity, started) = match app.status.as_str() {
             "compacting" => ("Compacting", app.compaction_started.unwrap_or(turn_started)),
             "searching" => (
@@ -1738,43 +1801,40 @@ fn live_transcript_tail(app: &App, width: usize) -> Vec<Line<'static>> {
             _ => ("Working", turn_started),
         };
         let label = format!("{activity} for {}", human_duration(started.elapsed()));
+        let kind = if activity == "Searching" {
+            TranscriptBlockKind::TurnWorking
+        } else {
+            TranscriptBlockKind::Activity
+        };
+        push_block_separator(&mut lines, previous_kind, kind, width);
         if activity == "Searching" {
             push_message(&mut lines, "turn_working", &label, width);
         } else {
             lines.push(activity_indicator(&app.throbber_state, &label, width));
-            lines.push(Line::raw(" ".repeat(width)));
         }
+        previous_kind = Some(kind);
     }
-    push_message_queue(
+    if push_message_queue(
         &mut lines,
+        previous_kind,
         "Queued after tool call:",
         &app.steering_queue,
         width,
         Color::LightYellow,
-    );
-    push_message_queue(
+    ) {
+        previous_kind = Some(TranscriptBlockKind::Note);
+    }
+    if push_message_queue(
         &mut lines,
+        previous_kind,
         "Queued for next turn:",
         &app.next_turn_queue,
         width,
         Color::LightBlue,
-    );
-    if lines
-        .last()
-        .or_else(|| {
-            app.current_model_cache
-                .as_ref()
-                .and_then(|cache| cache.block.lines.last())
-        })
-        .or_else(|| {
-            app.transcript_cache
-                .iter()
-                .rev()
-                .filter_map(Option::as_ref)
-                .find_map(|block| block.lines.last())
-        })
-        .is_some_and(|line| !line.to_string().trim().is_empty() || line.style.bg.is_some())
-    {
+    ) {
+        previous_kind = Some(TranscriptBlockKind::Note);
+    }
+    if previous_kind.is_some() {
         lines.push(Line::raw(" ".repeat(width)));
     }
     lines
@@ -1782,14 +1842,16 @@ fn live_transcript_tail(app: &App, width: usize) -> Vec<Line<'static>> {
 
 fn push_message_queue(
     lines: &mut Vec<Line<'static>>,
+    previous_kind: Option<TranscriptBlockKind>,
     label: &str,
     messages: &VecDeque<String>,
     width: usize,
     color: Color,
-) {
+) -> bool {
     if messages.is_empty() || width == 0 {
-        return;
+        return false;
     }
+    push_block_separator(lines, previous_kind, TranscriptBlockKind::Note, width);
     let style = Style::default().fg(color);
     lines.push(Line::styled(
         truncate_width(&format!("• {label}"), width),
@@ -1802,6 +1864,7 @@ fn push_message_queue(
             style,
         ));
     }
+    true
 }
 
 fn transcript_window(
@@ -1853,10 +1916,48 @@ fn transcript_text(app: &mut App, width: usize) -> ratatui::text::Text<'static> 
     ratatui::text::Text::from(transcript_window(app, &live_tail, 0, height))
 }
 
+/// Transcript blocks always have exactly one blank line between them and no
+/// leading separator at the start of the document. Blank lines emitted while
+/// rendering a block are therefore meaningful internal content layout.
+fn transcript_separator_lines(
+    previous: Option<TranscriptBlockKind>,
+    _next: TranscriptBlockKind,
+) -> usize {
+    usize::from(previous.is_some())
+}
+
+fn push_block_separator(
+    lines: &mut Vec<Line<'static>>,
+    previous: Option<TranscriptBlockKind>,
+    next: TranscriptBlockKind,
+    width: usize,
+) {
+    lines.extend(
+        std::iter::repeat_with(|| Line::raw(" ".repeat(width)))
+            .take(transcript_separator_lines(previous, next)),
+    );
+}
+
+fn push_transcript_block(
+    lines: &mut Vec<Line<'static>>,
+    previous: Option<TranscriptBlockKind>,
+    kind: TranscriptBlockKind,
+    role: &str,
+    content: &str,
+    width: usize,
+) {
+    let mut content_lines = Vec::new();
+    push_message(&mut content_lines, role, content, width);
+    if content_lines.is_empty() {
+        return;
+    }
+    push_block_separator(lines, previous, kind, width);
+    lines.extend(content_lines);
+}
+
 fn push_message(lines: &mut Vec<Line<'static>>, role: &str, content: &str, width: usize) {
     if role == "turn_end" || role == "turn_working" || role == "compaction_end" {
         lines.push(Line::raw(turn_divider(content, width)));
-        lines.push(Line::raw(" ".repeat(width)));
         return;
     }
     if role == "response_start" {
@@ -1884,7 +1985,6 @@ fn push_message(lines: &mut Vec<Line<'static>>, role: &str, content: &str, width
         "error" => Style::default().fg(Color::Red),
         _ => Style::default(),
     };
-    lines.push(Line::styled(" ".repeat(width), style));
     let content_width = width.saturating_sub(2).max(1);
     let mut first = true;
     for content_line in content.split('\n') {
@@ -1907,7 +2007,6 @@ fn push_message(lines: &mut Vec<Line<'static>>, role: &str, content: &str, width
             first = false;
         }
     }
-    lines.push(Line::styled(" ".repeat(width), style));
 }
 
 fn push_reasoning_summary(lines: &mut Vec<Line<'static>>, content: &str, width: usize) {
@@ -1917,7 +2016,6 @@ fn push_reasoning_summary(lines: &mut Vec<Line<'static>>, content: &str, width: 
     let content_style = Style::default()
         .fg(Color::Gray)
         .add_modifier(Modifier::ITALIC);
-    lines.push(Line::raw(" ".repeat(width)));
     lines.push(Line::styled(
         truncate_width("• Provider reasoning summary", width),
         label_style,
@@ -1932,7 +2030,6 @@ fn push_reasoning_summary(lines: &mut Vec<Line<'static>>, content: &str, width: 
             ));
         }
     }
-    lines.push(Line::raw(" ".repeat(width)));
 }
 
 fn activity_indicator(state: &ThrobberState, label: &str, width: usize) -> Line<'static> {
@@ -1969,8 +2066,6 @@ fn push_markdown(lines: &mut Vec<Line<'static>>, role: &str, content: &str, widt
     };
     let code_inset = usize::from(role == "processes") * 2;
     let code_padding = code_inset;
-    lines.push(Line::styled(" ".repeat(width), block_style));
-
     let options = tui_markdown::Options::new(PhiMarkdown);
     let markdown = tui_markdown::from_str_with_options(content, &options);
     let marker = if role == "you" { "‣ " } else { "• " };
@@ -2075,7 +2170,6 @@ fn push_markdown(lines: &mut Vec<Line<'static>>, role: &str, content: &str, widt
             block_style,
         ));
     }
-    lines.push(Line::styled(" ".repeat(width), block_style));
 }
 
 fn is_ordered_list_line(line: &str) -> bool {
@@ -2121,7 +2215,6 @@ fn wrap_styled_line(line: &Line<'_>, width: usize) -> Vec<Line<'static>> {
 fn push_tool(lines: &mut Vec<Line<'static>>, content: &str, width: usize) {
     let command_style = Style::default().fg(Color::Rgb(190, 190, 185));
     let output_style = Style::default().fg(Color::Rgb(125, 125, 122));
-    lines.push(Line::styled(" ".repeat(width), command_style));
     let (command, output) = content
         .split_once("\n\n")
         .map_or((content, None), |(command, output)| (command, Some(output)));
@@ -2643,6 +2736,206 @@ mod tests {
         )
     }
 
+    fn trimmed(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| line.to_string().trim_end().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn separator_policy_is_deterministic_for_every_block_kind() {
+        let kinds = [
+            TranscriptBlockKind::User,
+            TranscriptBlockKind::Assistant,
+            TranscriptBlockKind::Reasoning,
+            TranscriptBlockKind::Tool,
+            TranscriptBlockKind::Patch,
+            TranscriptBlockKind::Note,
+            TranscriptBlockKind::Error,
+            TranscriptBlockKind::ProcessOutput,
+            TranscriptBlockKind::ResponseStart,
+            TranscriptBlockKind::TurnEnd,
+            TranscriptBlockKind::CompactionEnd,
+            TranscriptBlockKind::TurnWorking,
+            TranscriptBlockKind::Activity,
+        ];
+
+        for next in kinds {
+            assert_eq!(transcript_separator_lines(None, next), 0);
+            for previous in kinds {
+                assert_eq!(
+                    transcript_separator_lines(Some(previous), next),
+                    1,
+                    "separator for {previous:?} -> {next:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn block_renderers_do_not_add_outer_separator_lines() {
+        let cases = [
+            ("you", "user"),
+            ("phi", "assistant"),
+            ("reasoning_summary", "reasoning"),
+            ("tool", "tool"),
+            ("patch", "patch"),
+            ("note", "note"),
+            ("error", "error"),
+            ("processes", "process"),
+            ("response_start", ""),
+            ("turn_end", "done"),
+            ("compaction_end", "compacted"),
+            ("turn_working", "working"),
+        ];
+
+        for (role, content) in cases {
+            let mut lines = Vec::new();
+            push_message(&mut lines, role, content, 40);
+            assert!(!lines.is_empty(), "renderer for {role}");
+            assert!(
+                !lines.first().unwrap().to_string().trim().is_empty(),
+                "leading separator from {role}"
+            );
+            assert!(
+                !lines.last().unwrap().to_string().trim().is_empty(),
+                "trailing separator from {role}"
+            );
+        }
+    }
+
+    #[test]
+    fn adjacent_blocks_have_exactly_one_compositor_separator() {
+        let cases = [
+            ("reasoning_summary", "reasoning", "tool", "tool"),
+            ("reasoning_summary", "reasoning", "phi", "assistant"),
+            (
+                "reasoning_summary",
+                "reasoning one",
+                "reasoning_summary",
+                "reasoning two",
+            ),
+            ("you", "user", "reasoning_summary", "reasoning"),
+            ("you", "user", "phi", "assistant"),
+            ("you", "user", "tool", "tool"),
+            ("tool", "tool one", "tool", "tool two"),
+            ("tool", "tool", "phi", "assistant"),
+            ("tool", "tool", "patch", "patch"),
+            ("patch", "patch", "tool", "tool"),
+            ("note", "note", "error", "error"),
+            ("error", "error", "processes", "process"),
+            ("processes", "process", "note", "note"),
+            ("response_start", "", "phi", "assistant"),
+            ("turn_end", "done", "you", "user"),
+            ("compaction_end", "compacted", "turn_end", "done"),
+            ("turn_working", "working", "tool", "tool"),
+        ];
+
+        for width in [8, 40] {
+            for (first_role, first_content, second_role, second_content) in cases {
+                let mut first = Vec::new();
+                push_message(&mut first, first_role, first_content, width);
+                let mut second = Vec::new();
+                push_message(&mut second, second_role, second_content, width);
+                let mut expected = trimmed(&first);
+                expected.push(String::new());
+                expected.extend(trimmed(&second));
+                expected.push(String::new());
+
+                let mut app = app();
+                app.push_transcript(first_role, first_content);
+                app.push_transcript(second_role, second_content);
+                assert_eq!(
+                    trimmed(&transcript_text(&mut app, width).lines),
+                    expected,
+                    "rendering {first_role} -> {second_role} at width {width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn streamed_assistant_spacing_is_stable_when_cached() {
+        let mut app = app();
+        app.push_transcript("reasoning_summary", "because");
+        app.current_model = "final answer".into();
+        app.current_model_changed();
+        let streaming = trimmed(&transcript_text(&mut app, 20).lines);
+
+        app.current_model.clear();
+        app.current_model_changed();
+        app.push_transcript("phi", "final answer");
+        let cached = trimmed(&transcript_text(&mut app, 20).lines);
+
+        assert_eq!(streaming, cached);
+        let answer = cached
+            .iter()
+            .position(|line| line.contains("final"))
+            .unwrap();
+        assert!(!cached[answer - 2].is_empty());
+        assert!(cached[answer - 1].is_empty());
+    }
+
+    #[test]
+    fn empty_blocks_do_not_create_or_double_separators() {
+        let mut with_empty = app();
+        with_empty.push_transcript("reasoning_summary", "because");
+        with_empty.push_transcript("phi", "");
+        with_empty.push_transcript("tool", "tool");
+
+        let mut without_empty = app();
+        without_empty.push_transcript("reasoning_summary", "because");
+        without_empty.push_transcript("tool", "tool");
+
+        assert_eq!(
+            trimmed(&transcript_text(&mut with_empty, 20).lines),
+            trimmed(&transcript_text(&mut without_empty, 20).lines)
+        );
+        assert!(
+            with_empty.transcript_cache[1]
+                .as_ref()
+                .unwrap()
+                .lines
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn mixed_transcript_window_matches_full_composition() {
+        let mut app = app();
+        for (role, content) in [
+            ("you", "a wrapped user message"),
+            ("reasoning_summary", "reasoning\ncontinued"),
+            ("tool", "Ran `test`\n\nline one\nline two"),
+            ("patch", "patch output"),
+            ("phi", "```text\nanswer\n```"),
+            ("turn_end", "done"),
+        ] {
+            app.push_transcript(role, content);
+        }
+        sync_transcript_cache(&mut app, 12);
+        sync_live_model_cache(&mut app, 12);
+        let tail = live_transcript_tail(&app, 12);
+        let height = cached_transcript_height(&app) + tail.len();
+        let full = transcript_window(&app, &tail, 0, height);
+
+        assert_eq!(full.len(), height);
+        assert!(
+            app.transcript_offsets
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        );
+        for start in 0..=height {
+            let end = (start + 5).min(height);
+            assert_eq!(
+                transcript_window(&app, &tail, start, end),
+                full[start..end],
+                "window {start}..{end}"
+            );
+        }
+    }
+
     #[test]
     fn reduces_stream_and_tool_events() {
         let mut app = app();
@@ -2875,9 +3168,8 @@ mod tests {
 
         let mut lines = Vec::new();
         push_message(&mut lines, "patch", &content, 80);
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].to_string().trim().is_empty());
-        assert_eq!(lines[1].to_string(), content);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].to_string(), content);
     }
 
     #[test]
@@ -3090,10 +3382,10 @@ mod tests {
         let mut app = app();
         app.current_model = "Question?\n\nAnswer.".into();
         let text = transcript_text(&mut app, 20);
-        assert_eq!(text.lines.len(), 5);
-        assert_eq!(text.lines[1].to_string().trim(), "• Question?");
-        assert_eq!(text.lines[2].to_string().trim(), "");
-        assert_eq!(text.lines[3].to_string().trim(), "Answer.");
+        assert_eq!(text.lines.len(), 4);
+        assert_eq!(text.lines[0].to_string().trim(), "• Question?");
+        assert_eq!(text.lines[1].to_string().trim(), "");
+        assert_eq!(text.lines[2].to_string().trim(), "Answer.");
     }
 
     #[test]
@@ -3123,19 +3415,19 @@ mod tests {
         let mut app = app();
         app.transcript.push(("you".into(), "hello".into()));
         let text = transcript_text(&mut app, 20);
-        assert_eq!(text.lines.len(), 4);
+        assert_eq!(text.lines.len(), 2);
         assert!(
             text.lines
                 .iter()
                 .all(|line| { UnicodeWidthStr::width(line.to_string().as_str()) == 20 })
         );
         assert!(
-            text.lines[..3]
+            text.lines[..1]
                 .iter()
                 .all(|line| line.style.bg == Some(Color::Rgb(38, 40, 45)))
         );
-        assert!(text.lines[1].to_string().starts_with("‣ hello"));
-        assert_eq!(text.lines[3].style.bg, None);
+        assert!(text.lines[0].to_string().starts_with("‣ hello"));
+        assert_eq!(text.lines[1].style.bg, None);
     }
 
     #[test]
@@ -3518,25 +3810,38 @@ mod tests {
         assert_eq!(command, "rg \"hello world\" src");
         let mut lines = Vec::new();
         push_tool(&mut lines, &format!("Ran `{command}`\n\nmatch\nsecond"), 40);
-        assert!(lines[1].to_string().starts_with("• Ran `rg"));
-        assert_eq!(lines[1].spans[0].style.fg, Some(Color::Green));
-        assert_eq!(lines[2].to_string(), "");
-        assert_eq!(lines[3].to_string(), "  └ match");
-        assert_eq!(lines[4].to_string(), "    second");
-        assert_eq!(lines[3].style.fg, Some(Color::Rgb(125, 125, 122)));
+        assert!(lines[0].to_string().starts_with("• Ran `rg"));
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Green));
+        assert_eq!(lines[1].to_string(), "");
+        assert_eq!(lines[2].to_string(), "  └ match");
+        assert_eq!(lines[3].to_string(), "    second");
+        assert_eq!(lines[2].style.fg, Some(Color::Rgb(125, 125, 122)));
     }
 
     #[test]
     fn leaves_one_blank_line_between_tool_calls() {
         let mut lines = Vec::new();
-        push_tool(&mut lines, "Ran `one`", 40);
-        push_tool(&mut lines, "Ran `two`", 40);
+        push_transcript_block(
+            &mut lines,
+            None,
+            TranscriptBlockKind::Tool,
+            "tool",
+            "Ran `one`",
+            40,
+        );
+        push_transcript_block(
+            &mut lines,
+            Some(TranscriptBlockKind::Tool),
+            TranscriptBlockKind::Tool,
+            "tool",
+            "Ran `two`",
+            40,
+        );
 
-        assert_eq!(lines.len(), 4);
-        assert!(lines[0].to_string().trim().is_empty());
-        assert!(lines[1].to_string().contains("Ran `one`"));
-        assert!(lines[2].to_string().trim().is_empty());
-        assert!(lines[3].to_string().contains("Ran `two`"));
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].to_string().contains("Ran `one`"));
+        assert!(lines[1].to_string().trim().is_empty());
+        assert!(lines[2].to_string().contains("Ran `two`"));
     }
 
     #[test]
@@ -3583,8 +3888,8 @@ mod tests {
             "Ran `many-lines`\n\none\ntwo\n… (+ 2 lines)\nfive\nsix",
             40,
         );
-        assert_eq!(rendered[5].to_string(), "    … (+ 2 lines)");
-        assert_eq!(rendered[5].style.fg, Some(Color::Rgb(125, 125, 122)));
+        assert_eq!(rendered[4].to_string(), "    … (+ 2 lines)");
+        assert_eq!(rendered[4].style.fg, Some(Color::Rgb(125, 125, 122)));
 
         assert_eq!(truncate_middle_width("abcdefghijk", 5), "ab…jk");
         let mut single_long_line = Vec::new();
@@ -3593,12 +3898,12 @@ mod tests {
             &format!("Ran `json`\n\n{}", "x".repeat(200)),
             40,
         );
-        assert_eq!(single_long_line.len(), 4);
+        assert_eq!(single_long_line.len(), 3);
         assert_eq!(
-            UnicodeWidthStr::width(single_long_line[3].to_string().as_str()),
+            UnicodeWidthStr::width(single_long_line[2].to_string().as_str()),
             40
         );
-        assert!(single_long_line[3].to_string().contains('…'));
+        assert!(single_long_line[2].to_string().contains('…'));
     }
 
     #[test]
@@ -3938,8 +4243,7 @@ mod tests {
 
         let mut lines = Vec::new();
         push_message(&mut lines, "turn_end", "Worked for 2m 32s", 40);
-        assert_eq!(lines.len(), 2);
-        assert!(lines[1].to_string().trim().is_empty());
+        assert_eq!(lines.len(), 1);
 
         assert_eq!(turn_divider("", 40), "─".repeat(40));
     }

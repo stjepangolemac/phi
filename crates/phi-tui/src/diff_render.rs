@@ -34,7 +34,6 @@ struct Change<'a> {
 }
 
 pub(super) fn push(lines: &mut Vec<Line<'static>>, content: &str, width: usize) {
-    lines.push(Line::raw(" ".repeat(width)));
     let Some(changes) = parse_changes(content) else {
         push_fallback(lines, content, width);
         return;
@@ -351,7 +350,7 @@ mod tests {
             60,
         );
 
-        assert_eq!(lines[1].to_string(), "• Edited src/main.rs (+1 −1)");
+        assert_eq!(lines[0].to_string(), "• Edited src/main.rs (+1 −1)");
         let removed = lines
             .iter()
             .find(|line| line.to_string().contains("old();"))
