@@ -2091,6 +2091,7 @@ fn push_reasoning_summary(lines: &mut Vec<Line<'static>>, content: &str, width: 
                 base: content_style,
                 marker: "  ",
                 code_inset: 0,
+                vertical_inset: 0,
             },
         );
     }
@@ -2138,6 +2139,7 @@ fn push_markdown(lines: &mut Vec<Line<'static>>, role: &str, content: &str, widt
             base: Style::default(),
             marker: if role == "you" { "‣ " } else { "• " },
             code_inset,
+            vertical_inset: usize::from(role == "you"),
         },
     );
 }
@@ -2150,6 +2152,7 @@ struct MarkdownBlockStyle {
     base: Style,
     marker: &'static str,
     code_inset: usize,
+    vertical_inset: usize,
 }
 
 fn push_markdown_content(
@@ -2158,6 +2161,7 @@ fn push_markdown_content(
     width: usize,
     block: MarkdownBlockStyle,
 ) {
+    let content_start = lines.len();
     let code_padding = block.code_inset;
     let options = tui_markdown::Options::new(PhiMarkdown);
     let markdown = tui_markdown::from_str_with_options(content, &options);
@@ -2334,6 +2338,14 @@ fn push_markdown_content(
             format!("{}{}", block.marker, " ".repeat(width.saturating_sub(2))),
             block.block.patch(block.base),
         ));
+    }
+    if lines.len() > content_start && block.vertical_inset > 0 {
+        let padding = || Line::styled(" ".repeat(width), block.block.patch(block.base));
+        lines.splice(
+            content_start..content_start,
+            std::iter::repeat_with(padding).take(block.vertical_inset),
+        );
+        lines.extend(std::iter::repeat_with(padding).take(block.vertical_inset));
     }
 }
 
@@ -3036,6 +3048,10 @@ mod tests {
             .collect()
     }
 
+    fn is_user_background(line: &Line<'_>) -> bool {
+        line.style.bg == Some(Color::Rgb(38, 40, 45))
+    }
+
     #[test]
     fn separator_policy_is_deterministic_for_every_block_kind() {
         let kinds = [
@@ -3067,9 +3083,8 @@ mod tests {
     }
 
     #[test]
-    fn block_renderers_do_not_add_outer_separator_lines() {
+    fn non_user_block_renderers_do_not_add_outer_padding() {
         let cases = [
-            ("you", "user"),
             ("phi", "assistant"),
             ("reasoning_summary", "reasoning"),
             ("tool", "tool"),
@@ -3089,13 +3104,69 @@ mod tests {
             assert!(!lines.is_empty(), "renderer for {role}");
             assert!(
                 !lines.first().unwrap().to_string().trim().is_empty(),
-                "leading separator from {role}"
+                "leading padding from {role}"
             );
             assert!(
                 !lines.last().unwrap().to_string().trim().is_empty(),
-                "trailing separator from {role}"
+                "trailing padding from {role}"
             );
         }
+    }
+
+    #[test]
+    fn user_renderer_adds_one_full_width_background_inset() {
+        for (content, width) in [
+            ("hello", 20),
+            ("first\nsecond", 20),
+            ("a message that wraps", 8),
+            ("**bold** and `code`", 20),
+            ("- list item\n\n```text\ncode\n```", 20),
+            ("hello", 1),
+            ("hello", 0),
+        ] {
+            let mut lines = Vec::new();
+            push_message(&mut lines, "you", content, width);
+            assert!(lines.len() >= 3, "rendering {content:?} at width {width}");
+            assert!(lines[0].to_string().trim().is_empty());
+            assert!(lines.last().unwrap().to_string().trim().is_empty());
+            assert!(is_user_background(&lines[0]));
+            assert!(is_user_background(lines.last().unwrap()));
+            assert_eq!(lines[0].width(), width);
+            assert_eq!(lines.last().unwrap().width(), width);
+            assert!(lines.iter().all(is_user_background));
+            assert!(
+                lines[1..lines.len() - 1]
+                    .iter()
+                    .any(|line| !line.to_string().trim().is_empty())
+            );
+        }
+    }
+
+    #[test]
+    fn empty_user_block_has_no_orphan_inset() {
+        let mut lines = Vec::new();
+        push_message(&mut lines, "you", "", 20);
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn user_inset_does_not_consume_markdown_edge_blank_lines() {
+        let content = "\nhello\n\n";
+        let mut user = Vec::new();
+        let mut assistant = Vec::new();
+        push_message(&mut user, "you", content, 20);
+        push_message(&mut assistant, "phi", content, 20);
+
+        assert_eq!(user.len(), assistant.len() + 2);
+        assert!(is_user_background(&user[0]));
+        assert!(is_user_background(user.last().unwrap()));
+        assert_eq!(
+            trimmed(&user[1..user.len() - 1])
+                .into_iter()
+                .map(|line| line.replacen('‣', "•", 1))
+                .collect::<Vec<_>>(),
+            trimmed(&assistant)
+        );
     }
 
     #[test]
@@ -3146,6 +3217,58 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn user_transitions_keep_container_insets_distinct_from_separators() {
+        let other_blocks = [
+            ("phi", "assistant"),
+            ("reasoning_summary", "reasoning"),
+            ("tool", "tool"),
+            ("patch", "patch"),
+            ("processes", "process"),
+            ("note", "note"),
+            ("error", "error"),
+            ("turn_end", "done"),
+        ];
+
+        for (role, content) in other_blocks {
+            for transcript in [
+                [("you", "user"), (role, content)],
+                [(role, content), ("you", "user")],
+            ] {
+                let mut app = app();
+                for (role, content) in transcript {
+                    app.push_transcript(role, content);
+                }
+                let lines = transcript_text(&mut app, 20).lines;
+                let user = lines
+                    .iter()
+                    .position(|line| line.to_string().contains("user"))
+                    .unwrap();
+                assert!(is_user_background(&lines[user - 1]), "before {role}");
+                assert!(is_user_background(&lines[user + 1]), "after {role}");
+                let separator = if transcript[0].0 == "you" {
+                    &lines[user + 2]
+                } else {
+                    &lines[user - 2]
+                };
+                assert!(separator.to_string().trim().is_empty(), "role {role}");
+                assert_eq!(separator.style.bg, None, "role {role}");
+            }
+        }
+
+        let mut app = app();
+        app.push_transcript("you", "first");
+        app.push_transcript("you", "second");
+        let lines = transcript_text(&mut app, 20).lines;
+        assert_eq!(lines.len(), 8);
+        assert!(is_user_background(&lines[0]));
+        assert!(is_user_background(&lines[2]));
+        assert_eq!(lines[3].style.bg, None);
+        assert!(is_user_background(&lines[4]));
+        assert!(is_user_background(&lines[6]));
+        assert_eq!(lines[7].style.bg, None);
     }
 
     #[test]
@@ -3227,6 +3350,30 @@ mod tests {
                 "window {start}..{end}"
             );
         }
+    }
+
+    #[test]
+    fn user_insets_are_included_in_cached_heights_offsets_windows_and_resizes() {
+        let mut app = app();
+        app.push_transcript("you", "abcdefghijk");
+        app.push_transcript("phi", "ok");
+
+        sync_transcript_cache(&mut app, 20);
+        assert_eq!(app.transcript_offsets, [3, 5]);
+        assert_eq!(cached_transcript_height(&app), 5);
+        let full = transcript_window(&app, &[], 0, 5);
+        assert!(is_user_background(&full[0]));
+        assert!(is_user_background(&full[2]));
+        assert_eq!(full[3].style.bg, None);
+        assert_eq!(transcript_window(&app, &[], 1, 4), full[1..4]);
+
+        sync_transcript_cache(&mut app, 8);
+        assert_eq!(app.transcript_offsets, [4, 6]);
+        assert_eq!(cached_transcript_height(&app), 6);
+        let resized = transcript_window(&app, &[], 0, 6);
+        assert!(is_user_background(&resized[0]));
+        assert!(is_user_background(&resized[3]));
+        assert_eq!(resized[4].style.bg, None);
     }
 
     #[test]
@@ -3712,19 +3859,21 @@ mod tests {
         let mut app = app();
         app.transcript.push(("you".into(), "hello".into()));
         let text = transcript_text(&mut app, 20);
-        assert_eq!(text.lines.len(), 2);
+        assert_eq!(text.lines.len(), 4);
         assert!(
-            text.lines
+            text.lines[..3]
                 .iter()
                 .all(|line| { UnicodeWidthStr::width(line.to_string().as_str()) == 20 })
         );
         assert!(
-            text.lines[..1]
+            text.lines[..3]
                 .iter()
                 .all(|line| line.style.bg == Some(Color::Rgb(38, 40, 45)))
         );
-        assert!(text.lines[0].to_string().starts_with("‣ hello"));
-        assert_eq!(text.lines[1].style.bg, None);
+        assert!(text.lines[0].to_string().trim().is_empty());
+        assert!(text.lines[1].to_string().starts_with("‣ hello"));
+        assert!(text.lines[2].to_string().trim().is_empty());
+        assert_eq!(text.lines[3].style.bg, None);
     }
 
     #[test]
@@ -3816,29 +3965,37 @@ mod tests {
                 app.push_transcript(before_role, before);
                 app.push_transcript(role, "```text\ncode\n```");
                 app.push_transcript(after_role, after);
-                let rendered = trimmed(&transcript_text(&mut app, 30).lines);
+                let lines = transcript_text(&mut app, 30).lines;
+                let rendered = trimmed(&lines);
                 let code = rendered
                     .iter()
                     .position(|line| line.contains("code"))
                     .unwrap();
 
                 assert!(rendered[code - 1].is_empty(), "before {role} code");
-                assert!(
-                    !rendered[code - 2].is_empty(),
-                    "duplicate separator before {role} code"
-                );
                 assert!(rendered[code + 1].is_empty(), "after {role} code");
-                assert!(
-                    !rendered[code + 2].is_empty(),
-                    "duplicate separator after {role} code"
-                );
+                if role == "you" {
+                    assert!(is_user_background(&lines[code - 1]));
+                    assert_eq!(lines[code - 2].style.bg, None);
+                    assert!(is_user_background(&lines[code + 1]));
+                    assert_eq!(lines[code + 2].style.bg, None);
+                } else {
+                    assert!(
+                        !rendered[code - 2].is_empty(),
+                        "duplicate separator before {role} code"
+                    );
+                    assert!(
+                        !rendered[code + 2].is_empty(),
+                        "duplicate separator after {role} code"
+                    );
+                }
             }
         }
     }
 
     #[test]
-    fn fenced_code_at_markdown_content_edges_has_no_outer_padding() {
-        for role in ["you", "phi", "processes", "reasoning_summary"] {
+    fn non_user_fenced_code_at_markdown_content_edges_has_no_outer_padding() {
+        for role in ["phi", "processes", "reasoning_summary"] {
             let mut lines = Vec::new();
             push_message(&mut lines, role, "```text\ncode\n```\n\nafter", 30);
             let rendered = trimmed(&lines);
@@ -4991,11 +5148,18 @@ mod tests {
         for role in ["you", "phi", "processes"] {
             let mut lines = Vec::new();
             push_message(&mut lines, role, content, 18);
-            assert_eq!(
-                trimmed(&lines),
-                ["  - an item that w", "    raps across li", "    nes"],
-                "role {role}"
-            );
+            let expected = if role == "you" {
+                vec![
+                    "",
+                    "  - an item that w",
+                    "    raps across li",
+                    "    nes",
+                    "",
+                ]
+            } else {
+                vec!["  - an item that w", "    raps across li", "    nes"]
+            };
+            assert_eq!(trimmed(&lines), expected, "role {role}");
         }
 
         let mut reasoning = Vec::new();
