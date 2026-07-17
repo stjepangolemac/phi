@@ -214,7 +214,7 @@ const DEFAULT_CONFIG: &str = r#"{
 }"#;
 
 const DEFAULT_SCHEME_CONFIG: &str = include_str!("../../../config.scm");
-static BUNDLED_POLICY: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../policy");
+static BUNDLED_PLUGINS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../plugins");
 const PHI_HARNESS_SKILL: &[(&str, &str)] = &[
     (
         "SKILL.md",
@@ -268,7 +268,7 @@ pub fn initialize_at(home: &phi_core::home::PhiHome) -> Result<()> {
     write_if_missing(&home.plugin_lock(), "{\n  \"plugins\": []\n}\n")?;
     let official = phi_core::plugin::official_catalog()?;
     for plugin in &official.plugins {
-        copy_official_plugin(home, &plugin.name, &plugin.version, &plugin.path)?;
+        copy_official_plugin(home, &plugin.name, &plugin.path)?;
     }
     let commit = env!("PHI_BUILD_COMMIT");
     if !commit.is_empty() {
@@ -289,37 +289,17 @@ pub fn initialize_at(home: &phi_core::home::PhiHome) -> Result<()> {
     Ok(())
 }
 
-fn copy_official_plugin(
-    home: &phi_core::home::PhiHome,
-    name: &str,
-    version: &str,
-    relative: &str,
-) -> Result<()> {
-    let relative = relative.strip_prefix("policy/").unwrap_or(relative);
+fn copy_official_plugin(home: &phi_core::home::PhiHome, name: &str, relative: &str) -> Result<()> {
+    let relative = relative.strip_prefix("plugins/").unwrap_or(relative);
     let plugin = home.builtins().join("plugins").join(name);
-    if let Some(source) = BUNDLED_POLICY.get_dir(relative) {
-        if plugin.exists() {
-            std::fs::remove_dir_all(&plugin)?;
-        }
-        extract_bundled_dir(source, &plugin)?;
-        return Ok(());
+    let source = BUNDLED_PLUGINS
+        .get_dir(relative)
+        .with_context(|| format!("official plugin package is missing: plugins/{relative}"))?;
+    if plugin.exists() {
+        std::fs::remove_dir_all(&plugin)?;
     }
-    let source = BUNDLED_POLICY
-        .get_file(relative)
-        .with_context(|| format!("official plugin source is missing: policy/{relative}"))?;
-    write_bundled(
-        &plugin.join("plugin.json"),
-        &serde_json::to_string_pretty(&serde_json::json!({
-            "name": name,
-            "version": version,
-            "entrypoint": "main.scm"
-        }))?,
-    )?;
-    if let Some(parent) = plugin.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(plugin.join("main.scm"), source.contents())
-        .with_context(|| format!("copy official plugin {name}"))?;
+    extract_bundled_dir(source, &plugin)?;
+    phi_core::plugin::validate_package(&plugin)?;
     Ok(())
 }
 
@@ -368,19 +348,7 @@ fn write_if_missing(path: &Path, content: &str) -> Result<()> {
 }
 
 fn initialize_scheme_config(home: &phi_core::home::PhiHome) -> Result<()> {
-    let target = home.scheme_config();
-    if target.exists() {
-        return Ok(());
-    }
-    let legacy = home.root.join("main.scm");
-    if legacy.is_file() {
-        let (agent, _) = DEFAULT_SCHEME_CONFIG
-            .split_once("(load-plugin!")
-            .context("default config has no plugin composition")?;
-        let composition = std::fs::read_to_string(legacy)?;
-        return write_if_missing(&target, &format!("{}{}", agent, composition));
-    }
-    write_if_missing(&target, DEFAULT_SCHEME_CONFIG)
+    write_if_missing(&home.scheme_config(), DEFAULT_SCHEME_CONFIG)
 }
 
 fn home_for_config(path: &Path) -> Result<phi_core::home::PhiHome> {
@@ -395,35 +363,48 @@ fn resolve_sources(
 ) -> Result<phi_core::session::ComposedSources> {
     let config = home.scheme_config();
     let lock = phi_core::plugin::read_lock(home)?;
+    let official = phi_core::plugin::official_catalog()?;
+    let mut available = std::collections::BTreeMap::new();
+    for plugin in &official.plugins {
+        available.insert(
+            plugin.name.clone(),
+            home.builtins().join("plugins").join(&plugin.name),
+        );
+    }
+    for plugin in &lock.plugins {
+        available.insert(
+            plugin.name.clone(),
+            phi_core::plugin::install_root(home, &plugin.name, &plugin.commit),
+        );
+    }
+    let mut skill_plugins = Vec::new();
+    for (name, root) in &available {
+        let entrypoint = phi_core::plugin::validate_package(root)
+            .with_context(|| format!("validate plugin package: {name}"))?;
+        skill_plugins.push(phi_core::session::PluginSource {
+            name: name.clone(),
+            root: root.clone(),
+            entrypoint,
+        });
+    }
     let mut plugins = Vec::new();
     for name in phi_steel::composition_plugins(&config)? {
-        let (root, manifest) =
-            if let Some(locked) = lock.plugins.iter().find(|item| item.name == name) {
-                let root = phi_core::plugin::install_root(home, &name, &locked.commit);
-                let manifest = phi_core::plugin::read_manifest(&root)?;
-                (root, manifest)
-            } else {
-                let root = home.builtins().join("plugins").join(&name);
-                if !root.is_dir() {
-                    bail!("plugin is not installed: {name}");
-                }
-                let manifest = phi_core::plugin::read_manifest(&root)?;
-                (root, manifest)
-            };
-        if manifest.name != name {
-            bail!("plugin manifest name does not match composition: {name}");
-        }
-        let entrypoint = root.join(&manifest.entrypoint);
-        if !entrypoint.is_file() {
-            bail!("plugin entrypoint is missing: {name}");
-        }
+        let root = available
+            .get(&name)
+            .with_context(|| format!("plugin is not installed: {name}"))?
+            .clone();
+        let entrypoint = phi_core::plugin::validate_package(&root)?;
         plugins.push(phi_core::session::PluginSource {
             name,
             root,
             entrypoint,
         });
     }
-    Ok(phi_core::session::ComposedSources { config, plugins })
+    Ok(phi_core::session::ComposedSources {
+        config,
+        plugins,
+        skill_plugins,
+    })
 }
 
 fn entrypoints(sources: &phi_core::session::ComposedSources) -> Vec<PathBuf> {
@@ -434,32 +415,17 @@ fn entrypoints(sources: &phi_core::session::ComposedSources) -> Vec<PathBuf> {
         .collect()
 }
 
-fn plugin_skill_roots(sources: &phi_core::session::ComposedSources) -> Result<Vec<PathBuf>> {
-    let registrations = phi_steel::plugin_skills(&sources.config, &entrypoints(sources))?;
-    let mut roots = Vec::new();
-    for registration in registrations {
-        let plugin = sources
-            .plugins
-            .iter()
-            .find(|plugin| plugin.name == registration.plugin)
-            .with_context(|| {
-                format!(
-                    "skill registered by unknown plugin: {}",
-                    registration.plugin
-                )
-            })?;
-        let package = plugin.root.canonicalize()?;
-        let root = package.join(&registration.path).canonicalize()?;
-        if !root.starts_with(&package) || !root.join("SKILL.md").is_file() {
-            bail!(
-                "plugin skill path is invalid: {}/{}",
-                registration.plugin,
-                registration.path
-            );
-        }
-        roots.push(root);
-    }
-    Ok(roots)
+fn plugin_skill_sources(
+    sources: &phi_core::session::ComposedSources,
+) -> Vec<phi_core::skill::PluginSkillSource> {
+    sources
+        .skill_plugins
+        .iter()
+        .map(|plugin| phi_core::skill::PluginSkillSource {
+            plugin: plugin.name.clone(),
+            root: plugin.root.clone(),
+        })
+        .collect()
 }
 
 struct ResolvedPolicySources {
@@ -526,6 +492,7 @@ fn resolve_session(
                 &sessions,
                 &current.config,
                 &current.plugins,
+                &current.skill_plugins,
             )?;
             let sources = session
                 .composed_sources()?
@@ -548,7 +515,7 @@ fn build_policy(
     session_id: &str,
     output_schema: Option<&serde_json::Value>,
 ) -> Result<PolicyBootstrap> {
-    let plugin_skills = plugin_skill_roots(sources)?;
+    let plugin_skills = plugin_skill_sources(sources);
     let skills = discover_skills_with_plugins(home, workspace, &plugin_skills)?;
     let capabilities = Arc::new(capabilities_for_skills(
         home,
@@ -595,7 +562,19 @@ fn reload_composition(
         output_schema,
     )?;
     let catalog = catalog(&mut bootstrap.policy)?;
-    session.replace_composition(&sources.config, &sources.plugins)?;
+    session.replace_composition(&sources.config, &sources.plugins, &sources.skill_plugins)?;
+    let pinned = session
+        .composed_sources()?
+        .context("session has no composition snapshot after reload")?;
+    bootstrap = build_policy(
+        home,
+        workspace,
+        &pinned,
+        Some(bootstrap.policy.state().to_owned()),
+        full_access,
+        session.id(),
+        output_schema,
+    )?;
     Ok((bootstrap, catalog))
 }
 
@@ -1212,13 +1191,13 @@ fn discover_skills(
 fn discover_skills_with_plugins(
     home: &phi_core::home::PhiHome,
     workspace: &Path,
-    plugin_roots: &[PathBuf],
+    plugin_sources: &[phi_core::skill::PluginSkillSource],
 ) -> Result<phi_core::skill::SkillCatalog> {
     phi_core::skill::discover(
         &home.builtin_skills(),
         &home.skills(),
         workspace,
-        plugin_roots,
+        plugin_sources,
     )
 }
 
@@ -2684,6 +2663,91 @@ mod tests {
     }
 
     #[test]
+    fn unloaded_plugin_skills_are_session_pinned_across_update_and_remove() {
+        let (workspace, options) = options();
+        let home = home_for_config(&options.config_path).unwrap();
+        let write_plugin = |commit: &str, instructions: &str| {
+            let root = phi_core::plugin::install_root(&home, "unloaded", commit);
+            std::fs::create_dir_all(root.join("skills/example")).unwrap();
+            std::fs::write(root.join("plugin.scm"), "(define unloaded #t)").unwrap();
+            std::fs::write(
+                root.join("skills/example/SKILL.md"),
+                format!(
+                    "---\nname: example\ndescription: Example plugin skill.\n---\n\n{instructions}\n"
+                ),
+            )
+            .unwrap();
+        };
+        let write_lock = |commit: &str| {
+            std::fs::write(
+                home.plugin_lock(),
+                serde_json::to_vec_pretty(&phi_core::plugin::PluginLock {
+                    plugins: vec![phi_core::plugin::LockedPlugin {
+                        name: "unloaded".into(),
+                        url: "https://example.invalid/plugins.git".into(),
+                        requested_rev: "main".into(),
+                        commit: commit.into(),
+                        path: "plugins/unloaded".into(),
+                    }],
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        let instructions = |sources: &phi_core::session::ComposedSources| {
+            let catalog = discover_skills_with_plugins(
+                &home,
+                workspace.path(),
+                &plugin_skill_sources(sources),
+            )
+            .unwrap();
+            std::fs::read_to_string(catalog.resource_roots()["skill://example/"].join("SKILL.md"))
+                .unwrap()
+        };
+
+        write_plugin("commit-a", "Pinned version A.");
+        write_lock("commit-a");
+        let current = resolve_sources(&home, workspace.path()).unwrap();
+        assert!(
+            !current
+                .plugins
+                .iter()
+                .any(|plugin| plugin.name == "unloaded")
+        );
+        assert!(
+            current
+                .skill_plugins
+                .iter()
+                .any(|plugin| plugin.name == "unloaded")
+        );
+        let session = phi_core::session::Session::create_composed(
+            &workspace.path().join(".phi/sessions"),
+            &current.config,
+            &current.plugins,
+            &current.skill_plugins,
+        )
+        .unwrap();
+        let pinned = session.composed_sources().unwrap().unwrap();
+        assert!(instructions(&pinned).contains("Pinned version A."));
+
+        write_plugin("commit-b", "Updated version B.");
+        write_lock("commit-b");
+        let updated = resolve_sources(&home, workspace.path()).unwrap();
+        assert!(instructions(&updated).contains("Updated version B."));
+        assert!(instructions(&pinned).contains("Pinned version A."));
+
+        phi_core::plugin::remove(&home, "unloaded").unwrap();
+        let removed = resolve_sources(&home, workspace.path()).unwrap();
+        assert!(
+            !removed
+                .skill_plugins
+                .iter()
+                .any(|plugin| plugin.name == "unloaded")
+        );
+        assert!(instructions(&pinned).contains("Pinned version A."));
+    }
+
+    #[test]
     fn reports_the_resolved_harness_status() {
         let (workspace, options) = options();
         let status = harness_status(&options).unwrap();
@@ -3098,6 +3162,7 @@ mod tests {
                     &workspace.path().join(".phi/sessions"),
                     &sources.config,
                     &sources.plugins,
+                    &sources.skill_plugins,
                 )
                 .unwrap();
                 let mut policy = phi_steel::Policy::load_with_state(
@@ -3187,6 +3252,7 @@ mod tests {
                     &workspace.path().join(".phi/sessions"),
                     &sources.config,
                     &sources.plugins,
+                    &sources.skill_plugins,
                 )
                 .unwrap();
                 let capabilities = capabilities(&home, false);
@@ -3274,6 +3340,7 @@ mod tests {
                     &workspace.path().join(".phi/sessions"),
                     &sources.config,
                     &sources.plugins,
+                    &sources.skill_plugins,
                 )
                 .unwrap();
                 let registry = Arc::new(capabilities(&home, false));
@@ -3346,35 +3413,23 @@ mod tests {
     }
 
     #[test]
-    fn migrates_legacy_main_into_the_single_scheme_config() {
-        let root = tempfile::tempdir().unwrap();
-        let home = phi_core::home::PhiHome {
-            root: root.path().join("home"),
-        };
-        std::fs::create_dir_all(&home.root).unwrap();
-        std::fs::write(home.root.join("main.scm"), "(load-plugin! \"legacy\")\n").unwrap();
-
-        initialize_at(&home).unwrap();
-
-        let migrated = std::fs::read_to_string(home.scheme_config()).unwrap();
-        assert!(migrated.contains("(define (on-event"));
-        assert!(migrated.ends_with("(load-plugin! \"legacy\")\n"));
-    }
-
-    #[test]
     fn refreshes_versioned_builtins_without_overwriting_user_config() {
         let root = tempfile::tempdir().unwrap();
         let home = phi_core::home::PhiHome {
             root: root.path().join("home"),
         };
         initialize_at(&home).unwrap();
-        std::fs::write(home.builtins().join("plugins/responses/main.scm"), "stale").unwrap();
+        std::fs::write(
+            home.builtins().join("plugins/responses/plugin.scm"),
+            "stale",
+        )
+        .unwrap();
         std::fs::write(home.scheme_config(), "user composition").unwrap();
         initialize_at(&home).unwrap();
         assert_eq!(
-            std::fs::read_to_string(home.builtins().join("plugins/responses/main.scm")).unwrap(),
-            BUNDLED_POLICY
-                .get_file("providers/responses.scm")
+            std::fs::read_to_string(home.builtins().join("plugins/responses/plugin.scm")).unwrap(),
+            BUNDLED_PLUGINS
+                .get_file("responses/plugin.scm")
                 .unwrap()
                 .contents_utf8()
                 .unwrap()
@@ -3382,11 +3437,11 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(
                 home.builtins()
-                    .join("plugins/compaction-structured/main.scm")
+                    .join("plugins/compaction-structured/plugin.scm")
             )
             .unwrap(),
-            BUNDLED_POLICY
-                .get_file("compaction/structured.scm")
+            BUNDLED_PLUGINS
+                .get_file("compaction-structured/plugin.scm")
                 .unwrap()
                 .contents_utf8()
                 .unwrap()

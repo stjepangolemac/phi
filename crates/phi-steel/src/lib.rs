@@ -46,12 +46,6 @@ pub struct CompositionStatus {
     pub compactor: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub struct RegisteredSkill {
-    pub plugin: String,
-    pub path: String,
-}
-
 const PLUGIN_PRELUDE: &str = include_str!("plugin_prelude.scm");
 
 impl Policy {
@@ -112,14 +106,6 @@ impl Policy {
             &mut self.vm,
             &json_invocation("registered-command-specs", []),
             "decode plugin commands",
-        )
-    }
-
-    pub fn registered_skills(&mut self) -> Result<Vec<RegisteredSkill>> {
-        eval_json(
-            &mut self.vm,
-            &json_invocation("registered-skills", []),
-            "decode registered skills",
         )
     }
 
@@ -236,17 +222,6 @@ impl Policy {
     }
 }
 
-pub fn plugin_skills(config: &Path, plugins: &[PathBuf]) -> Result<Vec<RegisteredSkill>> {
-    let mut vm = Engine::new_sandboxed();
-    vm.compile_and_run_raw_program(policy_source(config, plugins)?)
-        .context("load Steel policy for skill discovery")?;
-    eval_json(
-        &mut vm,
-        &json_invocation("registered-skills", []),
-        "decode registered skills",
-    )
-}
-
 fn policy_source(config: &Path, plugins: &[PathBuf]) -> Result<String> {
     let mut source = String::from(PLUGIN_PRELUDE);
     for plugin in plugins {
@@ -263,17 +238,11 @@ fn policy_source(config: &Path, plugins: &[PathBuf]) -> Result<String> {
 }
 
 fn plugin_name(entrypoint: &Path) -> Result<String> {
-    let manifest = entrypoint.parent().map(|root| root.join("plugin.json"));
-    if let Some(manifest) = manifest.filter(|path| path.is_file()) {
-        let value: serde_json::Value = serde_json::from_slice(&fs::read(manifest)?)?;
-        if let Some(name) = value.get("name").and_then(|value| value.as_str()) {
-            return Ok(name.to_owned());
-        }
-    }
     Ok(entrypoint
-        .file_stem()
+        .parent()
+        .and_then(Path::file_name)
         .and_then(|value| value.to_str())
-        .context("plugin entrypoint has no file stem")?
+        .context("plugin entrypoint has no package name")?
         .to_owned())
 }
 
@@ -405,16 +374,16 @@ mod tests {
 
     fn plugins(root: &Path) -> Vec<PathBuf> {
         vec![
-            root.join("policy/providers/responses.scm"),
-            root.join("policy/providers/openai.scm"),
-            root.join("policy/providers/openrouter.scm"),
-            root.join("policy/tools/openai-web-search.scm"),
-            root.join("policy/tools/openrouter-web-search.scm"),
-            root.join("policy/tools/skills.scm"),
-            root.join("policy/tools/context.scm"),
-            root.join("policy/tools/codex-patch.scm"),
-            root.join("policy/prompts/simple.scm"),
-            root.join("policy/compaction/structured.scm"),
+            root.join("plugins/responses/plugin.scm"),
+            root.join("plugins/openai/plugin.scm"),
+            root.join("plugins/openrouter/plugin.scm"),
+            root.join("plugins/openai-web-search/plugin.scm"),
+            root.join("plugins/openrouter-web-search/plugin.scm"),
+            root.join("plugins/skills/plugin.scm"),
+            root.join("plugins/context-management/plugin.scm"),
+            root.join("plugins/codex-patch/plugin.scm"),
+            root.join("plugins/simple-prompt/plugin.scm"),
+            root.join("plugins/compaction-structured/plugin.scm"),
         ]
     }
 
@@ -429,7 +398,7 @@ mod tests {
     fn compact_policy_with_strict(root: &Path, limit: u64, strict: bool) -> Policy {
         let temp = tempfile::tempdir().unwrap();
         let provider = temp.path().join("openai.scm");
-        let mut source = fs::read_to_string(root.join("policy/providers/openai.scm"))
+        let mut source = fs::read_to_string(root.join("plugins/openai/plugin.scm"))
             .unwrap()
             .replace(
                 "'compaction_token_limit 244800",
@@ -588,33 +557,6 @@ mod tests {
     }
 
     #[test]
-    fn plugins_register_package_relative_skills() {
-        let temp = tempfile::tempdir().unwrap();
-        let plugin = temp.path().join("example");
-        fs::create_dir_all(&plugin).unwrap();
-        fs::write(
-            plugin.join("plugin.json"),
-            r#"{"name":"example","version":"0.1.0","entrypoint":"main.scm"}"#,
-        )
-        .unwrap();
-        fs::write(
-            plugin.join("main.scm"),
-            r#"(register-skill! (hash 'path "skills/review"))"#,
-        )
-        .unwrap();
-        let config = temp.path().join("config.scm");
-        fs::write(&config, "").unwrap();
-
-        assert_eq!(
-            plugin_skills(&config, &[plugin.join("main.scm")]).unwrap(),
-            vec![RegisteredSkill {
-                plugin: "example".into(),
-                path: "skills/review".into(),
-            }]
-        );
-    }
-
-    #[test]
     fn policy_maps_events_to_provider_and_finish_effects() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut policy = policy(&root);
@@ -763,15 +705,15 @@ mod tests {
         )
         .unwrap();
         let custom = vec![
-            root.join("policy/providers/responses.scm"),
-            root.join("policy/providers/openai.scm"),
-            root.join("policy/providers/openrouter.scm"),
-            root.join("policy/tools/openai-web-search.scm"),
-            root.join("policy/tools/openrouter-web-search.scm"),
-            root.join("policy/tools/context.scm"),
-            root.join("policy/tools/codex-patch.scm"),
+            root.join("plugins/responses/plugin.scm"),
+            root.join("plugins/openai/plugin.scm"),
+            root.join("plugins/openrouter/plugin.scm"),
+            root.join("plugins/openai-web-search/plugin.scm"),
+            root.join("plugins/openrouter-web-search/plugin.scm"),
+            root.join("plugins/context-management/plugin.scm"),
+            root.join("plugins/codex-patch/plugin.scm"),
             prompt,
-            root.join("policy/compaction/structured.scm"),
+            root.join("plugins/compaction-structured/plugin.scm"),
         ];
         let mut policy = Policy::load(&root.join("config.scm"), &custom).unwrap();
         let output = policy
@@ -1115,7 +1057,7 @@ mod tests {
         let provider = temp.path().join("openai.scm");
         fs::write(
             &provider,
-            fs::read_to_string(root.join("policy/providers/openai.scm"))
+            fs::read_to_string(root.join("plugins/openai/plugin.scm"))
                 .unwrap()
                 .replace(
                     "'compaction_token_limit 244800",
@@ -1125,7 +1067,7 @@ mod tests {
         .unwrap();
         let mut sources = plugins(&root);
         sources[1] = provider;
-        sources.retain(|source| !source.ends_with("policy/tools/context.scm"));
+        sources.retain(|source| !source.ends_with("plugins/context-management/plugin.scm"));
         let mut policy = Policy::load(&root.join("config.scm"), &sources).unwrap();
 
         let output = policy
@@ -2779,7 +2721,7 @@ mod tests {
             &provider,
             format!(
                 "{}\n{}",
-                fs::read_to_string(root.join("policy/providers/openai.scm")).unwrap(),
+                fs::read_to_string(root.join("plugins/openai/plugin.scm")).unwrap(),
                 r#"(register-command!
                       (hash 'name "echo" 'usage "/echo TEXT"
                             'description "Echo text." 'source "test")
@@ -2789,15 +2731,15 @@ mod tests {
         )
         .unwrap();
         let custom = vec![
-            root.join("policy/providers/responses.scm"),
+            root.join("plugins/responses/plugin.scm"),
             provider,
-            root.join("policy/providers/openrouter.scm"),
-            root.join("policy/tools/openai-web-search.scm"),
-            root.join("policy/tools/openrouter-web-search.scm"),
-            root.join("policy/tools/context.scm"),
-            root.join("policy/tools/codex-patch.scm"),
-            root.join("policy/prompts/simple.scm"),
-            root.join("policy/compaction/structured.scm"),
+            root.join("plugins/openrouter/plugin.scm"),
+            root.join("plugins/openai-web-search/plugin.scm"),
+            root.join("plugins/openrouter-web-search/plugin.scm"),
+            root.join("plugins/context-management/plugin.scm"),
+            root.join("plugins/codex-patch/plugin.scm"),
+            root.join("plugins/simple-prompt/plugin.scm"),
+            root.join("plugins/compaction-structured/plugin.scm"),
         ];
         let mut policy = Policy::load(&root.join("config.scm"), &custom).unwrap();
         assert_eq!(policy.commands().unwrap()[0].name, "echo");

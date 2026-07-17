@@ -2,17 +2,17 @@
   "url": "https://github.com/stjepangolemac/phi.git",
   "revision": "main",
   "plugins": [
-    { "name": "responses", "version": "0.1.0", "path": "policy/providers/responses.scm" },
-    { "name": "openai", "version": "0.1.0", "path": "policy/providers/openai.scm" },
-    { "name": "openrouter", "version": "0.1.0", "path": "policy/providers/openrouter.scm" },
-    { "name": "openai-web-search", "version": "0.1.0", "path": "policy/tools/openai-web-search.scm" },
-    { "name": "openrouter-web-search", "version": "0.1.0", "path": "policy/tools/openrouter-web-search.scm" },
-    { "name": "skills", "version": "0.1.0", "path": "policy/tools/skills.scm" },
-    { "name": "context-management", "version": "0.1.0", "path": "policy/tools/context.scm" },
-    { "name": "dynamic-workflows", "version": "0.1.0", "path": "policy/tools/dynamic-workflows" },
-    { "name": "codex-patch", "version": "0.1.0", "path": "policy/tools/codex-patch.scm" },
-    { "name": "simple-prompt", "version": "0.1.0", "path": "policy/prompts/simple.scm" },
-    { "name": "simple-compaction", "version": "0.1.0", "path": "policy/compaction/simple.scm" },
-    { "name": "compaction-structured", "version": "0.1.0", "path": "policy/compaction/structured.scm" }
+    { "name": "responses", "path": "plugins/responses" },
+    { "name": "openai", "path": "plugins/openai" },
+    { "name": "openrouter", "path": "plugins/openrouter" },
+    { "name": "openai-web-search", "path": "plugins/openai-web-search" },
+    { "name": "openrouter-web-search", "path": "plugins/openrouter-web-search" },
+    { "name": "skills", "path": "plugins/skills" },
+    { "name": "context-management", "path": "plugins/context-management" },
+    { "name": "dynamic-workflows", "path": "plugins/dynamic-workflows" },
+    { "name": "codex-patch", "path": "plugins/codex-patch" },
+    { "name": "simple-prompt", "path": "plugins/simple-prompt" },
+    { "name": "simple-compaction", "path": "plugins/simple-compaction" },
+    { "name": "compaction-structured", "path": "plugins/compaction-structured" }
   ]
 }

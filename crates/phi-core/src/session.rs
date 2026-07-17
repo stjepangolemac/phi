@@ -26,11 +26,14 @@ pub struct PluginSource {
 pub struct ComposedSources {
     pub config: PathBuf,
     pub plugins: Vec<PluginSource>,
+    pub skill_plugins: Vec<PluginSource>,
 }
 
 #[derive(Deserialize, Serialize)]
 struct CompositionSnapshot {
     plugins: Vec<SnapshotPlugin>,
+    #[serde(default)]
+    skill_plugins: Vec<SnapshotPlugin>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -41,11 +44,16 @@ struct SnapshotPlugin {
 }
 
 impl Session {
-    pub fn create_composed(root: &Path, config: &Path, plugins: &[PluginSource]) -> Result<Self> {
+    pub fn create_composed(
+        root: &Path,
+        config: &Path,
+        plugins: &[PluginSource],
+        skill_plugins: &[PluginSource],
+    ) -> Result<Self> {
         let id = Uuid::new_v4().to_string();
         let session = Self::at(root, &id)?;
         fs::create_dir_all(&session.dir)?;
-        let snapshot = snapshot_composition(&session.dir, config, plugins)?;
+        let snapshot = snapshot_composition(&session.dir, config, plugins, skill_plugins)?;
         crate::write_json_atomic(
             &session.dir.join("meta.json"),
             &serde_json::json!({
@@ -91,8 +99,13 @@ impl Session {
         fs::read_to_string(self.dir.join("state.json")).context("session has no saved state")
     }
 
-    pub fn replace_composition(&self, config: &Path, plugins: &[PluginSource]) -> Result<()> {
-        snapshot_composition(&self.dir, config, plugins).map(|_| ())
+    pub fn replace_composition(
+        &self,
+        config: &Path,
+        plugins: &[PluginSource],
+        skill_plugins: &[PluginSource],
+    ) -> Result<()> {
+        snapshot_composition(&self.dir, config, plugins, skill_plugins).map(|_| ())
     }
 
     pub fn composed_sources(&self) -> Result<Option<ComposedSources>> {
@@ -101,25 +114,16 @@ impl Session {
             return Ok(None);
         }
         let snapshot: CompositionSnapshot = serde_json::from_slice(&fs::read(path)?)?;
-        let plugins = snapshot
-            .plugins
-            .into_iter()
-            .map(|plugin| {
-                let root = self.dir.join("plugins").join(plugin.directory);
-                let entrypoint = root.join(plugin.entrypoint);
-                if !entrypoint.is_file() {
-                    anyhow::bail!("session plugin snapshot is incomplete: {}", plugin.name);
-                }
-                Ok(PluginSource {
-                    name: plugin.name,
-                    root,
-                    entrypoint,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let plugins = snapshot_sources(&self.dir, snapshot.plugins)?;
+        let skill_plugins = if snapshot.skill_plugins.is_empty() {
+            plugins.clone()
+        } else {
+            snapshot_sources(&self.dir, snapshot.skill_plugins)?
+        };
         Ok(Some(ComposedSources {
             config: self.dir.join("config.scm"),
             plugins,
+            skill_plugins,
         }))
     }
 
@@ -136,6 +140,7 @@ fn snapshot_composition(
     root: &Path,
     config: &Path,
     plugins: &[PluginSource],
+    skill_plugins: &[PluginSource],
 ) -> Result<CompositionSnapshot> {
     let plugins_dir = root.join("plugins");
     if plugins_dir.exists() {
@@ -144,23 +149,28 @@ fn snapshot_composition(
     fs::copy(config, root.join("config.scm"))?;
     let mut snapshot = CompositionSnapshot {
         plugins: Vec::new(),
+        skill_plugins: Vec::new(),
     };
+    let mut packages = std::collections::BTreeMap::new();
     for plugin in plugins {
+        packages.insert(plugin.name.as_str(), plugin);
+    }
+    for plugin in skill_plugins {
+        packages.insert(plugin.name.as_str(), plugin);
+    }
+    for plugin in packages.into_values() {
         let directory = plugin.name.clone();
-        let entrypoint = plugin
-            .entrypoint
-            .strip_prefix(&plugin.root)
-            .context("plugin entrypoint is outside its package")?;
         copy_package_tree(
             &plugin.root,
             &plugins_dir.join(&directory),
             SymlinkPolicy::Reject,
         )?;
-        snapshot.plugins.push(SnapshotPlugin {
-            name: plugin.name.clone(),
-            directory,
-            entrypoint: entrypoint.to_string_lossy().into(),
-        });
+    }
+    for plugin in plugins {
+        snapshot.plugins.push(snapshot_plugin(plugin)?);
+    }
+    for plugin in skill_plugins {
+        snapshot.skill_plugins.push(snapshot_plugin(plugin)?);
     }
     crate::write_json_atomic(
         &root.join("composition.json"),
@@ -168,6 +178,36 @@ fn snapshot_composition(
         AtomicWriteMode::Overwrite,
     )?;
     Ok(snapshot)
+}
+
+fn snapshot_plugin(plugin: &PluginSource) -> Result<SnapshotPlugin> {
+    let entrypoint = plugin
+        .entrypoint
+        .strip_prefix(&plugin.root)
+        .context("plugin entrypoint is outside its package")?;
+    Ok(SnapshotPlugin {
+        name: plugin.name.clone(),
+        directory: plugin.name.clone(),
+        entrypoint: entrypoint.to_string_lossy().into(),
+    })
+}
+
+fn snapshot_sources(root: &Path, plugins: Vec<SnapshotPlugin>) -> Result<Vec<PluginSource>> {
+    plugins
+        .into_iter()
+        .map(|plugin| {
+            let package = root.join("plugins").join(plugin.directory);
+            let entrypoint = package.join(plugin.entrypoint);
+            if !entrypoint.is_file() {
+                anyhow::bail!("session plugin snapshot is incomplete: {}", plugin.name);
+            }
+            Ok(PluginSource {
+                name: plugin.name,
+                root: package,
+                entrypoint,
+            })
+        })
+        .collect()
 }
 
 pub fn append(path: &Path, value: &impl Serialize) -> Result<()> {
@@ -190,7 +230,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join("config.scm"), "config").unwrap();
         let session =
-            Session::create_composed(root.path(), &root.path().join("config.scm"), &[]).unwrap();
+            Session::create_composed(root.path(), &root.path().join("config.scm"), &[], &[])
+                .unwrap();
         session.save_state("{\"input\":[]}").unwrap();
         let resumed = Session::open(root.path(), session.id()).unwrap();
         assert_eq!(resumed.load_state().unwrap(), "{\"input\":[]}");
@@ -205,16 +246,17 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let plugin = root.path().join("plugin");
         fs::create_dir(&plugin).unwrap();
-        fs::write(plugin.join("main.scm"), "plugin").unwrap();
+        fs::write(plugin.join("plugin.scm"), "plugin").unwrap();
         fs::write(root.path().join("config.scm"), "config").unwrap();
         let plugins = [PluginSource {
             name: "example".into(),
             root: plugin.clone(),
-            entrypoint: plugin.join("main.scm"),
+            entrypoint: plugin.join("plugin.scm"),
         }];
         let created = Session::create_composed(
             &root.path().join("sessions"),
             &root.path().join("config.scm"),
+            &plugins,
             &plugins,
         )
         .unwrap();
@@ -222,10 +264,11 @@ mod tests {
             &root.path().join("sessions"),
             &root.path().join("config.scm"),
             &[],
+            &[],
         )
         .unwrap();
         replaced
-            .replace_composition(&root.path().join("config.scm"), &plugins)
+            .replace_composition(&root.path().join("config.scm"), &plugins, &plugins)
             .unwrap();
 
         let created_sources = created.composed_sources().unwrap().unwrap();
@@ -276,6 +319,7 @@ mod tests {
             &root.path().join("created"),
             &root.path().join("config.scm"),
             &plugins,
+            &plugins,
         )
         .err()
         .unwrap();
@@ -289,10 +333,11 @@ mod tests {
             &root.path().join("replaced"),
             &root.path().join("config.scm"),
             &[],
+            &[],
         )
         .unwrap();
         let replacement_error = replaced
-            .replace_composition(&root.path().join("config.scm"), &plugins)
+            .replace_composition(&root.path().join("config.scm"), &plugins, &plugins)
             .unwrap_err();
         assert!(
             replacement_error

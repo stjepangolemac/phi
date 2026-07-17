@@ -1,6 +1,6 @@
 # Extensions
 
-Plugins are Git-backed directories with `plugin.json` and a Steel entrypoint. Package-level plugin types do not exist; entrypoints register behavior through explicit extension points.
+Plugins are Git-backed directory packages named explicitly at installation. Every package has the fixed `plugin.scm` entrypoint and may contain arbitrary package-relative support files. Package-level plugin types and configurable entrypoints do not exist; entrypoints register behavior through explicit extension points.
 
 `~/.phi/config.scm` is the composition root. It loads plugins, configures tools, and selects implementations.
 
@@ -14,7 +14,7 @@ Add model registrations and all provider or tool configuration to this compositi
 - File editors define the model-facing edit format and matching policy; Rust verifies revisions and writes files.
 - Hosted and callable tools declare compatible provider/model routes.
 - Slash commands register local user operations.
-- Skills expose their name, description, and precedence-resolved `skill://NAME/SKILL.md` resource first. Read that file and its relative Markdown resources progressively with `read_file`; resource reads stay contained within the selected skill root. Plugins register a package-relative skill directory with `(register-skill! (hash 'path "skills/NAME"))`.
+- Skills expose their name, description, and precedence-resolved `skill://NAME/SKILL.md` resource first. Read that file and its relative Markdown resources progressively with `read_file`; resource reads stay contained within the selected skill root. Every installed plugin may provide conventional `skills/NAME/SKILL.md` resources without Scheme registration or activation.
 
 The official `context-management` plugin provides `context_mark`, `context_inspect`, and `context_compact`. They are generic focus-management tools, not planning-specific APIs. Item IDs and safe boundaries are runtime assigned; models select only IDs returned by `context_inspect`, never message offsets or arbitrary event ranges.
 
@@ -33,12 +33,12 @@ Prefer Steel for configurable behavior. Add Rust only for trusted effects, conta
 
 The bundled `codex-patch` editor accepts locator text on an `@@` line or as a context-only hunk before a later changing hunk. Repeated plain update sections for one file run sequentially as one atomic edit. Each update must contain at least one syntactic change and must change file content or destination. Matching errors identify the file and hunk.
 
-Plugin-specific operational instructions belong in plugin-registered skills. For example, read the `dynamic-workflows` skill before creating or troubleshooting workflows.
+Plugin-specific operational instructions belong in conventional plugin skills. For example, read the `dynamic-workflows` skill before creating or troubleshooting workflows.
 
 ## Plugin workflow
 
 ```sh
-phi plugin install URL --rev TAG_OR_COMMIT --path OPTIONAL_PATH
+phi plugin install NAME URL --rev TAG_OR_COMMIT --path OPTIONAL_PATH
 phi plugin check NAME
 phi plugin list
 phi update-plugins
@@ -46,4 +46,4 @@ phi update-plugins
 
 Installation does not activate a plugin. Add `(load-plugin! "NAME")` to `~/.phi/config.scm`, then call `reload_config`. The old composition remains active if validation fails.
 
-Official plugins are listed with versions and source paths in `official-plugins.json`. Fresh homes use the embedded snapshot without adding lock entries. `/update-plugins` and `phi update-plugins` resolve the latest official `main` revision and refresh all installed plugins from their recorded moving revisions.
+Official plugin identities and package source paths are listed in `official-plugins.json`. Fresh homes use the embedded snapshot without adding lock entries. `/update-plugins` and `phi update-plugins` resolve the latest official `main` revision and refresh all installed plugins from their recorded moving revisions. New or reloaded sessions see updated conventional skills; existing sessions read their pinned copies.

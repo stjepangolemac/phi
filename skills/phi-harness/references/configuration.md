@@ -24,8 +24,8 @@ Do not edit installed or official plugin files to reconfigure Phi. All provider,
 - `.phi/sessions/`: session state and exact composition snapshots.
 - `.phi/PLAN.md`: persistent, human-readable state for nontrivial work. The bundled `planning` skill keeps it out of Git through the repository-local `.git/info/exclude` and retains it after the work is complete.
 
-Loaded plugins may register package-relative skills. Skill precedence is protected system skills, workspace skills, personal skills, then plugin skills.
+Every installed plugin may expose `skills/NAME/SKILL.md` without being loaded. Skill precedence is protected system skills, workspace skills, personal skills, then plugin skills. Duplicate names from different installed plugins are configuration errors.
 
 ## Reload behavior
 
-New conversations load the current `config.scm`. Existing conversations keep their snapshot until `/reload` or `reload_config` validates and adopts the live configuration. Failed validation leaves the previous composition active.
+New conversations load the current `config.scm` and snapshot installed plugin skills. Existing conversations keep their snapshot until `/reload` or `reload_config` validates and adopts the live configuration and skill set. Failed validation leaves the previous composition active.

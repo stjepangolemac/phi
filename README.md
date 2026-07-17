@@ -26,7 +26,7 @@ phi --yolo # run without approvals or filesystem boundaries
 phi resume SESSION_ID "Continue"
 ```
 
-Sessions and their exact configuration/plugin sources are stored under `.phi/sessions/` in the working directory.
+Sessions and their exact configuration, loaded plugin sources, and installed plugin skill resources are stored under `.phi/sessions/` in the working directory.
 
 The shell tools run arbitrary commands through the user's shell, including pipelines and compound commands. Long-running commands yield a background session that survives model turns; the model can list sessions, poll them, or continue through stdin. Use `/ps` to inspect background processes and `/stop` to stop them. Use `/compact` to run the selected compactor immediately instead of waiting for the configured token threshold. PTYs are available for interactive programs. Tool approval is still required unless `--allow-shell` or `--yolo` is used. `--yolo` also lets file reads and edits target paths outside the workspace. OS sandboxing is intentionally not implemented yet.
 
@@ -131,7 +131,7 @@ Copy standard `SKILL.md` directories into `~/.phi/skills/` for personal use or `
   references/
 ```
 
-Loaded plugins can register package-relative skill directories with `(register-skill! (hash 'path "skills/NAME"))`. Plugin skills have the lowest precedence, followed by personal and workspace skills; protected Phi system skills have the highest precedence. Phi initially exposes each resolved skill's name, description, and stable `skill://NAME/SKILL.md` resource. The normal `read_file` tool reads that file and referenced resources such as `skill://NAME/references/details.md`; every such read is contained within the precedence-selected skill root without exposing Phi's installation or plugin-cache layout. Use `/skills` to list discovered skills or mention `$skill-name` to request one explicitly.
+Every installed plugin may provide skills conventionally under `skills/NAME/SKILL.md`; no Scheme registration or plugin activation is required. Plugin skills have the lowest precedence, followed by personal and workspace skills; protected Phi system skills have the highest precedence. Duplicate skill names from two installed plugins are rejected with both plugin names rather than selected by incidental order. Phi initially exposes each resolved skill's name, description, and stable `skill://NAME/SKILL.md` resource. The normal `read_file` tool reads that file and referenced resources such as `skill://NAME/references/details.md`; every such read is contained within the precedence-selected skill root without exposing Phi's installation or plugin-cache layout. Sessions snapshot installed plugin skill packages, so updates and removals affect new or reloaded sessions while an existing session remains internally consistent. Use `/skills` to list discovered skills or mention `$skill-name` to request one explicitly.
 
 Phi also bundles an authoritative `phi-harness` skill describing its architecture, configuration, extension points, and operations. The agent reads it before inspecting or reconfiguring the harness. Use `phi status` for the human-readable active composition or `phi --json status` for machine-readable output.
 
@@ -191,20 +191,21 @@ Phi emits `agent.event` notifications followed by a result containing `value` an
 
 ## Plugins
 
-A plugin is a Git-backed directory containing `plugin.json` and a Steel entrypoint:
+A plugin is a Git-backed convention-based directory package:
 
-```json
-{
-  "name": "example",
-  "version": "0.1.0",
-  "entrypoint": "main.scm"
-}
+```text
+plugins/example/
+  plugin.scm
+  skills/
+    example/
+      SKILL.md
+  support/            # arbitrary package-relative files are allowed
 ```
 
-Install from a tag or commit, optionally selecting a plugin within a larger repository:
+`plugin.scm` is the mandatory fixed entrypoint. Install from a tag or commit with an explicit lowercase installation name, optionally selecting a package within a larger repository:
 
 ```sh
-phi plugin install https://github.com/example/phi-plugins --rev v0.1.0 --path plugins/example
+phi plugin install example https://github.com/example/phi-plugins --rev v0.1.0 --path plugins/example
 phi plugin list
 phi plugin check example
 phi plugin update example --rev NEW_TAG_OR_COMMIT
@@ -213,11 +214,11 @@ phi plugin remove example
 phi update-plugins
 ```
 
-Installation records the resolved commit but does not activate the plugin. Add `(load-plugin! "example")` to `~/.phi/config.scm` and compose its registered behavior there.
+Installation records the lock-owned name, URL, requested revision, resolved commit, and source path but does not activate the plugin. Add `(load-plugin! "example")` to `~/.phi/config.scm` and compose its registered behavior there. Conventional skills are available even while the plugin is unloaded.
 
-Plugins have no package-level type. Their entrypoints may register providers and models, tools, skills, prompt builders, compactors, file editors, or slash commands. Registered skill paths are contained within the plugin package. The registration functions enforce the contract of each extension point.
+Plugins have no package-level type and are never grouped by provider, tool, prompt, or compactor type. Their entrypoints may register providers and models, tools, prompt builders, compactors, file editors, or slash commands. Package trees and conventional skill resources reject escaping paths and symlinks.
 
-Fresh Phi homes have an empty `plugins.lock.json`; the official plugins listed with versions in `official-plugins.json` are available from the embedded build snapshot. On startup Phi compares that snapshot and installed Git plugins with their configured sources. When updates are available the TUI suggests `/update-plugins`. Both `/update-plugins` and `phi update-plugins` resolve the official `latest` channel from the public repository's `main` branch, install exact commits, and retain those commits in the lock file. Existing sessions keep their snapshotted plugin sources until `/reload` or a new conversation.
+Fresh Phi homes have an empty `plugins.lock.json`; the official package identities and source paths in `official-plugins.json` are available from the embedded build snapshot. On startup Phi compares that snapshot and installed Git plugins with their configured sources. When updates are available the TUI suggests `/update-plugins`. Both `/update-plugins` and `phi update-plugins` resolve the official `latest` channel from the public repository's `main` branch, install exact directory packages, and retain those commits in the lock file. Existing sessions keep their snapshotted plugin code and skills until `/reload` or a new conversation.
 
 ## Optional features
 
@@ -244,7 +245,7 @@ crates/phi-protocol  provider-neutral events and effects
 crates/phi-runtime   frontend-neutral agent loop
 crates/phi-steel     Scheme composition and policy VM
 crates/phi-tui       Ratatui frontend library
-policy/              bundled Scheme sources
+plugins/             bundled convention-based plugin packages
 ```
 
 Validate changes with:
