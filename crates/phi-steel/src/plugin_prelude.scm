@@ -294,6 +294,39 @@
   (if (null? ids) (error! "context_compact requires at least one item"))
   (context-selected-items (context-find-start items (car ids)) ids '()))
 
+(define (context-id-member? id ids)
+  (cond
+    [(null? ids) #f]
+    [(equal? id (car ids)) #t]
+    [else (context-id-member? id (cdr ids))]))
+
+(define (context-reserved-id ids reservations)
+  (cond
+    [(null? ids) #f]
+    [(context-id-member? (car ids) reservations) (car ids)]
+    [else (context-reserved-id (cdr ids) reservations)]))
+
+(define (context-validated-selection items ids reservations)
+  (with-handler
+    (lambda (error) (hash 'error (to-string error)))
+    (let ([reserved (context-reserved-id ids reservations)])
+      (if reserved
+          (hash 'error (string-append "context item is already reserved: " reserved))
+          (hash 'selected (context-selection items ids))))))
+
+(define (context-leading-ordinary-calls calls)
+  (cond
+    [(null? calls) '()]
+    [(context-tool-name? (hash-ref (car calls) 'name)) '()]
+    [else
+     (cons (car calls) (context-leading-ordinary-calls (cdr calls)))]))
+
+(define (context-after-leading-ordinary-calls calls)
+  (cond
+    [(null? calls) '()]
+    [(context-tool-name? (hash-ref (car calls) 'name)) calls]
+    [else (context-after-leading-ordinary-calls (cdr calls))]))
+
 (define (context-sum-from-tokens items)
   (if (null? items)
       0

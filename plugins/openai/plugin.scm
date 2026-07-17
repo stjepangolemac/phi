@@ -47,9 +47,7 @@
           'tools (map responses-tool (hash-ref prompt 'tools))
           'prompt_cache_key (runtime-session-id)
           'tool_choice "auto"
-          ;; Context tools mutate policy state and must be dispatched alone.
-          'parallel_tool_calls
-          (not (context-tools-available? (hash-ref prompt 'tools)))
+          'parallel_tool_calls #t
           'reasoning (hash 'effort reasoning 'summary "concise"
                            'context "all_turns")
           'service_tier service-tier

@@ -417,18 +417,27 @@ mod tests {
     }
 
     fn response_call(name: &str, call_id: &str, arguments: serde_json::Value) -> Event {
+        response_calls(vec![(name, call_id, arguments)])
+    }
+
+    fn response_calls(calls: Vec<(&str, &str, serde_json::Value)>) -> Event {
         Event::HttpCompleted {
             success: true,
             status: 200,
-            events: vec![serde_json::json!({
-                "type": "response.output_item.done",
-                "item": {
-                    "type": "function_call",
-                    "call_id": call_id,
-                    "name": name,
-                    "arguments": arguments.to_string()
-                }
-            })],
+            events: calls
+                .into_iter()
+                .map(|(name, call_id, arguments)| {
+                    serde_json::json!({
+                        "type": "response.output_item.done",
+                        "item": {
+                            "type": "function_call",
+                            "call_id": call_id,
+                            "name": name,
+                            "arguments": arguments.to_string()
+                        }
+                    })
+                })
+                .collect(),
             error: String::new(),
         }
     }
@@ -454,6 +463,46 @@ mod tests {
 
     fn state_json(policy: &Policy) -> serde_json::Value {
         serde_json::from_str(policy.state()).unwrap()
+    }
+
+    fn create_closed_context_spans(policy: &mut Policy, count: usize) {
+        policy
+            .on_event(&Event::UserMessage {
+                content: "span 1 work".into(),
+            })
+            .unwrap();
+        for index in 1..=count {
+            policy
+                .on_event(&response_call(
+                    "context_mark",
+                    &format!("setup-mark-{index}"),
+                    serde_json::json!({ "label": format!("span {}", index + 1) }),
+                ))
+                .unwrap();
+            if index < count {
+                policy
+                    .on_event(&response_text(&format!("span {} work", index + 1)))
+                    .unwrap();
+                policy
+                    .on_event(&Event::UserMessage {
+                        content: format!("continue span {}", index + 1),
+                    })
+                    .unwrap();
+            }
+        }
+    }
+
+    fn context_results(state: &serde_json::Value, call_ids: &[&str]) -> Vec<serde_json::Value> {
+        state["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| {
+                message["kind"] == "tool_result"
+                    && call_ids.contains(&message["call_id"].as_str().unwrap_or_default())
+            })
+            .map(|message| serde_json::from_str(message["content"].as_str().unwrap()).unwrap())
+            .collect()
     }
 
     const CONTEXT_NOTICE: &str = "Internal context-management notice";
@@ -782,7 +831,7 @@ mod tests {
             matches!(&output.effects[0], Effect::HttpRequest { body, .. }
             if ["context_mark", "context_inspect", "context_compact"].iter().all(|name|
                 body["tools"].as_array().unwrap().iter().any(|tool| tool["name"] == *name))
-                && body["parallel_tool_calls"] == false
+                && body["parallel_tool_calls"] == true
                 && body["instructions"].as_str().unwrap().contains(
                     "Use context_mark proactively after completing a substantial phase")
                 && body["tools"].as_array().unwrap().iter().any(|tool|
@@ -852,7 +901,7 @@ mod tests {
             .unwrap();
         assert!(
             matches!(&output.effects[0], Effect::HttpRequest { body, .. }
-            if body["parallel_tool_calls"] == false)
+            if body["parallel_tool_calls"] == true)
         );
         let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
         let inspect_results = state["messages"]
@@ -1185,16 +1234,18 @@ mod tests {
             ))
             .unwrap();
 
-        let nonadjacent = marked_policy
+        marked_policy
             .on_event(&response_call(
                 "context_compact",
                 "compact-bad",
                 serde_json::json!({ "items": ["S1", "S3"], "label": "bad" }),
             ))
-            .unwrap_err();
+            .unwrap();
+        let nonadjacent = context_results(&state_json(&marked_policy), &["compact-bad"]);
         assert!(
-            nonadjacent
-                .to_string()
+            nonadjacent[0]["error"]
+                .as_str()
+                .unwrap()
                 .contains("ordered and adjacent in the active context")
         );
 
@@ -1204,15 +1255,21 @@ mod tests {
                 content: "open".into(),
             })
             .unwrap();
-        let open = open_policy
+        open_policy
             .on_event(&response_call(
                 "context_compact",
                 "compact-open",
                 serde_json::json!({ "items": ["S1"], "label": "bad" }),
             ))
-            .unwrap_err();
-        assert!(open.to_string().contains("context item is still open: S1"));
-        assert!(open.to_string().contains("context_mark"));
+            .unwrap();
+        let open = context_results(&state_json(&open_policy), &["compact-open"]);
+        assert!(
+            open[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("context item is still open: S1")
+        );
+        assert!(open[0]["error"].as_str().unwrap().contains("context_mark"));
     }
 
     #[test]
@@ -1435,6 +1492,438 @@ mod tests {
                     .unwrap()
                     .contains("no summary after 4 repair attempts")
         }));
+    }
+
+    #[test]
+    fn multiple_disjoint_context_compactions_remain_independent_across_replay() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut policy = policy(&root);
+        create_closed_context_spans(&mut policy, 4);
+
+        let output = policy
+            .on_event(&response_calls(vec![
+                (
+                    "context_compact",
+                    "compact-a",
+                    serde_json::json!({ "items": ["S1"], "label": "first" }),
+                ),
+                (
+                    "context_compact",
+                    "compact-b",
+                    serde_json::json!({ "items": ["S2"], "label": "second" }),
+                ),
+                (
+                    "context_compact",
+                    "compact-c",
+                    serde_json::json!({ "items": ["S4"], "label": "fourth" }),
+                ),
+            ]))
+            .unwrap();
+        assert!(matches!(&output.effects[0], Effect::HttpRequest { .. }));
+        let saved = policy.state().to_owned();
+        let saved_state: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        assert_eq!(saved_state["pending_context"]["call_id"], "compact-a");
+        assert_eq!(
+            saved_state["pending_context_calls"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            saved_state["context_reservations"],
+            serde_json::json!(["S1"])
+        );
+
+        let mut replayed = Policy::load_with_state(
+            &root.join("config.scm"),
+            &plugins(&root),
+            r#"{"model":"openai/gpt-5.6-luna","reasoning":"low","service_tier":"default"}"#,
+            Some(saved),
+        )
+        .unwrap();
+        for summary in ["summary a", "summary b"] {
+            let output = replayed.on_event(&response_text(summary)).unwrap();
+            assert!(matches!(&output.effects[0], Effect::HttpRequest { .. }));
+        }
+        let output = replayed.on_event(&response_text("summary c")).unwrap();
+        assert!(
+            matches!(&output.effects[0], Effect::HttpRequest { body, .. }
+            if body["tools"].is_array())
+        );
+
+        let state = state_json(&replayed);
+        assert_eq!(
+            state["context_items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["C1", "C2", "S3", "C3", "S5"]
+        );
+        assert_eq!(
+            state["context_reservations"],
+            serde_json::json!(["S1", "S2", "S4"])
+        );
+        assert_eq!(
+            state["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| {
+                    message["kind"] == "tool_call"
+                        && matches!(
+                            message["call_id"].as_str(),
+                            Some("compact-a" | "compact-b" | "compact-c")
+                        )
+                })
+                .map(|message| message["call_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["compact-a", "compact-b", "compact-c"]
+        );
+        let results = context_results(&state, &["compact-a", "compact-b", "compact-c"]);
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|result| result["created"].is_object()));
+    }
+
+    #[test]
+    fn invalid_and_overlapping_context_calls_do_not_suppress_valid_siblings() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut policy = policy(&root);
+        create_closed_context_spans(&mut policy, 3);
+
+        policy
+            .on_event(&response_calls(vec![
+                (
+                    "context_compact",
+                    "empty",
+                    serde_json::json!({ "items": [], "label": "empty" }),
+                ),
+                (
+                    "context_compact",
+                    "reversed",
+                    serde_json::json!({ "items": ["S2", "S1"], "label": "bad" }),
+                ),
+                (
+                    "context_compact",
+                    "nonadjacent",
+                    serde_json::json!({ "items": ["S1", "S3"], "label": "bad" }),
+                ),
+                (
+                    "context_compact",
+                    "valid-a",
+                    serde_json::json!({ "items": ["S1"], "label": "first" }),
+                ),
+                (
+                    "context_compact",
+                    "overlap",
+                    serde_json::json!({ "items": ["S1"], "label": "overlap" }),
+                ),
+                (
+                    "context_compact",
+                    "unknown",
+                    serde_json::json!({ "items": ["missing"], "label": "unknown" }),
+                ),
+                (
+                    "context_compact",
+                    "valid-b",
+                    serde_json::json!({ "items": ["S3"], "label": "third" }),
+                ),
+                (
+                    "context_compact",
+                    "open",
+                    serde_json::json!({ "items": ["S4"], "label": "open" }),
+                ),
+            ]))
+            .unwrap();
+        policy.on_event(&response_text("summary first")).unwrap();
+        policy.on_event(&response_text("summary third")).unwrap();
+
+        let state = state_json(&policy);
+        let call_ids = [
+            "empty",
+            "reversed",
+            "nonadjacent",
+            "valid-a",
+            "overlap",
+            "unknown",
+            "valid-b",
+            "open",
+        ];
+        let results = context_results(&state, &call_ids);
+        assert_eq!(results.len(), call_ids.len());
+        assert!(
+            results[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("at least one item")
+        );
+        assert!(
+            results[1]["error"]
+                .as_str()
+                .unwrap()
+                .contains("ordered and adjacent")
+        );
+        assert!(
+            results[2]["error"]
+                .as_str()
+                .unwrap()
+                .contains("ordered and adjacent")
+        );
+        assert!(results[3]["created"].is_object());
+        assert!(
+            results[4]["error"]
+                .as_str()
+                .unwrap()
+                .contains("already reserved")
+        );
+        assert!(
+            results[5]["error"]
+                .as_str()
+                .unwrap()
+                .contains("unknown context item")
+        );
+        assert!(results[6]["created"].is_object());
+        assert!(results[7]["error"].as_str().unwrap().contains("still open"));
+        assert_eq!(
+            state["context_items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["C1", "S2", "C2", "S4"]
+        );
+    }
+
+    #[test]
+    fn mixed_context_calls_observe_model_returned_order() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut policy = policy(&root);
+        policy
+            .on_event(&Event::UserMessage {
+                content: "ordered context work".into(),
+            })
+            .unwrap();
+        let output = policy
+            .on_event(&response_calls(vec![
+                ("context_inspect", "inspect-a", serde_json::json!({})),
+                (
+                    "context_mark",
+                    "mark-a",
+                    serde_json::json!({ "label": "middle" }),
+                ),
+                ("context_inspect", "inspect-b", serde_json::json!({})),
+                (
+                    "context_mark",
+                    "mark-b",
+                    serde_json::json!({ "label": "last" }),
+                ),
+            ]))
+            .unwrap();
+        assert!(matches!(&output.effects[0], Effect::HttpRequest { .. }));
+        let state = state_json(&policy);
+        let results = context_results(&state, &["inspect-a", "mark-a", "inspect-b", "mark-b"]);
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0]["items"].as_array().unwrap().len(), 1);
+        assert_eq!(results[1]["closed"], "S1");
+        assert_eq!(results[2]["items"].as_array().unwrap().len(), 2);
+        assert_eq!(results[3]["closed"], "S2");
+        assert_eq!(state["context_items"].as_array().unwrap().len(), 3);
+        assert_eq!(state["context_items"][2]["label"], "last");
+    }
+
+    #[test]
+    fn mark_and_compact_order_has_deterministic_state_semantics() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+
+        let mut mark_first = policy(&root);
+        create_closed_context_spans(&mut mark_first, 2);
+        mark_first
+            .on_event(&response_calls(vec![
+                (
+                    "context_mark",
+                    "mark-first",
+                    serde_json::json!({ "label": "after mark" }),
+                ),
+                (
+                    "context_compact",
+                    "compact-second",
+                    serde_json::json!({ "items": ["S1"], "label": "first span" }),
+                ),
+            ]))
+            .unwrap();
+        mark_first
+            .on_event(&response_text("mark-first summary"))
+            .unwrap();
+        let mark_first_state = state_json(&mark_first);
+        assert_eq!(
+            mark_first_state["context_items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| (
+                    item["id"].as_str().unwrap(),
+                    item["closed"].as_bool().unwrap()
+                ))
+                .collect::<Vec<_>>(),
+            vec![("C1", true), ("S2", true), ("S3", true), ("S4", false)]
+        );
+        assert_eq!(
+            mark_first_state["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| {
+                    message["kind"] == "tool_result"
+                        && matches!(
+                            message["call_id"].as_str(),
+                            Some("mark-first" | "compact-second")
+                        )
+                })
+                .map(|message| message["call_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["mark-first", "compact-second"]
+        );
+
+        let mut compact_first = policy(&root);
+        create_closed_context_spans(&mut compact_first, 2);
+        compact_first
+            .on_event(&response_calls(vec![
+                (
+                    "context_compact",
+                    "compact-first",
+                    serde_json::json!({ "items": ["S1"], "label": "first span" }),
+                ),
+                (
+                    "context_mark",
+                    "mark-second",
+                    serde_json::json!({ "label": "after compact" }),
+                ),
+            ]))
+            .unwrap();
+        compact_first
+            .on_event(&response_text("compact-first summary"))
+            .unwrap();
+        let compact_first_state = state_json(&compact_first);
+        assert_eq!(
+            compact_first_state["context_items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| (
+                    item["id"].as_str().unwrap(),
+                    item["closed"].as_bool().unwrap()
+                ))
+                .collect::<Vec<_>>(),
+            vec![("C1", true), ("S2", true), ("S3", true), ("S4", false)]
+        );
+        assert_eq!(
+            compact_first_state["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| {
+                    message["kind"] == "tool_result"
+                        && matches!(
+                            message["call_id"].as_str(),
+                            Some("compact-first" | "mark-second")
+                        )
+                })
+                .map(|message| message["call_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["compact-first", "mark-second"]
+        );
+    }
+
+    #[test]
+    fn ordinary_tools_do_not_cross_context_state_barriers() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut policy = policy(&root);
+        policy
+            .on_event(&Event::UserMessage {
+                content: "mixed tools".into(),
+            })
+            .unwrap();
+        let output = policy
+            .on_event(&response_calls(vec![
+                (
+                    "context_mark",
+                    "mark-before",
+                    serde_json::json!({ "label": "after first mark" }),
+                ),
+                (
+                    "read_file",
+                    "ordinary",
+                    serde_json::json!({ "path": "config.scm" }),
+                ),
+                ("context_inspect", "inspect-after", serde_json::json!({})),
+                (
+                    "context_mark",
+                    "mark-after",
+                    serde_json::json!({ "label": "after ordinary" }),
+                ),
+            ]))
+            .unwrap();
+        let Effect::RunTools { calls } = &output.effects[0] else {
+            panic!("expected ordinary tool barrier");
+        };
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].call_id, "ordinary");
+
+        let output = policy
+            .on_event(&Event::ToolsCompleted {
+                results: vec![phi_protocol::ToolResult {
+                    call_id: "ordinary".into(),
+                    name: "read_file".into(),
+                    result: serde_json::json!({ "content": "config" }),
+                }],
+            })
+            .unwrap();
+        assert!(matches!(&output.effects[0], Effect::HttpRequest { .. }));
+        let state = state_json(&policy);
+        assert_eq!(
+            state["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| {
+                    message["kind"] == "tool_result"
+                        && matches!(
+                            message["call_id"].as_str(),
+                            Some("mark-before" | "ordinary" | "inspect-after" | "mark-after")
+                        )
+                })
+                .map(|message| message["call_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["mark-before", "ordinary", "inspect-after", "mark-after"]
+        );
+        assert_eq!(state["context_items"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn openrouter_enables_multiple_tool_calls_with_context_tools() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut policy = policy(&root);
+        policy
+            .on_event(&Event::ModelSelected {
+                model: "openrouter/anthropic/claude-sonnet-4.6".into(),
+                reasoning: "high".into(),
+                service_tier: "".into(),
+            })
+            .unwrap();
+        let output = policy
+            .on_event(&Event::UserMessage {
+                content: "use tools".into(),
+            })
+            .unwrap();
+        assert!(
+            matches!(&output.effects[0], Effect::HttpRequest { body, .. }
+            if body["parallel_tool_calls"] == true
+                && body["tools"].as_array().unwrap().iter().any(|tool|
+                    tool["name"] == "context_compact"))
+        );
     }
 
     #[test]

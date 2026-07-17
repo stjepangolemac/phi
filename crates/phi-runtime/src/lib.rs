@@ -1327,7 +1327,9 @@ async fn run(
             )?;
         }
         session.append(&event)?;
+        let previous_policy_state = policy.state().to_owned();
         let output = policy.on_event(&event)?;
+        emit_context_tool_events(events, &previous_policy_state, policy.state())?;
         session.append(&output)?;
         session.save_state(policy.state())?;
         send_context(events, policy.state())?;
@@ -1479,6 +1481,103 @@ async fn run(
             }
         }
     }
+}
+
+fn emit_context_tool_events(
+    events: &mpsc::UnboundedSender<RuntimeEvent>,
+    previous_state: &str,
+    next_state: &str,
+) -> Result<()> {
+    let previous: serde_json::Value = serde_json::from_str(previous_state)?;
+    let next: serde_json::Value = serde_json::from_str(next_state)?;
+    let previous_messages = previous["messages"]
+        .as_array()
+        .context("missing messages")?;
+    let next_messages = next["messages"].as_array().context("missing messages")?;
+    let previous_context_events = previous_messages
+        .iter()
+        .filter_map(|message| context_tool_message_key(message, previous_messages))
+        .collect::<HashSet<_>>();
+    for message in next_messages {
+        let Some(key) = context_tool_message_key(message, next_messages) else {
+            continue;
+        };
+        if previous_context_events.contains(&key) {
+            continue;
+        }
+        let call_id = message["call_id"].as_str().unwrap_or_default().to_owned();
+        match message["kind"].as_str() {
+            Some("tool_call") => {
+                let name = message["name"].as_str().unwrap_or_default().to_owned();
+                let arguments = message["arguments"]
+                    .as_str()
+                    .and_then(|arguments| serde_json::from_str(arguments).ok())
+                    .unwrap_or_else(|| message["arguments"].clone());
+                send(
+                    events,
+                    RuntimeEvent::ToolStarted {
+                        call_id,
+                        name,
+                        arguments,
+                    },
+                )?;
+            }
+            Some("tool_result") => {
+                let name = context_tool_name_for_call(next_messages, &call_id)
+                    .unwrap_or_default()
+                    .to_owned();
+                let result = message["content"]
+                    .as_str()
+                    .and_then(|content| serde_json::from_str(content).ok())
+                    .unwrap_or_else(|| message["content"].clone());
+                send(
+                    events,
+                    RuntimeEvent::ToolCompleted {
+                        call_id,
+                        name,
+                        result,
+                    },
+                )?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn context_tool_message_key(
+    message: &serde_json::Value,
+    messages: &[serde_json::Value],
+) -> Option<(String, String)> {
+    let kind = message["kind"].as_str()?;
+    if !matches!(kind, "tool_call" | "tool_result") {
+        return None;
+    }
+    let call_id = message["call_id"].as_str()?;
+    let name = if kind == "tool_call" {
+        message["name"].as_str()
+    } else {
+        context_tool_name_for_call(messages, call_id)
+    };
+    if !matches!(
+        name,
+        Some("context_mark" | "context_inspect" | "context_compact")
+    ) {
+        return None;
+    }
+    Some((kind.to_owned(), call_id.to_owned()))
+}
+
+fn context_tool_name_for_call<'a>(
+    messages: &'a [serde_json::Value],
+    call_id: &str,
+) -> Option<&'a str> {
+    messages
+        .iter()
+        .find(|candidate| {
+            candidate["kind"] == "tool_call" && candidate["call_id"].as_str() == Some(call_id)
+        })
+        .and_then(|call| call["name"].as_str())
 }
 
 struct PendingToolCall {
@@ -2211,6 +2310,71 @@ mod tests {
         time::Duration,
     };
 
+    #[test]
+    fn emits_independent_display_events_for_context_tool_messages() {
+        let previous = serde_json::json!({ "messages": [] }).to_string();
+        let next = serde_json::json!({
+            "messages": [
+                {
+                    "kind": "tool_call",
+                    "call_id": "inspect-a",
+                    "name": "context_inspect",
+                    "arguments": "{}"
+                },
+                {
+                    "kind": "tool_result",
+                    "call_id": "inspect-a",
+                    "content": "{\"items\":[]}"
+                },
+                {
+                    "kind": "tool_call",
+                    "call_id": "mark-b",
+                    "name": "context_mark",
+                    "arguments": "{\"label\":\"next\"}"
+                },
+                {
+                    "kind": "tool_result",
+                    "call_id": "mark-b",
+                    "content": "{\"opened\":\"S2\"}"
+                },
+                {
+                    "kind": "tool_call",
+                    "call_id": "ordinary",
+                    "name": "read_file",
+                    "arguments": "{\"path\":\"README.md\"}"
+                },
+                {
+                    "kind": "tool_result",
+                    "call_id": "ordinary",
+                    "content": "{\"content\":\"ignored\"}"
+                }
+            ]
+        })
+        .to_string();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        emit_context_tool_events(&event_tx, &previous, &next).unwrap();
+
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(events.len(), 4);
+        assert!(
+            matches!(&events[0], RuntimeEvent::ToolStarted { call_id, name, .. }
+            if call_id == "inspect-a" && name == "context_inspect")
+        );
+        assert!(
+            matches!(&events[1], RuntimeEvent::ToolCompleted { call_id, name, .. }
+            if call_id == "inspect-a" && name == "context_inspect")
+        );
+        assert!(
+            matches!(&events[2], RuntimeEvent::ToolStarted { call_id, name, .. }
+            if call_id == "mark-b" && name == "context_mark")
+        );
+        assert!(
+            matches!(&events[3], RuntimeEvent::ToolCompleted { call_id, name, .. }
+            if call_id == "mark-b" && name == "context_mark")
+        );
+    }
+
     struct ConcurrentTool {
         gate: Arc<(Mutex<usize>, Condvar)>,
     }
@@ -2909,7 +3073,7 @@ mod tests {
                     && body["reasoning"]["effort"] == "high"
                     && body["reasoning"]["summary"] == "concise"
                     && body["service_tier"] == "priority"
-                    && body["parallel_tool_calls"] == false
+                    && body["parallel_tool_calls"] == true
                     && body["prompt_cache_key"] == execution.session_id
                     && headers["session_id"] == execution.session_id
                     && body["tools"].as_array().unwrap().len() == 14

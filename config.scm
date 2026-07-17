@@ -5,6 +5,8 @@
 (define next-context-span 2)
 (define next-context-summary 1)
 (define pending-context (hash))
+(define pending-context-calls '())
+(define context-reservations '())
 (define context-pressure-thresholds (list 25 50 75))
 (define next-context-notification 25)
 
@@ -59,6 +61,10 @@
   (set! next-context-span (or (hash-try-get state 'next_context_span) 2))
   (set! next-context-summary (or (hash-try-get state 'next_context_summary) 1))
   (set! pending-context (or (hash-try-get state 'pending_context) (hash)))
+  (set! pending-context-calls
+        (or (hash-try-get state 'pending_context_calls) '()))
+  (set! context-reservations
+        (or (hash-try-get state 'context_reservations) '()))
   (set! next-context-notification
         (or (hash-try-get state 'next_context_notification) 25))
   (define compactions (hash-ref state 'compactions))
@@ -73,6 +79,99 @@
   (define compaction-attempt
     (or (hash-try-get state 'compaction_attempt) 0))
   (define next-state state)
+  (define (append-context-result! call result)
+    (set! messages
+          (append messages (list (context-tool-result call result)))))
+  (define (continue-context-calls)
+    (cond
+      [(null? pending-context-calls)
+       (set! next-state
+             (make-state messages compactions last-usage context-budget
+                         model reasoning service-tier "working" "" 0))
+       (request-effect messages last-usage model reasoning service-tier)]
+      [(context-tool-name? (hash-ref (car pending-context-calls) 'name))
+       (define call (car pending-context-calls))
+       (define name (hash-ref call 'name))
+       (set! pending-context-calls (cdr pending-context-calls))
+       (set! messages (append messages (list call)))
+       (set! active-context-items
+             (context-sync-items active-context-items messages))
+       (cond
+         [(equal? name "context_inspect")
+          (append-context-result!
+            call
+            (context-inspection active-context-items messages last-usage
+                                context-budget))
+          (continue-context-calls)]
+         [(equal? name "context_mark")
+          (define outcome
+            (with-handler
+              (lambda (error) (hash 'error (to-string error)))
+              (let* ([arguments (provider-arguments-for model call)]
+                     [label (hash-ref arguments 'label)]
+                     [closed (hash-ref (context-last-item active-context-items) 'id)]
+                     [opened (context-runtime-id "S" next-context-span)])
+                (hash 'label label
+                      'result (hash 'closed closed 'opened opened 'label label)))))
+          (define error (hash-try-get outcome 'error))
+          (if error
+              (append-context-result! call (hash 'error error))
+              (begin
+                (append-context-result! call (hash-ref outcome 'result))
+                (set! active-context-items
+                      (context-sync-items active-context-items messages))
+                (set! active-context-items
+                      (context-mark-items
+                        active-context-items
+                        (context-runtime-id "S" next-context-span)
+                        (hash-ref outcome 'label) (hash-ref call 'call_id)))
+                (set! next-context-span (+ next-context-span 1))))
+          (continue-context-calls)]
+         [else
+          (define outcome
+            (with-handler
+              (lambda (error) (hash 'error (to-string error)))
+              (let* ([arguments (provider-arguments-for model call)]
+                     [ids (hash-ref arguments 'items)]
+                     [validation
+                      (context-validated-selection
+                        active-context-items ids context-reservations)]
+                     [error (hash-try-get validation 'error)])
+                (if error
+                    (hash 'error error)
+                    (hash 'ids ids
+                          'label (hash-ref arguments 'label)
+                          'selected (hash-ref validation 'selected))))))
+          (define error (hash-try-get outcome 'error))
+          (if error
+              (begin
+                (append-context-result! call (hash 'error error))
+                (continue-context-calls))
+              (begin
+                (define ids (hash-ref outcome 'ids))
+                (set! context-reservations (append context-reservations ids))
+                (set! pending-context
+                      (hash 'call_id (hash-ref call 'call_id)
+                            'items ids
+                            'label (hash-ref outcome 'label)))
+                (set! next-state
+                      (make-state messages compactions last-usage context-budget
+                                  model reasoning service-tier
+                                  "selective_compacting" "" 0))
+                (start-context-summary
+                  (context-selected-messages (hash-ref outcome 'selected))
+                  model reasoning service-tier)))])]
+      [else
+       (define calls
+         (context-leading-ordinary-calls pending-context-calls))
+       (set! pending-context-calls
+             (context-after-leading-ordinary-calls pending-context-calls))
+       (set! messages (append messages calls))
+       (set! next-state
+             (make-state messages compactions last-usage context-budget
+                         model reasoning service-tier "working" "" 0))
+       (hash 'type "run_tools"
+             'calls (map (lambda (call) (tool-call-execution model call)) calls))]))
   (define effect
     (cond
       [(equal? event-type "user_message")
@@ -122,10 +221,7 @@
                               (list (hash 'kind "tool_result" 'call_id call-id
                                           'content (value->jsexpr-string result)))))
                 (set! pending-context (hash))
-                (set! next-state
-                      (make-state messages compactions last-usage context-budget
-                                  model reasoning service-tier "working" "" 0))
-                (request-effect messages last-usage model reasoning service-tier))
+                (continue-context-calls))
               (begin
                 (set! next-state
                       (make-state messages compactions last-usage context-budget
@@ -155,10 +251,7 @@
                                   (list (hash 'kind "tool_result" 'call_id call-id
                                               'content (value->jsexpr-string result)))))
                     (set! pending-context (hash))
-                    (set! next-state
-                          (make-state messages compactions last-usage context-budget
-                                      model reasoning service-tier "working" "" 0))
-                    (request-effect messages last-usage model reasoning service-tier)))
+                    (continue-context-calls)))
               (begin
                 (define summary-message
                   (hash 'kind "message" 'role "user"
@@ -190,10 +283,7 @@
                 (set! compactions (+ compactions 1))
                 (reset-context-pressure-notification!
                   messages last-usage context-budget)
-                (set! next-state
-                      (make-state messages compactions last-usage context-budget
-                                  model reasoning service-tier "working" "" 0))
-                (request-effect messages last-usage model reasoning service-tier)))]
+                (continue-context-calls)))]
          [(equal? activity "compacting")
           (define result
             (complete-selected-compaction
@@ -237,72 +327,9 @@
                                  (estimated-message-tokens messages))))
           (set! messages (append messages preserved))
           (if (not (null? calls))
-              (if (and (null? (cdr calls))
-                       (context-tool-name? (hash-ref (car calls) 'name)))
-                  (let* ([call (car calls)]
-                         [name (hash-ref call 'name)]
-                         [arguments (provider-arguments-for model call)])
-                    (set! messages (append messages calls))
-                    (set! active-context-items
-                          (context-sync-items active-context-items messages))
-                    (cond
-                      [(equal? name "context_inspect")
-                       (define result
-                         (context-inspection
-                           active-context-items messages last-usage
-                           context-budget))
-                       (set! messages
-                             (append messages (list (context-tool-result call result))))
-                       (set! next-state
-                             (make-state messages compactions last-usage
-                                         context-budget model reasoning service-tier
-                                         "working" "" 0))
-                       (request-effect messages last-usage model reasoning service-tier)]
-                      [(equal? name "context_mark")
-                       (define label (hash-ref arguments 'label))
-                       (define result
-                         (hash 'closed (hash-ref (context-last-item active-context-items) 'id)
-                               'opened (context-runtime-id "S" next-context-span)
-                               'label label))
-                       (set! messages
-                             (append messages (list (context-tool-result call result))))
-                       (set! active-context-items
-                             (context-sync-items active-context-items messages))
-                       (set! active-context-items
-                             (context-mark-items
-                               active-context-items
-                               (context-runtime-id "S" next-context-span)
-                               label (hash-ref call 'call_id)))
-                       (set! next-context-span (+ next-context-span 1))
-                       (set! next-state
-                             (make-state messages compactions last-usage
-                                         context-budget model reasoning service-tier
-                                         "working" "" 0))
-                       (request-effect messages last-usage model reasoning service-tier)]
-                      [else
-                       (define ids (hash-ref arguments 'items))
-                       (define selected (context-selection active-context-items ids))
-                       (set! pending-context
-                             (hash 'call_id (hash-ref call 'call_id)
-                                   'items ids
-                                   'label (hash-ref arguments 'label)))
-                       (set! next-state
-                             (make-state messages compactions last-usage
-                                         context-budget model reasoning service-tier
-                                         "selective_compacting" "" 0))
-                       (start-context-summary
-                         (context-selected-messages selected)
-                         model reasoning service-tier)]))
-                  (begin
-                (set! messages (append messages calls))
-                (set! next-state
-                      (make-state messages compactions last-usage
-                                  context-budget model reasoning service-tier
-                                  "working" "" 0))
-                (hash 'type "run_tools"
-                      'calls (map (lambda (call)
-                                    (tool-call-execution model call))
-                                  calls))))
+              (begin
+                (set! pending-context-calls calls)
+                (continue-context-calls))
               (let* ([content (provider-output-for model events)]
                      [finished-content (if (equal? content "")
                                            "Model returned no output."
@@ -332,17 +359,19 @@
        (set! messages
              (append messages
                      (map tool-result-message (hash-ref event 'results))))
-       (if (selected-compaction-needed? messages last-usage context-budget)
-           (begin
-             (set! next-state
-                   (make-state messages compactions last-usage context-budget
-                               model reasoning service-tier "compacting" "" 0))
-             (start-selected-compaction messages context-budget))
-           (begin
-             (set! next-state
-                   (make-state messages compactions last-usage context-budget
-                               model reasoning service-tier "working" "" 0))
-             (request-effect messages last-usage model reasoning service-tier)))]
+       (if (not (null? pending-context-calls))
+           (continue-context-calls)
+           (if (selected-compaction-needed? messages last-usage context-budget)
+               (begin
+                 (set! next-state
+                       (make-state messages compactions last-usage context-budget
+                                   model reasoning service-tier "compacting" "" 0))
+                 (start-selected-compaction messages context-budget))
+               (begin
+                 (set! next-state
+                       (make-state messages compactions last-usage context-budget
+                                   model reasoning service-tier "working" "" 0))
+                 (request-effect messages last-usage model reasoning service-tier))))]
       [else (hash 'type "finish" 'content "Unsupported event.")]))
   (set! next-state
         (hash-insert next-state 'next_context_notification
@@ -467,6 +496,8 @@
         'next_context_span next-context-span
         'next_context_summary next-context-summary
         'pending_context pending-context
+        'pending_context_calls pending-context-calls
+        'context_reservations context-reservations
         'next_context_notification next-context-notification
         'context_window (hash-ref (model-spec model) 'context_window)))
 
