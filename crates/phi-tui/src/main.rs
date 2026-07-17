@@ -2031,7 +2031,6 @@ fn push_reasoning_summary(lines: &mut Vec<Line<'static>>, content: &str, width: 
                 block: Style::default(),
                 base: content_style,
                 marker: "  ",
-                flush_ordered_lists: false,
                 code_inset: 0,
             },
         );
@@ -2079,7 +2078,6 @@ fn push_markdown(lines: &mut Vec<Line<'static>>, role: &str, content: &str, widt
             block: block_style,
             base: Style::default(),
             marker: if role == "you" { "‣ " } else { "• " },
-            flush_ordered_lists: role != "you",
             code_inset,
         },
     );
@@ -2092,7 +2090,6 @@ struct MarkdownBlockStyle {
     block: Style,
     base: Style,
     marker: &'static str,
-    flush_ordered_lists: bool,
     code_inset: usize,
 }
 
@@ -2108,14 +2105,18 @@ fn push_markdown_content(
     let content_width = width.saturating_sub(2).max(1);
     let mut marked = false;
     let mut in_code = false;
+    let mut list_markers = 0;
+    let mut list_item_indents = Vec::new();
+    let mut continuation_hints = list_continuation_hints(content).into_iter().peekable();
+    let mut previous_was_blank = false;
     let mut markdown_lines = markdown.lines.into_iter().peekable();
     while let Some(mut line) = markdown_lines.next() {
         let marker_text = line.to_string();
-        if is_ordered_list_marker(&marker_text)
+        if is_list_marker_only(&marker_text)
             && let Some(next) = markdown_lines.peek()
             && !next.to_string().trim().is_empty()
         {
-            let item = markdown_lines.next().expect("peeked ordered list item");
+            let item = markdown_lines.next().expect("peeked list item");
             if !marker_text.chars().last().is_some_and(char::is_whitespace) {
                 line.spans.push(Span::raw(" "));
             }
@@ -2146,10 +2147,23 @@ fn push_markdown_content(
             }
             continue;
         }
-        let ordered_list_line =
-            !in_code && block.flush_ordered_lists && is_ordered_list_line(&plain);
-        let line_width = if ordered_list_line {
-            width.max(1)
+        let list_marker = (!in_code).then(|| list_marker(&plain)).flatten();
+        let continuation_depth = if !in_code && previous_was_blank {
+            continuation_hints
+                .next_if(|hint| hint.after_marker == list_markers)
+                .map(|hint| hint.depth)
+        } else {
+            None
+        };
+        let hanging_list = list_marker.filter(|marker| width > 2 + marker.prefix_width);
+        let line_width = if let Some(marker) = hanging_list {
+            width.saturating_sub(2 + marker.prefix_width)
+        } else if list_marker.is_some() {
+            width.saturating_sub(2).max(1)
+        } else if let Some(depth) = continuation_depth {
+            width
+                .saturating_sub(list_item_indents.get(depth).copied().unwrap_or(2))
+                .max(1)
         } else if in_code && block.code_inset > 0 {
             width
                 .saturating_sub(block.code_inset * 2 + code_padding * 2)
@@ -2157,18 +2171,37 @@ fn push_markdown_content(
         } else {
             content_width
         };
-        for wrapped in wrap_styled_line(&line, line_width) {
+        let (line_prefix, line) = if let Some(marker) = hanging_list {
+            split_styled_line(&line, marker.prefix_width)
+        } else {
+            (Line::default(), line)
+        };
+        for (wrap_index, wrapped) in wrap_styled_line(&line, line_width).into_iter().enumerate() {
             let has_content = !wrapped.to_string().trim().is_empty();
-            let prefix = if ordered_list_line {
+            let prefix = if let Some(marker) = hanging_list {
                 if has_content {
                     marked = true;
                 }
-                ""
+                if wrap_index == 0 {
+                    "  ".to_owned()
+                } else {
+                    " ".repeat(2 + marker.prefix_width)
+                }
+            } else if list_marker.is_some() {
+                if has_content {
+                    marked = true;
+                }
+                " ".repeat(width.min(2))
+            } else if let Some(depth) = continuation_depth {
+                if has_content {
+                    marked = true;
+                }
+                " ".repeat(list_item_indents.get(depth).copied().unwrap_or(2))
             } else if !marked && has_content {
                 marked = true;
-                block.marker
+                block.marker.to_owned()
             } else {
-                "  "
+                "  ".to_owned()
             };
             let inherited = wrapped.style.fg.unwrap_or(block.normal);
             let style = Style::default()
@@ -2186,7 +2219,19 @@ fn push_markdown_content(
             } else {
                 style
             };
-            let mut spans = vec![Span::styled(prefix.to_owned(), prefix_style)];
+            let mut spans = vec![Span::styled(prefix, prefix_style)];
+            if hanging_list.is_some() && wrap_index == 0 {
+                spans.extend(line_prefix.spans.iter().map(|span| {
+                    Span::styled(
+                        span.content.clone().into_owned(),
+                        Style::default()
+                            .fg(inherited)
+                            .patch(block.block)
+                            .patch(block.base)
+                            .patch(span.style),
+                    )
+                }));
+            }
             if in_code && code_padding > 0 {
                 spans.push(Span::styled(" ".repeat(code_padding), style));
             }
@@ -2216,6 +2261,14 @@ fn push_markdown_content(
             }
             lines.push(Line::from(spans).style(line_style));
         }
+        if let Some(marker) = list_marker {
+            list_markers += 1;
+            let item_indent = width.min(2 + marker.prefix_width);
+            list_item_indents.truncate(marker.depth);
+            list_item_indents.resize(marker.depth + 1, item_indent);
+            list_item_indents[marker.depth] = item_indent;
+        }
+        previous_was_blank = plain.trim().is_empty();
     }
     if !marked && !content.is_empty() {
         lines.push(Line::styled(
@@ -2225,16 +2278,144 @@ fn push_markdown_content(
     }
 }
 
-fn is_ordered_list_line(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
-    digits > 0 && trimmed[digits..].starts_with(". ")
+#[derive(Clone, Copy)]
+struct ListMarker {
+    depth: usize,
+    prefix_width: usize,
 }
 
-fn is_ordered_list_marker(line: &str) -> bool {
-    let trimmed = line.trim();
+fn list_marker(line: &str) -> Option<ListMarker> {
+    let leading = line.len() - line.trim_start_matches(' ').len();
+    let trimmed = &line[leading..];
+    let marker_width = if trimmed.starts_with("- ") {
+        2
+    } else {
+        let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 || !trimmed[digits..].starts_with(". ") {
+            return None;
+        }
+        digits + 2
+    };
+    Some(ListMarker {
+        depth: leading / 4,
+        prefix_width: leading + marker_width,
+    })
+}
+
+fn is_list_marker_only(line: &str) -> bool {
+    list_marker(line)
+        .is_some_and(|marker| UnicodeWidthStr::width(line.trim_end()) < marker.prefix_width)
+}
+
+#[derive(Clone, Copy)]
+struct ListContinuationHint {
+    after_marker: usize,
+    depth: usize,
+}
+
+fn list_continuation_hints(content: &str) -> Vec<ListContinuationHint> {
+    #[derive(Clone, Copy)]
+    struct Item {
+        indent: usize,
+        content_indent: usize,
+        depth: usize,
+    }
+
+    let mut items = Vec::<Item>::new();
+    let mut hints = Vec::new();
+    let mut marker = 0;
+    let mut after_blank = false;
+    let mut fence = None;
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if let Some(delimiter) = fence {
+            if trimmed.starts_with(delimiter) {
+                fence = None;
+            }
+            continue;
+        }
+        if trimmed.starts_with("```") {
+            fence = Some("```");
+            continue;
+        }
+        if trimmed.starts_with("~~~") {
+            fence = Some("~~~");
+            continue;
+        }
+        if line.trim().is_empty() {
+            after_blank = true;
+            continue;
+        }
+        if let Some((indent, marker_width)) = source_list_marker(line) {
+            while items.last().is_some_and(|item| item.indent >= indent) {
+                items.pop();
+            }
+            let depth = items.len();
+            marker += 1;
+            items.push(Item {
+                indent,
+                content_indent: indent + marker_width,
+                depth,
+            });
+            after_blank = false;
+            continue;
+        }
+        if after_blank {
+            let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+            if let Some(item) = items
+                .iter()
+                .rev()
+                .find(|item| indent >= item.content_indent)
+            {
+                hints.push(ListContinuationHint {
+                    after_marker: marker,
+                    depth: item.depth,
+                });
+            } else {
+                items.clear();
+            }
+        }
+        after_blank = false;
+    }
+    hints
+}
+
+fn source_list_marker(line: &str) -> Option<(usize, usize)> {
+    let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+    let trimmed = &line[indent..];
+    if matches!(trimmed.as_bytes(), [b'-' | b'+' | b'*', b' ', ..]) {
+        return Some((indent, 2));
+    }
     let digits = trimmed.bytes().take_while(u8::is_ascii_digit).count();
-    digits > 0 && &trimmed[digits..] == "."
+    (digits > 0 && trimmed[digits..].starts_with(". ")).then_some((indent, digits + 2))
+}
+
+fn split_styled_line(line: &Line<'_>, prefix_width: usize) -> (Line<'static>, Line<'static>) {
+    let mut prefix = Vec::new();
+    let mut content = Vec::new();
+    let mut used = 0;
+    for span in &line.spans {
+        let mut before = String::new();
+        let mut after = String::new();
+        for character in span.content.chars() {
+            if used < prefix_width {
+                before.push(character);
+                used += character.width().unwrap_or_default();
+            } else {
+                after.push(character);
+            }
+        }
+        if !before.is_empty() {
+            prefix.push(Span::styled(before, span.style));
+        }
+        if !after.is_empty() {
+            content.push(Span::styled(after, span.style));
+        }
+    }
+    (
+        Line::from(prefix).style(line.style),
+        Line::from(content).style(line.style),
+    )
 }
 
 fn wrap_styled_line(line: &Line<'_>, width: usize) -> Vec<Line<'static>> {
@@ -4606,15 +4787,142 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.to_string().starts_with("1. First"))
+                .any(|line| line.to_string().starts_with("  1. First"))
         );
         assert!(
             lines
                 .iter()
-                .any(|line| line.to_string().contains("2. Second"))
+                .any(|line| line.to_string().starts_with("  2. Second"))
         );
         assert!(!lines.iter().any(|line| line.to_string().trim() == "1."));
         assert!(!lines.iter().any(|line| line.to_string().trim() == "2."));
+    }
+
+    #[test]
+    fn markdown_lists_have_consistent_inset_and_hanging_indent() {
+        let cases = [
+            (
+                "1. First numbered item\n2. Second numbered item",
+                vec![
+                    "  1. First numbe",
+                    "     red item",
+                    "  2. Second numb",
+                    "     ered item",
+                ],
+            ),
+            (
+                "- first unordered item\n- second unordered item",
+                vec![
+                    "  - first unorde",
+                    "    red item",
+                    "  - second unord",
+                    "    ered item",
+                ],
+            ),
+        ];
+        for (content, expected) in cases {
+            let mut lines = Vec::new();
+            push_message(&mut lines, "phi", content, 16);
+            assert_eq!(trimmed(&lines), expected, "rendering {content:?}");
+            assert!(lines.iter().all(|line| line.width() == 16));
+        }
+
+        for marker in ['-', '+', '*'] {
+            let mut lines = Vec::new();
+            push_message(&mut lines, "phi", &format!("{marker} item"), 16);
+            assert_eq!(trimmed(&lines), ["  - item"]);
+        }
+
+        let mut narrow = Vec::new();
+        push_message(&mut narrow, "phi", "10. item", 4);
+        assert_eq!(trimmed(&narrow), ["  10", "  .", "  it", "  em"]);
+        assert!(narrow.iter().all(|line| line.width() == 4));
+    }
+
+    #[test]
+    fn markdown_lists_preserve_nested_and_paragraph_indentation() {
+        let mut lines = Vec::new();
+        push_message(
+            &mut lines,
+            "phi",
+            "10. outer item\n    - nested item\n\n      nested paragraph\n\n11. final outer item",
+            24,
+        );
+        assert_eq!(
+            trimmed(&lines),
+            [
+                "  10. outer item",
+                "      - nested item",
+                "",
+                "        nested paragraph",
+                "  11. final outer item",
+            ]
+        );
+        assert!(lines.iter().all(|line| line.width() == 24));
+    }
+
+    #[test]
+    fn markdown_list_layout_is_shared_and_stable_when_cached() {
+        let content = "- an item that wraps across lines";
+        for role in ["you", "phi", "processes"] {
+            let mut lines = Vec::new();
+            push_message(&mut lines, role, content, 18);
+            assert_eq!(
+                trimmed(&lines),
+                ["  - an item that w", "    raps across li", "    nes"],
+                "role {role}"
+            );
+        }
+
+        let mut reasoning = Vec::new();
+        push_message(&mut reasoning, "reasoning_summary", content, 18);
+        assert_eq!(
+            trimmed(&reasoning),
+            [
+                "• Provider reason…",
+                "  - an item that w",
+                "    raps across li",
+                "    nes",
+            ]
+        );
+
+        let mut app = app();
+        app.current_model = content.into();
+        app.current_model_changed();
+        let live = trimmed(&transcript_text(&mut app, 18).lines);
+        app.current_model.clear();
+        app.current_model_changed();
+        app.push_transcript("phi", content);
+        let cached = trimmed(&transcript_text(&mut app, 18).lines);
+        assert_eq!(live, cached);
+        assert_eq!(
+            cached,
+            ["  - an item that w", "    raps across li", "    nes", ""]
+        );
+    }
+
+    #[test]
+    fn markdown_lists_keep_inset_without_adding_block_spacing() {
+        let mut app = app();
+        app.push_transcript("phi", "before\n\n- item\n\n```text\ncode\n```");
+        app.push_transcript("tool", "Ran `test`");
+        app.push_transcript("patch", "Updated file");
+        app.push_transcript("reasoning_summary", "1. reason");
+        app.push_transcript("turn_end", "done");
+
+        let rendered = trimmed(&transcript_text(&mut app, 24).lines);
+        for expected in ["  - item", "  1. reason"] {
+            let index = rendered.iter().position(|line| line == expected).unwrap();
+            assert_eq!(
+                rendered[index].chars().position(|char| char != ' '),
+                Some(2)
+            );
+        }
+        assert!(
+            !rendered
+                .windows(2)
+                .any(|lines| lines[0].is_empty() && lines[1].is_empty())
+        );
     }
 
     #[test]
@@ -4629,12 +4937,12 @@ mod tests {
 
         let rendered = lines.iter().map(ToString::to_string).collect::<Vec<_>>();
         assert!(
-            rendered.iter().any(|line| line.starts_with("1. one")),
+            rendered.iter().any(|line| line.starts_with("  1. one")),
             "rendered lines: {rendered:#?}"
         );
-        assert!(rendered.iter().any(|line| line.starts_with("2. two")));
-        assert!(rendered.iter().any(|line| line.starts_with("3. three")));
-        assert!(rendered.iter().any(|line| line.starts_with("4. four")));
+        assert!(rendered.iter().any(|line| line.starts_with("  2. two")));
+        assert!(rendered.iter().any(|line| line.starts_with("  3. three")));
+        assert!(rendered.iter().any(|line| line.starts_with("  4. four")));
         assert!(
             !rendered
                 .iter()
