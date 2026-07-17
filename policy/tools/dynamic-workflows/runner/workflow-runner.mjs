@@ -157,19 +157,7 @@ try {
     throw new Error("workflow must default-export an async function")
   }
   await progress({ type: "workflow_started", name: request.name, meta: module.meta })
-  let timer
-  let value
-  try {
-    const timeout = new Promise((_, reject) => {
-      timer = setTimeout(
-        () => reject(new Error(`workflow timed out after ${request.limits.timeoutMs} ms`)),
-        request.limits.timeoutMs
-      )
-    })
-    value = await Promise.race([module.default({ args: request.args }), timeout])
-  } finally {
-    clearTimeout(timer)
-  }
+  const value = await module.default({ args: request.args })
   closing = true
   await stopChildren()
   await worktrees.cleanup()

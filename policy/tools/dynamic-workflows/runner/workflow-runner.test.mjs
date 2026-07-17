@@ -13,7 +13,7 @@ function git(root, ...args) {
   return execFileSync("git", ["-C", root, ...args], { encoding: "utf8" }).trim()
 }
 
-async function fixture(source, timeoutMs = 10_000) {
+async function fixture(source) {
   const base = await mkdtemp(join(tmpdir(), "phi-workflow-runner-test-"))
   const repository = join(base, "repository")
   const taskDir = join(base, "task")
@@ -68,7 +68,7 @@ process.stdin.on("end", () => {
       repoHash: "test"
     },
     worktreeRoot,
-    limits: { maxConcurrency: 2, maxAgents: 4, timeoutMs }
+    limits: { maxConcurrency: 2, maxAgents: 4 }
   }))
   return { base, repository, taskDir, requestPath, taskId, worktreeRoot }
 }
@@ -119,25 +119,6 @@ export default async function () {
     } finally {
       await rm(value.base, { recursive: true, force: true })
     }
-  }
-})
-
-test("runner cleans managed worktrees after timeout", {
-  skip: process.platform === "win32"
-}, async () => {
-  const value = await fixture(`${header}
-export default async function () {
-  return agent("HANG", { branch: "timeout" })
-}`, 100)
-  try {
-    const result = await run(value.requestPath)
-    assert.equal(result.code, 1, result.stderr)
-    const state = JSON.parse(await readFile(join(value.taskDir, "state.json")))
-    assert.equal(state.status, "failed")
-    assert.match(state.error, /timed out/)
-    await assertClean(value)
-  } finally {
-    await rm(value.base, { recursive: true, force: true })
   }
 })
 

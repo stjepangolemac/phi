@@ -14,7 +14,6 @@ use uuid::Uuid;
 
 const MAX_CONCURRENCY: u64 = 8;
 const MAX_AGENTS: u64 = 32;
-const WORKFLOW_TIMEOUT_MS: u64 = 60 * 60 * 1_000;
 const MAX_PROGRESS_BYTES: usize = 32 * 1024;
 
 struct TaskEntry {
@@ -87,7 +86,6 @@ impl WorkflowTasks {
             "limits": {
                 "maxConcurrency": MAX_CONCURRENCY,
                 "maxAgents": MAX_AGENTS,
-                "timeoutMs": WORKFLOW_TIMEOUT_MS,
             }
         });
         let request_path = dir.join("request.json");
@@ -913,6 +911,23 @@ mod tests {
             .await
             .unwrap();
         let task_id = launched["task_id"].as_str().unwrap();
+        let request: Value = serde_json::from_slice(
+            &fs::read(
+                session
+                    .join("workflows/tasks")
+                    .join(task_id)
+                    .join("request.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            request["limits"],
+            json!({
+                "maxConcurrency": MAX_CONCURRENCY,
+                "maxAgents": MAX_AGENTS,
+            })
+        );
         let output = tasks
             .output(&session, &json!({ "task_id": task_id }))
             .await
