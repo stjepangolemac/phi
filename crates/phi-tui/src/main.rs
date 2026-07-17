@@ -2124,17 +2124,25 @@ fn push_markdown_content(
         let plain = line.to_string();
         if plain.trim_start().starts_with("```") {
             if in_code {
-                lines.push(Line::styled(
-                    " ".repeat(width),
-                    block.block.patch(block.base),
-                ));
                 in_code = false;
             } else {
+                // tui-markdown inserts one blank line before every non-leading
+                // fence. Replace that renderer-owned padding with our single
+                // intentional prose/code separator, while leaving any blank
+                // lines inside the preceding code block untouched.
+                if lines
+                    .last()
+                    .is_some_and(|line| line.to_string().trim().is_empty())
+                {
+                    lines.pop();
+                }
+                if !lines.is_empty() {
+                    lines.push(Line::styled(
+                        " ".repeat(width),
+                        block.block.patch(block.base),
+                    ));
+                }
                 in_code = true;
-                lines.push(Line::styled(
-                    " ".repeat(width),
-                    block.block.patch(block.base),
-                ));
             }
             continue;
         }
@@ -3528,7 +3536,132 @@ mod tests {
             .position(|line| line.to_string().contains("fn main"))
             .unwrap();
         assert_eq!(lines[code_index - 1].style.bg, None);
-        assert_eq!(lines[code_index + 1].style.bg, None);
+        assert_eq!(code_index, lines.len() - 1);
+    }
+
+    #[test]
+    fn fenced_code_uses_one_separator_only_when_adjacent_to_markdown_content() {
+        let cases = [
+            ("```text\none\n```", vec!["• one"]),
+            ("before\n\n```text\none\n```", vec!["• before", "", "  one"]),
+            ("```text\none\n```\n\nafter", vec!["• one", "", "  after"]),
+            (
+                "before\n\n```text\none\n```\n\nafter",
+                vec!["• before", "", "  one", "", "  after"],
+            ),
+            (
+                "```text\none\n```\n\n```text\ntwo\n```",
+                vec!["• one", "", "  two"],
+            ),
+        ];
+
+        for (content, expected) in cases {
+            let mut lines = Vec::new();
+            push_message(&mut lines, "phi", content, 30);
+            assert_eq!(trimmed(&lines), expected, "rendering {content:?}");
+        }
+    }
+
+    #[test]
+    fn fenced_code_does_not_stack_with_transcript_block_separators() {
+        let adjacent_blocks = [
+            ("tool", "before", "patch", "after"),
+            ("patch", "before", "reasoning_summary", "after"),
+            ("reasoning_summary", "before", "turn_end", "after"),
+            ("turn_end", "before", "tool", "after"),
+        ];
+        for role in ["you", "phi", "processes", "reasoning_summary"] {
+            for (before_role, before, after_role, after) in adjacent_blocks {
+                let mut app = app();
+                app.push_transcript(before_role, before);
+                app.push_transcript(role, "```text\ncode\n```");
+                app.push_transcript(after_role, after);
+                let rendered = trimmed(&transcript_text(&mut app, 30).lines);
+                let code = rendered
+                    .iter()
+                    .position(|line| line.contains("code"))
+                    .unwrap();
+
+                assert!(rendered[code - 1].is_empty(), "before {role} code");
+                assert!(
+                    !rendered[code - 2].is_empty(),
+                    "duplicate separator before {role} code"
+                );
+                assert!(rendered[code + 1].is_empty(), "after {role} code");
+                assert!(
+                    !rendered[code + 2].is_empty(),
+                    "duplicate separator after {role} code"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fenced_code_at_markdown_content_edges_has_no_outer_padding() {
+        for role in ["you", "phi", "processes", "reasoning_summary"] {
+            let mut lines = Vec::new();
+            push_message(&mut lines, role, "```text\ncode\n```\n\nafter", 30);
+            let rendered = trimmed(&lines);
+            let code = rendered
+                .iter()
+                .position(|line| line.contains("code"))
+                .unwrap();
+            assert_eq!(rendered[code + 1], "", "code -> prose for {role}");
+            assert!(!rendered[code + 2].is_empty(), "prose after {role} code");
+
+            lines.clear();
+            push_message(&mut lines, role, "before\n\n```text\ncode\n```", 30);
+            let rendered = trimmed(&lines);
+            let code = rendered
+                .iter()
+                .position(|line| line.contains("code"))
+                .unwrap();
+            assert_eq!(rendered[code - 1], "", "prose -> code for {role}");
+            assert_eq!(code, rendered.len() - 1, "trailing padding for {role}");
+        }
+    }
+
+    #[test]
+    fn fenced_code_preserves_content_blank_lines_and_narrow_wrapping() {
+        let mut lines = Vec::new();
+        push_message(&mut lines, "phi", "```text\n\nalpha\n\n```", 30);
+        assert_eq!(trimmed(&lines), ["", "• alpha", ""]);
+
+        lines.clear();
+        push_message(&mut lines, "phi", "```text\nabcdefghij\n```", 8);
+        assert_eq!(trimmed(&lines), ["• abcdef", "  ghij"]);
+
+        lines.clear();
+        push_message(&mut lines, "phi", "```\n```", 8);
+        assert_eq!(trimmed(&lines), ["•"]);
+    }
+
+    #[test]
+    fn streamed_fenced_code_spacing_is_stable_when_cached() {
+        let mut app = app();
+        app.push_transcript("reasoning_summary", "because");
+        app.current_model = "before\n\n```text\nanswer\n```".into();
+        app.current_model_changed();
+        let streaming = trimmed(&transcript_text(&mut app, 20).lines);
+
+        app.current_model.clear();
+        app.current_model_changed();
+        app.push_transcript("phi", "before\n\n```text\nanswer\n```");
+        let cached = trimmed(&transcript_text(&mut app, 20).lines);
+
+        assert_eq!(streaming, cached);
+        assert_eq!(
+            cached,
+            [
+                "• Provider reasonin…",
+                "  because",
+                "",
+                "• before",
+                "",
+                "  answer",
+                ""
+            ]
+        );
     }
 
     #[test]
