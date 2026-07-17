@@ -256,9 +256,11 @@
             (with-handler
               (lambda (error) (hash 'error (to-string error)))
               (let* ([arguments (provider-arguments-for model call)]
+                     [job-ids (hash-ref arguments 'job_ids)]
                      [requested
-                       (or (hash-try-get arguments 'job_ids)
-                           (context-pending-job-ids context-jobs))])
+                       (if (void? job-ids)
+                           (context-pending-job-ids context-jobs)
+                           job-ids)])
                 (define (unknown ids)
                   (cond [(null? ids) #f]
                         [(not (context-job-find context-jobs (car ids))) (car ids)]

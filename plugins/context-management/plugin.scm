@@ -36,8 +36,10 @@
         (hash 'type "object"
               'properties
               (hash 'job_ids
-                    (hash 'type "array"
-                          'items (hash 'type "string")))
+                    (hash 'type (list "array" "null")
+                          'items (hash 'type "string")
+                          'description "Job IDs to wait for. Use null for every job pending when the call begins."))
+              'required (list "job_ids")
               'additionalProperties #f)))
 
 (register-tool! (lambda () context-mark-spec))

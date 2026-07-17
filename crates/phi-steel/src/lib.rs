@@ -1604,7 +1604,7 @@ mod tests {
     }
 
     #[test]
-    fn context_wait_without_ids_snapshots_all_currently_pending_jobs() {
+    fn context_wait_with_null_ids_snapshots_all_currently_pending_jobs() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut policy = policy(&root);
         policy
@@ -1652,7 +1652,7 @@ mod tests {
             .on_event(&response_call(
                 "context_wait",
                 "wait-all",
-                serde_json::json!({}),
+                serde_json::json!({ "job_ids": null }),
             ))
             .unwrap();
         assert_eq!(

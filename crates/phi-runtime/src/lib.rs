@@ -3512,7 +3512,12 @@ mod tests {
                     && body["tools"].as_array().unwrap().iter()
                         .any(|tool| tool["name"] == "context_compact")
                     && body["tools"].as_array().unwrap().iter()
-                        .any(|tool| tool["name"] == "context_wait")
+                        .any(|tool| tool["name"] == "context_wait"
+                            && tool["strict"] == true
+                            && tool["parameters"]["properties"]["job_ids"]["type"]
+                                == serde_json::json!(["array", "null"])
+                            && tool["parameters"]["required"]
+                                == serde_json::json!(["job_ids"]))
                     && !body["tools"].as_array().unwrap().iter()
                         .any(|tool| tool["name"] == "load_skill")
                     && body["tools"].as_array().unwrap().iter()
