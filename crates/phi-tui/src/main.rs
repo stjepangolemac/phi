@@ -1922,15 +1922,21 @@ fn push_reasoning_summary(lines: &mut Vec<Line<'static>>, content: &str, width: 
         truncate_width("• Provider reasoning summary", width),
         label_style,
     ));
-    let content_width = width.saturating_sub(2).max(1);
-    for content_line in content.split('\n') {
-        for wrapped in wrap_line(content_line, content_width) {
-            let used = UnicodeWidthStr::width(wrapped.as_str()).min(content_width);
-            lines.push(Line::styled(
-                format!("  {wrapped}{}", " ".repeat(width.saturating_sub(2 + used))),
-                content_style,
-            ));
-        }
+    if !content.trim().is_empty() {
+        push_markdown_content(
+            lines,
+            content,
+            width,
+            MarkdownBlockStyle {
+                normal: Color::Gray,
+                strong: Color::Gray,
+                block: Style::default(),
+                base: content_style,
+                marker: "  ",
+                flush_ordered_lists: false,
+                code_inset: 0,
+            },
+        );
     }
     lines.push(Line::raw(" ".repeat(width)));
 }
@@ -1960,20 +1966,53 @@ fn activity_indicator(state: &ThrobberState, label: &str, width: usize) -> Line<
 }
 
 fn push_markdown(lines: &mut Vec<Line<'static>>, role: &str, content: &str, width: usize) {
-    let normal = Color::Rgb(190, 190, 185);
-    let strong = Color::Rgb(235, 235, 230);
     let block_style = if role == "you" {
         Style::default().bg(Color::Rgb(38, 40, 45))
     } else {
         Style::default()
     };
     let code_inset = usize::from(role == "processes") * 2;
-    let code_padding = code_inset;
     lines.push(Line::styled(" ".repeat(width), block_style));
+
+    push_markdown_content(
+        lines,
+        content,
+        width,
+        MarkdownBlockStyle {
+            normal: Color::Rgb(190, 190, 185),
+            strong: Color::Rgb(235, 235, 230),
+            block: block_style,
+            base: Style::default(),
+            marker: if role == "you" { "‣ " } else { "• " },
+            flush_ordered_lists: role != "you",
+            code_inset,
+        },
+    );
+
+    lines.push(Line::styled(" ".repeat(width), block_style));
+}
+
+#[derive(Clone, Copy)]
+struct MarkdownBlockStyle {
+    normal: Color,
+    strong: Color,
+    block: Style,
+    base: Style,
+    marker: &'static str,
+    flush_ordered_lists: bool,
+    code_inset: usize,
+}
+
+fn push_markdown_content(
+    lines: &mut Vec<Line<'static>>,
+    content: &str,
+    width: usize,
+    block: MarkdownBlockStyle,
+) {
+    let code_padding = block.code_inset;
 
     let options = tui_markdown::Options::new(PhiMarkdown);
     let markdown = tui_markdown::from_str_with_options(content, &options);
-    let marker = if role == "you" { "‣ " } else { "• " };
     let content_width = width.saturating_sub(2).max(1);
     let mut marked = false;
     let mut in_code = false;
@@ -1993,20 +2032,27 @@ fn push_markdown(lines: &mut Vec<Line<'static>>, role: &str, content: &str, widt
         let plain = line.to_string();
         if plain.trim_start().starts_with("```") {
             if in_code {
-                lines.push(Line::styled(" ".repeat(width), block_style));
+                lines.push(Line::styled(
+                    " ".repeat(width),
+                    block.block.patch(block.base),
+                ));
                 in_code = false;
             } else {
                 in_code = true;
-                lines.push(Line::styled(" ".repeat(width), block_style));
+                lines.push(Line::styled(
+                    " ".repeat(width),
+                    block.block.patch(block.base),
+                ));
             }
             continue;
         }
-        let ordered_list_line = !in_code && role != "you" && is_ordered_list_line(&plain);
+        let ordered_list_line =
+            !in_code && block.flush_ordered_lists && is_ordered_list_line(&plain);
         let line_width = if ordered_list_line {
             width.max(1)
-        } else if in_code && code_inset > 0 {
+        } else if in_code && block.code_inset > 0 {
             width
-                .saturating_sub(code_inset * 2 + code_padding * 2)
+                .saturating_sub(block.code_inset * 2 + code_padding * 2)
                 .max(1)
         } else {
             content_width
@@ -2020,22 +2066,23 @@ fn push_markdown(lines: &mut Vec<Line<'static>>, role: &str, content: &str, widt
                 ""
             } else if !marked && has_content {
                 marked = true;
-                marker
+                block.marker
             } else {
                 "  "
             };
-            let inherited = wrapped.style.fg.unwrap_or(normal);
+            let inherited = wrapped.style.fg.unwrap_or(block.normal);
             let style = Style::default()
                 .fg(inherited)
-                .patch(block_style)
+                .patch(block.block)
+                .patch(block.base)
                 .patch(wrapped.style);
-            let prefix_style = if in_code && code_inset > 0 {
-                block_style
+            let prefix_style = if in_code && block.code_inset > 0 {
+                block.block
             } else {
                 style
             };
-            let line_style = if in_code && code_inset > 0 {
-                block_style
+            let line_style = if in_code && block.code_inset > 0 {
+                block.block
             } else {
                 style
             };
@@ -2046,10 +2093,11 @@ fn push_markdown(lines: &mut Vec<Line<'static>>, role: &str, content: &str, widt
             spans.extend(wrapped.spans.into_iter().map(|span| {
                 let mut span_style = Style::default()
                     .fg(inherited)
-                    .patch(block_style)
+                    .patch(block.block)
+                    .patch(block.base)
                     .patch(span.style);
                 if span_style.add_modifier.contains(Modifier::BOLD) {
-                    span_style = span_style.fg(strong);
+                    span_style = span_style.fg(block.strong);
                 }
                 Span::styled(span.content.into_owned(), span_style)
             }));
@@ -2057,12 +2105,12 @@ fn push_markdown(lines: &mut Vec<Line<'static>>, role: &str, content: &str, widt
                 .iter()
                 .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
                 .sum::<usize>();
-            if in_code && code_inset > 0 {
+            if in_code && block.code_inset > 0 {
                 spans.push(Span::styled(
-                    " ".repeat(width.saturating_sub(used + code_inset)),
+                    " ".repeat(width.saturating_sub(used + block.code_inset)),
                     style,
                 ));
-                spans.push(Span::styled(" ".repeat(code_inset), block_style));
+                spans.push(Span::styled(" ".repeat(block.code_inset), block.block));
             } else {
                 spans.push(Span::styled(" ".repeat(width.saturating_sub(used)), style));
             }
@@ -2071,11 +2119,10 @@ fn push_markdown(lines: &mut Vec<Line<'static>>, role: &str, content: &str, widt
     }
     if !marked && !content.is_empty() {
         lines.push(Line::styled(
-            format!("{marker}{}", " ".repeat(width.saturating_sub(2))),
-            block_style,
+            format!("{}{}", block.marker, " ".repeat(width.saturating_sub(2))),
+            block.block.patch(block.base),
         ));
     }
-    lines.push(Line::styled(" ".repeat(width), block_style));
 }
 
 fn is_ordered_list_line(line: &str) -> bool {
@@ -2698,10 +2745,10 @@ mod tests {
     fn streams_reasoning_summaries_separately_and_preserves_event_order() {
         let mut app = app();
         app.on_runtime(RuntimeEvent::ReasoningSummaryDelta {
-            content: "Checked ".into(),
+            content: "Checked **the ".into(),
         });
         app.on_runtime(RuntimeEvent::ReasoningSummaryDelta {
-            content: "the request.".into(),
+            content: "request**.".into(),
         });
         app.on_runtime(RuntimeEvent::ToolStarted {
             call_id: "read".into(),
@@ -2718,7 +2765,10 @@ mod tests {
         assert_eq!(
             &app.transcript[..3],
             &[
-                ("reasoning_summary".into(), "Checked the request.".into()),
+                (
+                    "reasoning_summary".into(),
+                    "Checked **the request**.".into()
+                ),
                 ("tool".into(), "Read src/main.rs".into()),
                 ("response_start".into(), String::new()),
             ]
@@ -2727,6 +2777,7 @@ mod tests {
         let rendered = transcript_text(&mut app, 48).to_string();
         assert!(rendered.contains("Provider reasoning summary"));
         assert!(rendered.contains("Checked the request."));
+        assert!(!rendered.contains("**"));
         assert_eq!(rendered.matches("Final answer").count(), 1);
     }
 
@@ -3188,6 +3239,112 @@ mod tests {
             .unwrap();
         assert_eq!(lines[code_index - 1].style.bg, None);
         assert_eq!(lines[code_index + 1].style.bg, None);
+    }
+
+    #[test]
+    fn renders_reasoning_summary_markdown_with_italic_base_style() {
+        let mut lines = Vec::new();
+        push_message(
+            &mut lines,
+            "reasoning_summary",
+            "plain **bold** *italic* ***both*** `inline` [link](https://example.com)\n\n- list item\n\n```rust\nfn main() {}\n```",
+            80,
+        );
+
+        let rendered = lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Provider reasoning summary"));
+        assert!(!rendered.contains("**"));
+        assert!(!rendered.contains("*italic*"));
+        assert!(!rendered.contains("`inline`"));
+        assert!(!rendered.contains("[link]"));
+        assert!(!rendered.contains("```"));
+        assert!(rendered.contains("list item"));
+        assert!(rendered.contains("fn main"));
+
+        let spans = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .collect::<Vec<_>>();
+        let plain = spans.iter().find(|span| span.content == "plain ").unwrap();
+        assert_eq!(plain.style.fg, Some(Color::Gray));
+        assert!(plain.style.add_modifier.contains(Modifier::ITALIC));
+
+        for content in ["bold", "both"] {
+            let span = spans.iter().find(|span| span.content == content).unwrap();
+            assert!(span.style.add_modifier.contains(Modifier::BOLD));
+            assert!(span.style.add_modifier.contains(Modifier::ITALIC));
+            assert_eq!(span.style.fg, Some(Color::Gray));
+        }
+        let italic = spans.iter().find(|span| span.content == "italic").unwrap();
+        assert!(italic.style.add_modifier.contains(Modifier::ITALIC));
+        let inline = spans.iter().find(|span| span.content == "inline").unwrap();
+        assert!(inline.style.add_modifier.contains(Modifier::ITALIC));
+        assert_eq!(inline.style.bg, Some(Color::Rgb(27, 28, 31)));
+        let link = spans
+            .iter()
+            .find(|span| span.content.contains("https://example.com"))
+            .unwrap();
+        assert!(link.style.add_modifier.contains(Modifier::ITALIC));
+        assert!(link.style.add_modifier.contains(Modifier::UNDERLINED));
+        let code = lines
+            .iter()
+            .find(|line| line.to_string().contains("fn main"))
+            .unwrap();
+        assert!(
+            code.spans
+                .iter()
+                .filter(|span| !span.content.trim().is_empty())
+                .all(|span| span.style.add_modifier.contains(Modifier::ITALIC))
+        );
+    }
+
+    #[test]
+    fn wraps_formatted_reasoning_without_losing_styles() {
+        let mut lines = Vec::new();
+        push_message(
+            &mut lines,
+            "reasoning_summary",
+            "**This formatted reasoning is long enough to wrap across several narrow lines.**",
+            18,
+        );
+
+        let content = &lines[2..lines.len() - 1];
+        assert!(content.len() > 1);
+        assert!(
+            content
+                .iter()
+                .all(|line| UnicodeWidthStr::width(line.to_string().as_str()) == 18)
+        );
+        assert!(
+            content
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .filter(|span| !span.content.trim().is_empty())
+                .all(|span| {
+                    span.style.add_modifier.contains(Modifier::BOLD)
+                        && span.style.add_modifier.contains(Modifier::ITALIC)
+                })
+        );
+    }
+
+    #[test]
+    fn whitespace_only_reasoning_summary_keeps_a_well_formed_labeled_block() {
+        let mut lines = Vec::new();
+        push_message(&mut lines, "reasoning_summary", " \n\t", 40);
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.to_string().contains("Provider reasoning summary"))
+                .count(),
+            1
+        );
+        assert!(lines.iter().all(|line| line.to_string().len() <= 40));
     }
 
     #[test]
