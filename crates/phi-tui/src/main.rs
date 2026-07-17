@@ -364,21 +364,53 @@ impl App {
     }
 
     fn start_messages(&mut self, messages: Vec<String>) {
+        self.start_messages_with_display(messages, true);
+    }
+
+    fn start_messages_with_display(&mut self, messages: Vec<String>, display: bool) {
         if messages.is_empty() {
             return;
         }
         self.options.session_id = self.session_id.clone();
-        for message in &messages {
-            self.push_transcript("you", message.clone());
-            self.message_history.push(message.clone());
+        if display {
+            self.display_user_messages(&messages);
         }
-        self.history_index = None;
-        self.history_draft.clear();
         self.handle = Some(phi_runtime::start_messages(self.options.clone(), messages));
         self.turn_started = Some(Instant::now());
         self.final_response_rendered = false;
         self.status = "working".into();
         self.follow = true;
+    }
+
+    fn display_user_messages(&mut self, messages: &[String]) {
+        for message in messages {
+            self.push_transcript("you", message.clone());
+            self.message_history.push(message.clone());
+        }
+        self.history_index = None;
+        self.history_draft.clear();
+        self.follow = true;
+    }
+
+    fn remove_displayed_restart_messages(&mut self, messages: &[String]) {
+        for message in messages.iter().rev() {
+            if let Some(index) = self
+                .transcript
+                .iter()
+                .rposition(|(role, content)| role == "you" && content == message)
+            {
+                self.transcript.remove(index);
+                self.transcript_cache.remove(index);
+            }
+            if let Some(index) = self
+                .message_history
+                .iter()
+                .rposition(|content| content == message)
+            {
+                self.message_history.remove(index);
+            }
+        }
+        self.transcript_offsets.clear();
     }
 
     fn start_next_queued_turn(&mut self) {
@@ -592,8 +624,14 @@ impl App {
                     {
                         self.steering_queue.remove(index);
                     }
-                    self.push_transcript("you", content.clone());
-                    self.message_history.push(content.clone());
+                    let already_displayed = self
+                        .restart_after_cancel
+                        .as_ref()
+                        .is_some_and(|messages| messages.contains(content));
+                    if !already_displayed {
+                        self.push_transcript("you", content.clone());
+                        self.message_history.push(content.clone());
+                    }
                 }
                 self.history_index = None;
                 self.history_draft.clear();
@@ -927,10 +965,14 @@ impl App {
                 self.status = "ready".into();
                 if restarting {
                     let mut messages = self.restart_after_cancel.take().unwrap_or_default();
-                    messages.extend(self.steering_queue.drain(..));
-                    self.start_messages(messages);
+                    let queued = self.steering_queue.drain(..).collect::<Vec<_>>();
+                    self.display_user_messages(&queued);
+                    messages.extend(queued);
+                    self.start_messages_with_display(messages, false);
                 } else {
-                    self.restart_after_cancel = None;
+                    if let Some(messages) = self.restart_after_cancel.take() {
+                        self.remove_displayed_restart_messages(&messages);
+                    }
                     self.start_next_queued_turn();
                 }
             }
@@ -1086,6 +1128,7 @@ impl App {
             KeyCode::Esc if self.handle.is_some() => {
                 if !self.steering_queue.is_empty() {
                     let queued = self.steering_queue.drain(..).collect::<Vec<_>>();
+                    self.display_user_messages(&queued);
                     self.restart_after_cancel
                         .get_or_insert_with(Vec::new)
                         .extend(queued);
@@ -1098,7 +1141,8 @@ impl App {
                     self.follow = true;
                 } else {
                     if self.status == "cancelling" && self.restart_after_cancel.is_some() {
-                        self.restart_after_cancel = None;
+                        let messages = self.restart_after_cancel.take().unwrap_or_default();
+                        self.remove_displayed_restart_messages(&messages);
                     }
                     if let Some(handle) = &self.handle {
                         handle.cancel();
@@ -1268,10 +1312,14 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> R
     let mut input = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut frame_tick = tokio::time::interval(Duration::from_millis(16));
+    frame_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    frame_tick.tick().await;
+    terminal.draw(|frame| draw(frame, app))?;
+    let mut redraw = false;
     while !app.quit {
-        terminal.draw(|frame| draw(frame, app))?;
         tokio::select! {
-            _ = tick.tick(), if app.turn_started.is_some() => app.on_tick(),
+            biased;
             event = input.next().fuse() => {
                 match event.transpose()? {
                     Some(Event::Key(key)) if key.is_press() => app.on_key(key),
@@ -1280,19 +1328,30 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> R
                     Some(_) => {},
                     None => app.quit = true,
                 }
+                redraw = true;
             }
+            _ = tick.tick(), if app.turn_started.is_some() => {
+                app.on_tick();
+                redraw = true;
+            },
+            _ = frame_tick.tick(), if redraw => {
+                terminal.draw(|frame| draw(frame, app))?;
+                redraw = false;
+            },
             event = next_runtime(&mut app.handle).fuse() => {
                 if let Some(event) = event {
                     app.on_runtime(event);
                 } else {
                     app.handle = None;
                 }
+                redraw = true;
             }
             result = next_command(&mut app.command_task).fuse() => {
                 app.command_task = None;
                 if let Some(result) = result {
                     app.on_command(result);
                 }
+                redraw = true;
             }
         }
     }
@@ -4021,6 +4080,26 @@ mod tests {
         assert!(!app.follow);
     }
 
+    #[test]
+    fn rapid_model_deltas_render_once_per_frame_and_preserve_scroll_input() {
+        let mut app = app();
+        app.follow = false;
+        app.scroll = 12;
+        for _ in 0..10_000 {
+            app.on_runtime(RuntimeEvent::ModelDelta {
+                content: "x".into(),
+            });
+        }
+
+        assert_eq!(app.current_model_render_count, 0);
+        app.scroll_up(3);
+        transcript_text(&mut app, 80);
+
+        assert_eq!(app.scroll, 9);
+        assert!(!app.follow);
+        assert_eq!(app.current_model_render_count, 1);
+    }
+
     #[tokio::test]
     async fn enter_queues_input_for_the_current_turn() {
         tokio::task::LocalSet::new()
@@ -4087,6 +4166,11 @@ mod tests {
                 assert!(app.steering_queue.is_empty());
                 assert_eq!(app.restart_after_cancel, Some(vec!["steer".into()]));
                 assert_eq!(app.next_turn_queue, VecDeque::from(["later".into()]));
+                assert!(
+                    app.transcript
+                        .iter()
+                        .any(|entry| entry == &("you".into(), "steer".into()))
+                );
 
                 app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
                 assert!(app.next_turn_queue.is_empty());
@@ -4094,8 +4178,48 @@ mod tests {
 
                 app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
                 assert_eq!(app.restart_after_cancel, None);
+                assert!(
+                    !app.transcript
+                        .iter()
+                        .any(|entry| entry == &("you".into(), "steer".into()))
+                );
             })
             .await;
+    }
+
+    #[tokio::test]
+    async fn escape_displays_preserved_steering_before_cancellation_finishes() {
+        let mut app = app();
+        app.handle = Some(phi_runtime::start(app.options.clone(), "work".into()));
+        app.steering_queue.push_back("steer now".into());
+
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(app.status, "cancelling");
+        assert_eq!(app.restart_after_cancel, Some(vec!["steer now".into()]));
+        assert_eq!(
+            app.transcript
+                .iter()
+                .filter(|entry| entry == &&("you".into(), "steer now".into()))
+                .count(),
+            1
+        );
+
+        app.on_runtime(RuntimeEvent::QueuedMessagesInjected {
+            contents: vec!["steer now".into()],
+        });
+        app.on_runtime(RuntimeEvent::Error {
+            message: "cancelled".into(),
+        });
+
+        assert_eq!(
+            app.transcript
+                .iter()
+                .filter(|entry| entry == &&("you".into(), "steer now".into()))
+                .count(),
+            1
+        );
+        app.handle.as_ref().unwrap().cancel();
     }
 
     #[test]

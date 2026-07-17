@@ -1233,28 +1233,67 @@ fn start_events(options: RunOptions, initial_events: Vec<Event>) -> Handle {
     let (steering_tx, steering_rx) = mpsc::unbounded_channel();
     let cancellation = CancellationToken::new();
     let run_cancellation = cancellation.clone();
-    tokio::task::spawn_local(async move {
-        if let Err(error) = run(
-            options,
-            initial_events,
-            &event_tx,
-            command_rx,
-            steering_rx,
-            &run_cancellation,
-        )
-        .await
-        {
-            let _ = event_tx.send(RuntimeEvent::Error {
-                message: runtime_error(&error),
+    runtime_worker()
+        .tasks
+        .send(Box::new(move |local| {
+            local.spawn_local(async move {
+                if let Err(error) = run(
+                    options,
+                    initial_events,
+                    &event_tx,
+                    command_rx,
+                    steering_rx,
+                    &run_cancellation,
+                )
+                .await
+                {
+                    let _ = event_tx.send(RuntimeEvent::Error {
+                        message: runtime_error(&error),
+                    });
+                }
             });
-        }
-    });
+        }))
+        .expect("runtime worker stopped");
     Handle {
         events: event_rx,
         commands: command_tx,
         steering: steering_tx,
         cancellation,
     }
+}
+
+type RuntimeTask = Box<dyn FnOnce(&tokio::task::LocalSet) + Send>;
+
+struct RuntimeWorker {
+    tasks: mpsc::UnboundedSender<RuntimeTask>,
+}
+
+fn runtime_worker() -> &'static RuntimeWorker {
+    static WORKER: std::sync::OnceLock<RuntimeWorker> = std::sync::OnceLock::new();
+    WORKER.get_or_init(|| {
+        let (tasks, mut pending) = mpsc::unbounded_channel::<RuntimeTask>();
+        spawn_worker("phi-runtime", move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build runtime worker");
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&runtime, async {
+                while let Some(task) = pending.recv().await {
+                    task(&local);
+                }
+            });
+        })
+        .expect("failed to spawn runtime worker");
+        RuntimeWorker { tasks }
+    })
+}
+
+fn spawn_worker(
+    name: &str,
+    task: impl FnOnce() + Send + 'static,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new().name(name.into()).spawn(task)
 }
 
 #[allow(clippy::while_let_loop)] // The final non-queue effect must remain available for dispatch.
@@ -2644,9 +2683,25 @@ fn snapshot_content<'a>(
 mod tests {
     use super::*;
     use std::{
-        sync::{Condvar, Mutex},
+        sync::{Condvar, Mutex, mpsc as std_mpsc},
         time::Duration,
     };
+
+    #[test]
+    fn runtime_worker_does_not_block_the_caller_during_synchronous_setup() {
+        let (started_tx, started_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let worker = spawn_worker("phi-runtime-test", move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        })
+        .unwrap();
+
+        started_rx.recv().unwrap();
+        assert!(!worker.is_finished());
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+    }
 
     #[test]
     fn emits_independent_display_events_for_context_tool_messages() {
