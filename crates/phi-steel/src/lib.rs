@@ -640,7 +640,7 @@ mod tests {
                 if url.ends_with("/responses")
                     && body["model"] == "gpt-5.6-luna"
                     && body["reasoning"]["effort"] == "low"
-                    && body["reasoning"]["summary"] == "concise"
+                    && body["reasoning"]["summary"] == "auto"
                     && body["prompt_cache_key"] == ""
                     && body["tools"].as_array().unwrap().iter()
                         .any(|tool| tool["type"] == "web_search")

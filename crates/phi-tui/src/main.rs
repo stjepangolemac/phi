@@ -2069,32 +2069,26 @@ fn push_message(lines: &mut Vec<Line<'static>>, role: &str, content: &str, width
 }
 
 fn push_reasoning_summary(lines: &mut Vec<Line<'static>>, content: &str, width: usize) {
-    let label_style = Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::BOLD | Modifier::ITALIC);
+    if content.trim().is_empty() {
+        return;
+    }
     let content_style = Style::default()
         .fg(Color::Gray)
         .add_modifier(Modifier::ITALIC);
-    lines.push(Line::styled(
-        truncate_width("• Provider reasoning summary", width),
-        label_style,
-    ));
-    if !content.trim().is_empty() {
-        push_markdown_content(
-            lines,
-            content,
-            width,
-            MarkdownBlockStyle {
-                normal: Color::Gray,
-                strong: Color::Gray,
-                block: Style::default(),
-                base: content_style,
-                marker: "  ",
-                code_inset: 0,
-                vertical_inset: 0,
-            },
-        );
-    }
+    push_markdown_content(
+        lines,
+        content,
+        width,
+        MarkdownBlockStyle {
+            normal: Color::Gray,
+            strong: Color::Gray,
+            block: Style::default(),
+            base: content_style,
+            marker: "  ",
+            code_inset: 0,
+            vertical_inset: 0,
+        },
+    );
 }
 
 fn activity_indicator(state: &ThrobberState, label: &str, width: usize) -> Line<'static> {
@@ -3460,11 +3454,56 @@ mod tests {
             ]
         );
         assert_eq!(app.transcript[3], ("phi".into(), "Final answer".into()));
-        let rendered = transcript_text(&mut app, 48).to_string();
-        assert!(rendered.contains("Provider reasoning summary"));
+        let lines = transcript_text(&mut app, 48).lines;
+        assert_eq!(lines[0].to_string().trim_end(), "  Checked the request.");
+        let rendered = lines.iter().map(Line::to_string).collect::<String>();
+        assert!(!rendered.contains("Provider reasoning summary"));
         assert!(rendered.contains("Checked the request."));
         assert!(!rendered.contains("**"));
         assert_eq!(rendered.matches("Final answer").count(), 1);
+    }
+
+    #[test]
+    fn streamed_reasoning_matches_finalized_cached_rendering() {
+        let mut streamed = app();
+        streamed.on_runtime(RuntimeEvent::ReasoningSummaryDelta {
+            content: "Checked **the ".into(),
+        });
+        let partial = transcript_text(&mut streamed, 18).lines;
+        assert!(partial[0].to_string().starts_with("  Checked"));
+        assert!(
+            !partial
+                .iter()
+                .any(|line| line.to_string().contains("Provider"))
+        );
+
+        streamed.on_runtime(RuntimeEvent::ReasoningSummaryDelta {
+            content: "request** carefully.".into(),
+        });
+        streamed.on_runtime(RuntimeEvent::ModelDelta {
+            content: "Final answer".into(),
+        });
+        let live = transcript_text(&mut streamed, 18).lines;
+
+        let mut cached = app();
+        cached.push_transcript("reasoning_summary", "Checked **the request** carefully.");
+        cached.current_model = "Final answer".into();
+        cached.current_model_changed();
+        let finalized = transcript_text(&mut cached, 18).lines;
+
+        assert_eq!(live, finalized);
+        assert_eq!(streamed.transcript_offsets, cached.transcript_offsets);
+        assert_eq!(streamed.transcript_offsets, [2]);
+        assert_eq!(
+            trimmed(&live),
+            [
+                "  Checked the requ",
+                "  est carefully.",
+                "",
+                "• Final answer",
+                ""
+            ]
+        );
     }
 
     #[test]
@@ -4047,18 +4086,7 @@ mod tests {
         let cached = trimmed(&transcript_text(&mut app, 20).lines);
 
         assert_eq!(streaming, cached);
-        assert_eq!(
-            cached,
-            [
-                "• Provider reasonin…",
-                "  because",
-                "",
-                "• before",
-                "",
-                "  answer",
-                ""
-            ]
-        );
+        assert_eq!(cached, ["  because", "", "• before", "", "  answer", ""]);
     }
 
     #[test]
@@ -4076,7 +4104,8 @@ mod tests {
             .map(Line::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("Provider reasoning summary"));
+        assert!(lines[0].to_string().starts_with("  plain "));
+        assert!(!rendered.contains("Provider reasoning summary"));
         assert!(!rendered.contains("**"));
         assert!(!rendered.contains("*italic*"));
         assert!(!rendered.contains("`inline`"));
@@ -4123,6 +4152,28 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_summary_plain_text_is_the_first_rendered_line() {
+        let mut lines = Vec::new();
+        push_message(
+            &mut lines,
+            "reasoning_summary",
+            "First paragraph\n\nSecond paragraph",
+            40,
+        );
+
+        assert_eq!(
+            trimmed(&lines),
+            ["  First paragraph", "", "  Second paragraph"]
+        );
+        assert!(lines[0].to_string().contains("First paragraph"));
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.to_string().contains("Provider"))
+        );
+    }
+
+    #[test]
     fn wraps_formatted_reasoning_without_losing_styles() {
         let mut lines = Vec::new();
         push_message(
@@ -4132,15 +4183,14 @@ mod tests {
             18,
         );
 
-        let content = &lines[1..];
-        assert!(content.len() > 1);
+        assert!(lines.len() > 1);
         assert!(
-            content
+            lines
                 .iter()
                 .all(|line| UnicodeWidthStr::width(line.to_string().as_str()) == 18)
         );
         assert!(
-            content
+            lines
                 .iter()
                 .flat_map(|line| line.spans.iter())
                 .filter(|span| !span.content.trim().is_empty())
@@ -4152,19 +4202,24 @@ mod tests {
     }
 
     #[test]
-    fn whitespace_only_reasoning_summary_keeps_a_well_formed_labeled_block() {
-        let mut lines = Vec::new();
-        push_message(&mut lines, "reasoning_summary", " \n\t", 40);
+    fn empty_reasoning_summaries_render_no_orphan_block() {
+        for content in ["", " ", " \n\t"] {
+            let mut lines = Vec::new();
+            push_message(&mut lines, "reasoning_summary", content, 40);
+            assert!(lines.is_empty(), "rendering {content:?}");
+        }
 
-        assert_eq!(lines.len(), 1);
+        let mut with_empty = app();
+        with_empty.push_transcript("you", "question");
+        with_empty.push_transcript("reasoning_summary", " \n\t");
+        with_empty.push_transcript("tool", "tool");
+        let mut without_empty = app();
+        without_empty.push_transcript("you", "question");
+        without_empty.push_transcript("tool", "tool");
         assert_eq!(
-            lines
-                .iter()
-                .filter(|line| line.to_string().contains("Provider reasoning summary"))
-                .count(),
-            1
+            transcript_text(&mut with_empty, 40).lines,
+            transcript_text(&mut without_empty, 40).lines
         );
-        assert!(lines.iter().all(|line| line.to_string().len() <= 40));
     }
 
     #[test]
@@ -5166,12 +5221,7 @@ mod tests {
         push_message(&mut reasoning, "reasoning_summary", content, 18);
         assert_eq!(
             trimmed(&reasoning),
-            [
-                "• Provider reason…",
-                "  - an item that w",
-                "    raps across li",
-                "    nes",
-            ]
+            ["  - an item that w", "    raps across li", "    nes"]
         );
 
         let mut app = app();
