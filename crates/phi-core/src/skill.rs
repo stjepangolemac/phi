@@ -26,6 +26,12 @@ pub struct SkillCatalog {
     resource_roots: BTreeMap<String, PathBuf>,
 }
 
+#[derive(Clone, Debug)]
+pub struct PluginSkillSource {
+    pub plugin: String,
+    pub root: PathBuf,
+}
+
 impl SkillCatalog {
     pub fn resource_roots(&self) -> BTreeMap<String, PathBuf> {
         self.resource_roots.clone()
@@ -36,9 +42,9 @@ pub fn discover(
     system_root: &Path,
     personal_root: &Path,
     workspace: &Path,
-    plugin_roots: &[PathBuf],
+    plugin_sources: &[PluginSkillSource],
 ) -> Result<SkillCatalog> {
-    let skills = index(system_root, personal_root, workspace, plugin_roots)?;
+    let skills = index(system_root, personal_root, workspace, plugin_sources)?;
     let resource_roots = skills
         .iter()
         .map(|(name, skill)| (resource_prefix(name), skill.root.clone()))
@@ -58,30 +64,85 @@ fn index(
     system_root: &Path,
     personal_root: &Path,
     workspace: &Path,
-    plugin_roots: &[PathBuf],
+    plugin_sources: &[PluginSkillSource],
 ) -> Result<BTreeMap<String, Skill>> {
     let mut skills = BTreeMap::new();
-    for root in plugin_roots {
-        add_skill(&mut skills, root)?;
-    }
+    add_plugin_skills(&mut skills, plugin_sources)?;
     add_root(&mut skills, personal_root)?;
     add_root(&mut skills, &workspace.join(".phi/skills"))?;
     add_root(&mut skills, system_root)?;
     Ok(skills)
 }
 
-fn add_skill(skills: &mut BTreeMap<String, Skill>, root: &Path) -> Result<()> {
-    let root = fs::canonicalize(root)?;
-    let source = root.join("SKILL.md");
-    if !source.is_file() {
-        bail!("registered skill is missing SKILL.md: {}", root.display());
+fn add_plugin_skills(
+    skills: &mut BTreeMap<String, Skill>,
+    plugins: &[PluginSkillSource],
+) -> Result<()> {
+    let mut owners = BTreeMap::<String, String>::new();
+    for plugin in plugins {
+        let package = fs::canonicalize(&plugin.root)
+            .with_context(|| format!("resolve installed plugin package: {}", plugin.plugin))?;
+        let skills_root = package.join("skills");
+        let metadata = match fs::symlink_metadata(&skills_root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            bail!("plugin skills path is invalid: {}", plugin.plugin);
+        }
+        for entry in fs::read_dir(&skills_root)? {
+            let entry = entry?;
+            let path = entry.path();
+            let kind = entry.file_type()?;
+            if !kind.is_dir() || kind.is_symlink() {
+                bail!(
+                    "plugin skill path is invalid: {}/{}",
+                    plugin.plugin,
+                    entry.file_name().to_string_lossy()
+                );
+            }
+            let root = fs::canonicalize(&path)?;
+            if !root.starts_with(&skills_root) || !root.starts_with(&package) {
+                bail!(
+                    "plugin skill escapes its package: {}/{}",
+                    plugin.plugin,
+                    entry.file_name().to_string_lossy()
+                );
+            }
+            let source = root.join("SKILL.md");
+            let source_metadata = fs::symlink_metadata(&source).with_context(|| {
+                format!(
+                    "plugin skill is missing SKILL.md: {}/{}",
+                    plugin.plugin,
+                    entry.file_name().to_string_lossy()
+                )
+            })?;
+            if !source_metadata.is_file() || source_metadata.file_type().is_symlink() {
+                bail!(
+                    "plugin skill has invalid SKILL.md: {}/{}",
+                    plugin.plugin,
+                    entry.file_name().to_string_lossy()
+                );
+            }
+            let spec = parse_metadata(&fs::read_to_string(&source)?).with_context(|| {
+                format!(
+                    "read plugin skill metadata from {}/{}",
+                    plugin.plugin,
+                    entry.file_name().to_string_lossy()
+                )
+            })?;
+            if let Some(previous) = owners.insert(spec.name.clone(), plugin.plugin.clone()) {
+                bail!(
+                    "duplicate installed plugin skill '{}': plugins '{}' and '{}'",
+                    spec.name,
+                    previous,
+                    plugin.plugin
+                );
+            }
+            skills.insert(spec.name.clone(), Skill { spec, root });
+        }
     }
-    let spec = parse_metadata(&fs::read_to_string(&source)?)
-        .with_context(|| format!("read skill metadata from {}", source.display()))?;
-    if skills.contains_key(&spec.name) {
-        bail!("duplicate registered plugin skill: {}", spec.name);
-    }
-    skills.insert(spec.name.clone(), Skill { spec, root });
     Ok(())
 }
 
@@ -206,6 +267,17 @@ mod tests {
         fs::write(root.join("references/details.md"), "Details.").unwrap();
     }
 
+    fn plugin(root: &Path, plugin: &str, skill_name: &str, description: &str) -> PluginSkillSource {
+        let root = root.join(plugin);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("plugin.scm"), "").unwrap();
+        skill(&root.join("skills"), skill_name, skill_name, description);
+        PluginSkillSource {
+            plugin: plugin.into(),
+            root,
+        }
+    }
+
     #[test]
     fn workspace_skills_override_personal_skills() {
         let temp = tempfile::tempdir().unwrap();
@@ -272,13 +344,12 @@ mod tests {
     }
 
     #[test]
-    fn personal_skills_override_registered_plugin_skills() {
+    fn personal_skills_override_installed_plugin_skills() {
         let temp = tempfile::tempdir().unwrap();
-        let plugin = temp.path().join("plugin-skill");
+        let plugin = plugin(temp.path(), "plugin-package", "review", "Plugin review.");
         let personal = temp.path().join("personal");
         let system = temp.path().join("system");
         let workspace = temp.path().join("workspace");
-        skill(temp.path(), "plugin-skill", "review", "Plugin review.");
         skill(&personal, "review", "review", "Personal review.");
 
         assert_eq!(
@@ -315,7 +386,7 @@ mod tests {
         let system = temp.path().join("system");
         let personal = temp.path().join("personal");
         let workspace = temp.path().join("workspace");
-        let plugin = temp.path().join("plugin-skill");
+        let plugin = plugin(temp.path(), "plugin-package", "plugin", "Plugin skill.");
         skill(&system, "system", "system", "System skill.");
         skill(
             &workspace.join(".phi/skills"),
@@ -324,8 +395,6 @@ mod tests {
             "Workspace skill.",
         );
         skill(&personal, "personal", "personal", "Personal skill.");
-        skill(temp.path(), "plugin-skill", "plugin", "Plugin skill.");
-
         let catalog = discover(&system, &personal, &workspace, &[plugin]).unwrap();
         assert_eq!(
             catalog
@@ -362,6 +431,102 @@ mod tests {
                 .unwrap();
             assert_eq!(reference["content"], "Details.");
         }
+    }
+
+    #[test]
+    fn duplicate_installed_plugin_skills_report_both_plugins() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = plugin(temp.path(), "first-plugin", "review", "First.");
+        let second = plugin(temp.path(), "second-plugin", "review", "Second.");
+
+        let error = discover(
+            &temp.path().join("system"),
+            &temp.path().join("personal"),
+            &temp.path().join("workspace"),
+            &[first, second],
+        )
+        .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("duplicate installed plugin skill 'review'"));
+        assert!(message.contains("first-plugin"));
+        assert!(message.contains("second-plugin"));
+    }
+
+    #[test]
+    fn installed_plugin_skill_requires_valid_skill_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("example");
+        fs::create_dir_all(root.join("skills/review")).unwrap();
+        fs::write(root.join("plugin.scm"), "").unwrap();
+        let source = PluginSkillSource {
+            plugin: "example".into(),
+            root,
+        };
+
+        let error = discover(
+            &temp.path().join("system"),
+            &temp.path().join("personal"),
+            &temp.path().join("workspace"),
+            &[source],
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("plugin skill is missing SKILL.md")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_plugin_skill_rejects_escaping_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("example");
+        fs::create_dir_all(root.join("skills")).unwrap();
+        fs::write(root.join("plugin.scm"), "").unwrap();
+        skill(temp.path(), "outside", "outside", "Outside.");
+        symlink(temp.path().join("outside"), root.join("skills/outside")).unwrap();
+        let source = PluginSkillSource {
+            plugin: "example".into(),
+            root,
+        };
+
+        let error = discover(
+            &temp.path().join("system"),
+            &temp.path().join("personal"),
+            &temp.path().join("workspace"),
+            &[source],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("plugin skill path is invalid"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_plugin_rejects_dangling_skills_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("example");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("plugin.scm"), "").unwrap();
+        symlink(root.join("missing"), root.join("skills")).unwrap();
+
+        let error = discover(
+            &temp.path().join("system"),
+            &temp.path().join("personal"),
+            &temp.path().join("workspace"),
+            &[PluginSkillSource {
+                plugin: "example".into(),
+                root,
+            }],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("plugin skills path is invalid"));
     }
 
     #[test]

@@ -860,8 +860,8 @@ mod tests {
         let status = StdCommand::new("node")
             .args([
                 "--test",
-                "policy/tools/dynamic-workflows/runner/worktrees.test.mjs",
-                "policy/tools/dynamic-workflows/runner/workflow-runner.test.mjs",
+                "plugins/dynamic-workflows/runner/worktrees.test.mjs",
+                "plugins/dynamic-workflows/runner/workflow-runner.test.mjs",
             ])
             .current_dir(root)
             .status()
@@ -897,7 +897,7 @@ mod tests {
         let mut plugins = HashMap::new();
         plugins.insert(
             "dynamic-workflows".into(),
-            root.join("policy/tools/dynamic-workflows"),
+            root.join("plugins/dynamic-workflows"),
         );
         let tasks = WorkflowTasks::default();
         let launched = tasks
@@ -962,7 +962,7 @@ mod tests {
         let mut plugins = HashMap::new();
         plugins.insert(
             "dynamic-workflows".into(),
-            root.join("policy/tools/dynamic-workflows"),
+            root.join("plugins/dynamic-workflows"),
         );
         let tasks = WorkflowTasks::default();
         let launched = tasks

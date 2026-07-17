@@ -372,7 +372,7 @@ mod tests {
         let mut lines = Vec::new();
         push(
             &mut lines,
-            "Updated `/tmp/main.scm` · 1s\n\n--- /tmp/main.scm\n+++ /tmp/main.scm\n@@ -1,2 +1,2 @@\n-old\n+new\n ",
+            "Updated `/tmp/example.scm` · 1s\n\n--- /tmp/example.scm\n+++ /tmp/example.scm\n@@ -1,2 +1,2 @@\n-old\n+new\n ",
             40,
         );
 

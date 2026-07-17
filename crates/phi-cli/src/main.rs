@@ -63,6 +63,7 @@ enum Command {
 #[derive(Subcommand)]
 enum PluginCommand {
     Install {
+        name: String,
         url: String,
         #[arg(long)]
         rev: String,
@@ -295,15 +296,21 @@ fn approval_settings(cli: &Cli) -> (bool, bool, bool) {
 
 fn plugin(home: &phi_core::home::PhiHome, command: PluginCommand) -> Result<()> {
     match command {
-        PluginCommand::Install { url, rev, path } => {
-            let locked = phi_core::plugin::install(home, &url, &rev, &path)?;
+        PluginCommand::Install {
+            name,
+            url,
+            rev,
+            path,
+        } => {
+            let locked = phi_core::plugin::install(home, &name, &url, &rev, &path)?;
             let installed = phi_core::plugin::installed(home, &locked.name)?;
-            phi_steel::check_plugin(&installed.root.join(installed.manifest.entrypoint))?;
+            phi_steel::check_plugin(&installed.entrypoint)?;
             println!("installed {} {}", locked.name, locked.commit);
         }
         PluginCommand::Update { name, rev } => {
             let current = phi_core::plugin::installed(home, &name)?.locked;
-            let locked = phi_core::plugin::install(home, &current.url, &rev, &current.path)?;
+            let locked =
+                phi_core::plugin::install(home, &current.name, &current.url, &rev, &current.path)?;
             println!("updated {} {}", locked.name, locked.commit);
         }
         PluginCommand::Remove { name } => {
@@ -314,12 +321,9 @@ fn plugin(home: &phi_core::home::PhiHome, command: PluginCommand) -> Result<()> 
             let lock = phi_core::plugin::read_lock(home)?;
             for plugin in phi_core::plugin::official_catalog()?.plugins {
                 if let Some(locked) = lock.plugins.iter().find(|item| item.name == plugin.name) {
-                    let version = phi_core::plugin::installed(home, &plugin.name)?
-                        .manifest
-                        .version;
-                    println!("{} {} installed {}", plugin.name, version, locked.commit);
+                    println!("{} installed {}", plugin.name, locked.commit);
                 } else {
-                    println!("{} {} bundled", plugin.name, plugin.version);
+                    println!("{} bundled", plugin.name);
                 }
             }
             let official = phi_core::plugin::official_catalog()?;
@@ -333,14 +337,20 @@ fn plugin(home: &phi_core::home::PhiHome, command: PluginCommand) -> Result<()> 
         }
         PluginCommand::Check { name } => {
             let plugin = phi_core::plugin::installed(home, &name)?;
-            phi_steel::check_plugin(&plugin.root.join(plugin.manifest.entrypoint))?;
+            phi_steel::check_plugin(&plugin.entrypoint)?;
             println!("{name} ok");
         }
         PluginCommand::Sync => {
             let plugins = phi_core::plugin::read_lock(home)?.plugins;
             for plugin in plugins {
                 if !phi_core::plugin::install_root(home, &plugin.name, &plugin.commit).is_dir() {
-                    phi_core::plugin::install(home, &plugin.url, &plugin.commit, &plugin.path)?;
+                    phi_core::plugin::install(
+                        home,
+                        &plugin.name,
+                        &plugin.url,
+                        &plugin.commit,
+                        &plugin.path,
+                    )?;
                 }
             }
             println!("plugins synced");
@@ -422,6 +432,44 @@ fn print_status(status: &phi_runtime::HarnessStatus) {
             "  {} · {} · {}",
             plugin.name, plugin.source, plugin.revision
         );
+    }
+}
+
+#[cfg(test)]
+mod plugin_cli_tests {
+    use super::*;
+
+    #[test]
+    fn plugin_install_requires_an_explicit_name() {
+        assert!(
+            Cli::try_parse_from([
+                "phi",
+                "plugin",
+                "install",
+                "https://example.invalid/plugin.git",
+                "--rev",
+                "main",
+            ])
+            .is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "phi",
+            "plugin",
+            "install",
+            "example",
+            "https://example.invalid/plugin.git",
+            "--rev",
+            "main",
+            "--path",
+            "plugins/example",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Plugin {
+                command: PluginCommand::Install { name, path, .. }
+            }) if name == "example" && path == "plugins/example"
+        ));
     }
 }
 

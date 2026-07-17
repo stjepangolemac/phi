@@ -46,4 +46,3 @@
 (register-tool! workflow-tool)
 (register-tool! task-output-tool)
 (register-tool! task-stop-tool)
-(register-skill! (hash 'path "skills/dynamic-workflows"))
