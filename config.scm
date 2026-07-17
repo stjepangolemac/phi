@@ -6,12 +6,134 @@
 (define next-context-summary 1)
 (define pending-context (hash))
 (define pending-context-calls '())
-(define context-reservations '())
+(define context-jobs '())
+(define next-context-job 1)
 (define context-pressure-thresholds (list 25 50 75))
 (define next-context-notification 25)
 
+(define (context-terminal-status? status)
+  (or (equal? status "applied") (equal? status "failed")
+      (equal? status "cancelled") (equal? status "stale")))
+
+(define (context-job-find jobs id)
+  (cond
+    [(null? jobs) #f]
+    [(equal? (hash-ref (car jobs) 'id) id) (car jobs)]
+    [else (context-job-find (cdr jobs) id)]))
+
+(define (context-job-replace jobs id replacement)
+  (cond
+    [(null? jobs) '()]
+    [(equal? (hash-ref (car jobs) 'id) id)
+     (cons replacement (cdr jobs))]
+    [else (cons (car jobs) (context-job-replace (cdr jobs) id replacement))]))
+
+(define (context-job-update-status id status error)
+  (define job (context-job-find context-jobs id))
+  (if job
+      (set! context-jobs
+            (context-job-replace
+              context-jobs id
+              (hash-insert (hash-insert job 'status status) 'error error)))))
+
+(define (context-job-public job)
+  (hash 'id (hash-ref job 'id)
+        'items (hash-ref job 'items)
+        'label (hash-ref job 'label)
+        'status (hash-ref job 'status)
+        'error (or (hash-try-get job 'error) "")))
+
+(define (context-jobs-public jobs)
+  (if (null? jobs) '()
+      (cons (context-job-public (car jobs))
+            (context-jobs-public (cdr jobs)))))
+
+(define (context-pending-job? job)
+  (not (context-terminal-status? (hash-ref job 'status))))
+
+(define (context-pending-job-ids jobs)
+  (cond
+    [(null? jobs) '()]
+    [(context-pending-job? (car jobs))
+     (cons (hash-ref (car jobs) 'id)
+           (context-pending-job-ids (cdr jobs)))]
+    [else (context-pending-job-ids (cdr jobs))]))
+
+(define (context-any-selected? ids selected)
+  (cond
+    [(null? ids) #f]
+    [(string-member? (car ids) selected) #t]
+    [else (context-any-selected? (cdr ids) selected)]))
+
+(define (context-reserved-item-ids jobs)
+  (cond
+    [(null? jobs) '()]
+    [(context-pending-job? (car jobs))
+     (append (hash-ref (car jobs) 'items)
+             (context-reserved-item-ids (cdr jobs)))]
+    [else (context-reserved-item-ids (cdr jobs))]))
+
+(define (context-selection-reserved? ids jobs)
+  (cond
+    [(null? jobs) #f]
+    [(and (context-pending-job? (car jobs))
+          (context-any-selected? ids (hash-ref (car jobs) 'items))) #t]
+    [else (context-selection-reserved? ids (cdr jobs))]))
+
+(define (context-compatible-selection items ids snapshot)
+  (define (find remaining)
+    (cond [(null? remaining) #f]
+          [(equal? (hash-ref (car remaining) 'id) (car ids)) remaining]
+          [else (find (cdr remaining))]))
+  (define (take remaining wanted selected)
+    (cond
+      [(null? wanted) (reverse selected)]
+      [(or (null? remaining)
+           (not (equal? (hash-ref (car remaining) 'id) (car wanted)))) #f]
+      [else (take (cdr remaining) (cdr wanted) (cons (car remaining) selected))]))
+  (define remaining (if (null? ids) #f (find items)))
+  (if remaining
+      (let ([selected (take remaining ids '())])
+        (if (and selected (equal? selected snapshot)) selected #f))
+      #f))
+
+(define (context-cancel-pending! reason)
+  (define ids (context-pending-job-ids context-jobs))
+  (define (cancel jobs)
+    (if (null? jobs) '()
+        (cons (if (context-pending-job? (car jobs))
+                  (hash-insert
+                    (hash-insert (car jobs) 'status "cancelled")
+                    'error reason)
+                  (car jobs))
+              (cancel (cdr jobs)))))
+  (set! context-jobs (cancel context-jobs))
+  ids)
+
+(define (context-wait-result ids)
+  (map (lambda (id) (context-job-public (context-job-find context-jobs id))) ids))
+
+(define (context-queue-effect job request next)
+  (hash 'type "queue_context_compaction"
+        'job_id (hash-ref job 'id)
+        'url (hash-ref request 'url)
+        'secret (hash-ref request 'secret)
+        'headers (hash-ref request 'headers)
+        'body (hash-ref request 'body)
+        'timeout_ms (hash-ref request 'timeout_ms)
+        'stream (or (hash-try-get request 'stream) '())
+        'next next))
+
+(define (context-resume-effect activity messages usage model reasoning service-tier)
+  (if (equal? activity "working")
+      (request-effect messages usage model reasoning service-tier)
+      (hash 'type "continue")))
+
 (define (init encoded-config)
   (set! next-context-notification 25)
+  (set! pending-context-calls '())
+  (set! context-jobs '())
+  (set! next-context-job 1)
   (define config (string->jsexpr encoded-config))
   (define model (or (hash-try-get config 'model) ""))
   (define context-budget
@@ -63,8 +185,8 @@
   (set! pending-context (or (hash-try-get state 'pending_context) (hash)))
   (set! pending-context-calls
         (or (hash-try-get state 'pending_context_calls) '()))
-  (set! context-reservations
-        (or (hash-try-get state 'context_reservations) '()))
+  (set! context-jobs (or (hash-try-get state 'context_jobs) '()))
+  (set! next-context-job (or (hash-try-get state 'next_context_job) 1))
   (set! next-context-notification
         (or (hash-try-get state 'next_context_notification) 25))
   (define compactions (hash-ref state 'compactions))
@@ -100,8 +222,10 @@
          [(equal? name "context_inspect")
           (append-context-result!
             call
-            (context-inspection active-context-items messages last-usage
-                                context-budget))
+            (hash-insert
+              (context-inspection active-context-items messages last-usage
+                                  context-budget)
+              'jobs (context-jobs-public context-jobs)))
           (continue-context-calls)]
          [(equal? name "context_mark")
           (define outcome
@@ -127,6 +251,49 @@
                         (hash-ref outcome 'label) (hash-ref call 'call_id)))
                 (set! next-context-span (+ next-context-span 1))))
           (continue-context-calls)]
+         [(equal? name "context_wait")
+          (define outcome
+            (with-handler
+              (lambda (error) (hash 'error (to-string error)))
+              (let* ([arguments (provider-arguments-for model call)]
+                     [requested
+                       (or (hash-try-get arguments 'job_ids)
+                           (context-pending-job-ids context-jobs))])
+                (define (unknown ids)
+                  (cond [(null? ids) #f]
+                        [(not (context-job-find context-jobs (car ids))) (car ids)]
+                        [else (unknown (cdr ids))]))
+                (define unknown-id (unknown requested))
+                (if unknown-id
+                    (hash 'error
+                          (string-append "unknown context compaction job: " unknown-id))
+                    (hash 'requested requested)))))
+          (define error (hash-try-get outcome 'error))
+          (if error
+              (begin
+                (append-context-result! call (hash 'error error))
+                (continue-context-calls))
+              (let ([requested (hash-ref outcome 'requested)])
+                (define (collect-pending ids)
+                  (cond
+                    [(null? ids) '()]
+                    [(context-pending-job?
+                       (context-job-find context-jobs (car ids)))
+                     (cons (car ids) (collect-pending (cdr ids)))]
+                    [else (collect-pending (cdr ids))]))
+                (if (null? (collect-pending requested))
+                    (begin
+                      (append-context-result!
+                        call (hash 'jobs (context-wait-result requested)))
+                      (continue-context-calls))
+                    (begin
+                      (set! next-state
+                            (make-state messages compactions last-usage context-budget
+                                        model reasoning service-tier
+                                        "waiting_context" "" 0))
+                      (hash 'type "wait_for_context_compactions"
+                            'call_id (hash-ref call 'call_id)
+                            'job_ids requested)))))]
          [else
           (define outcome
             (with-handler
@@ -134,8 +301,9 @@
               (let* ([arguments (provider-arguments-for model call)]
                      [ids (hash-ref arguments 'items)]
                      [validation
-                      (context-validated-selection
-                        active-context-items ids context-reservations)]
+                       (context-validated-selection
+                         active-context-items ids
+                         (context-reserved-item-ids context-jobs))]
                      [error (hash-try-get validation 'error)])
                 (if error
                     (hash 'error error)
@@ -148,19 +316,25 @@
                 (append-context-result! call (hash 'error error))
                 (continue-context-calls))
               (begin
-                (define ids (hash-ref outcome 'ids))
-                (set! context-reservations (append context-reservations ids))
-                (set! pending-context
-                      (hash 'call_id (hash-ref call 'call_id)
-                            'items ids
-                            'label (hash-ref outcome 'label)))
+                (define job-id (context-runtime-id "J" next-context-job))
+                (define job
+                  (hash 'id job-id 'items (hash-ref outcome 'ids)
+                        'label (hash-ref outcome 'label)
+                        'status "queued" 'error "" 'attempt 0
+                        'snapshot (hash-ref outcome 'selected)))
+                (set! next-context-job (+ next-context-job 1))
+                (set! context-jobs (append context-jobs (list job)))
+                (append-context-result!
+                  call (hash 'job_id job-id 'status "queued"))
                 (set! next-state
                       (make-state messages compactions last-usage context-budget
-                                  model reasoning service-tier
-                                  "selective_compacting" "" 0))
-                (start-context-summary
-                  (context-selected-messages (hash-ref outcome 'selected))
-                  model reasoning service-tier)))])]
+                                  model reasoning service-tier "working" "" 0))
+                (context-queue-effect
+                  job
+                  (start-context-summary
+                    (context-selected-messages (hash-ref outcome 'selected))
+                    model reasoning service-tier)
+                  (continue-context-calls))))])]
       [else
        (define calls
          (context-leading-ordinary-calls pending-context-calls))
@@ -186,11 +360,13 @@
       [(equal? event-type "compact_requested")
        (if (null? messages)
            (begin
+             (context-cancel-pending! "superseded by full compaction")
              (set! next-state
                    (make-state messages compactions last-usage context-budget
                                model reasoning service-tier "ready" "" 0))
              (hash 'type "finish" 'content "Nothing to compact."))
            (begin
+             (context-cancel-pending! "superseded by full compaction")
              (set! next-state
                    (make-state messages compactions last-usage context-budget
                                model reasoning service-tier "compacting"
@@ -210,6 +386,126 @@
        (hash 'type "finish" 'content
              (string-append "Model set to " model " " reasoning
                             " " service-tier))]
+      [(equal? event-type "context_compaction_started")
+       (define job-id (hash-ref event 'job_id))
+       (define job (context-job-find context-jobs job-id))
+       (if (and job (not (context-terminal-status? (hash-ref job 'status))))
+           (context-job-update-status job-id "running" ""))
+       (set! next-state
+             (make-state messages compactions last-usage context-budget
+                         model reasoning service-tier activity pending-finish
+                         compaction-attempt))
+       (hash 'type "continue")]
+      [(equal? event-type "context_compaction_completed")
+       (define job-id (hash-ref event 'job_id))
+       (define job (context-job-find context-jobs job-id))
+       (cond
+         [(or (not job) (context-terminal-status? (hash-ref job 'status)))
+          (set! next-state
+                (make-state messages compactions last-usage context-budget
+                            model reasoning service-tier activity pending-finish
+                            compaction-attempt))
+          (context-resume-effect activity messages last-usage model reasoning service-tier)]
+         [(not (hash-ref event 'success))
+          (context-job-update-status job-id "failed" (hash-ref event 'error))
+          (set! next-state
+                (make-state messages compactions last-usage context-budget
+                            model reasoning service-tier activity pending-finish
+                            compaction-attempt))
+          (context-resume-effect activity messages last-usage model reasoning service-tier)]
+         [else
+          (define summary-text
+            (complete-context-summary (hash-ref event 'events) model))
+          (define attempt (or (hash-try-get job 'attempt) 0))
+          (if (equal? summary-text "")
+              (if (< attempt 4)
+                  (begin
+                    (define updated (hash-insert job 'attempt (+ attempt 1)))
+                    (set! context-jobs
+                          (context-job-replace context-jobs job-id updated))
+                    (set! next-state
+                          (make-state messages compactions last-usage context-budget
+                                      model reasoning service-tier activity
+                                      pending-finish compaction-attempt))
+                    (context-queue-effect
+                      updated
+                      (start-context-summary-repair
+                        (context-selected-messages (hash-ref job 'snapshot))
+                        model reasoning service-tier)
+                      (context-resume-effect
+                        activity messages last-usage model reasoning service-tier)))
+                  (begin
+                    (context-job-update-status
+                      job-id "failed"
+                      "selective context compactor returned no summary after 4 repair attempts")
+                    (set! next-state
+                          (make-state messages compactions last-usage context-budget
+                                      model reasoning service-tier activity
+                                      pending-finish compaction-attempt))
+                    (context-resume-effect
+                      activity messages last-usage model reasoning service-tier)))
+              (let* ([ids (hash-ref job 'items)]
+                     [current
+                       (context-compatible-selection
+                         active-context-items ids (hash-ref job 'snapshot))])
+                (if (not current)
+                    (begin
+                      (context-job-update-status
+                        job-id "stale" "selected context changed before apply")
+                      (set! next-state
+                            (make-state messages compactions last-usage context-budget
+                                        model reasoning service-tier activity
+                                        pending-finish compaction-attempt))
+                      (context-resume-effect
+                        activity messages last-usage model reasoning service-tier))
+                    (begin
+                      (define summary-message
+                        (hash 'kind "message" 'role "user"
+                              'content (string-append "Context summary:\n" summary-text)))
+                      (define summary
+                        (context-summary-item
+                          (context-runtime-id "C" next-context-summary)
+                          (hash-ref job 'label) summary-message
+                          (context-sum-from-tokens current) ids current
+                          (context-selection-after current)))
+                      (set! next-context-summary (+ next-context-summary 1))
+                      (set! active-context-items
+                            (context-replace-selection active-context-items ids summary))
+                      (set! messages (context-flatten-items active-context-items))
+                      (context-job-update-status job-id "applied" "")
+                      (set! compactions (+ compactions 1))
+                      (reset-context-pressure-notification!
+                        messages last-usage context-budget)
+                      (set! next-state
+                            (make-state messages compactions last-usage context-budget
+                                        model reasoning service-tier activity
+                                        pending-finish compaction-attempt))
+                      (context-resume-effect
+                        activity messages last-usage model reasoning
+                        service-tier)))))])]
+      [(equal? event-type "context_wait_completed")
+       (define ids (hash-ref event 'job_ids))
+       (define call-id (hash-ref event 'call_id))
+       (set! messages
+             (append messages
+                     (list
+                       (hash 'kind "tool_result" 'call_id call-id
+                             'content
+                             (value->jsexpr-string
+                               (hash 'jobs (context-wait-result ids)))))))
+       (continue-context-calls)]
+      [(equal? event-type "context_compactions_cancelled")
+       (map (lambda (id)
+              (define job (context-job-find context-jobs id))
+              (if (and job (context-pending-job? job))
+                  (context-job-update-status
+                    id "cancelled" (hash-ref event 'reason))))
+            (hash-ref event 'job_ids))
+       (set! next-state
+             (make-state messages compactions last-usage context-budget
+                         model reasoning service-tier activity pending-finish
+                         compaction-attempt))
+       (hash 'type "continue")]
       [(equal? event-type "http_completed")
        (cond
          [(not (hash-ref event 'success))
@@ -221,7 +517,10 @@
                               (list (hash 'kind "tool_result" 'call_id call-id
                                           'content (value->jsexpr-string result)))))
                 (set! pending-context (hash))
-                (continue-context-calls))
+                (set! next-state
+                      (make-state messages compactions last-usage context-budget
+                                  model reasoning service-tier "working" "" 0))
+                (request-effect messages last-usage model reasoning service-tier))
               (begin
                 (set! next-state
                       (make-state messages compactions last-usage context-budget
@@ -251,7 +550,10 @@
                                   (list (hash 'kind "tool_result" 'call_id call-id
                                               'content (value->jsexpr-string result)))))
                     (set! pending-context (hash))
-                    (continue-context-calls)))
+                    (set! next-state
+                          (make-state messages compactions last-usage context-budget
+                                      model reasoning service-tier "working" "" 0))
+                    (request-effect messages last-usage model reasoning service-tier)))
               (begin
                 (define summary-message
                   (hash 'kind "message" 'role "user"
@@ -283,7 +585,10 @@
                 (set! compactions (+ compactions 1))
                 (reset-context-pressure-notification!
                   messages last-usage context-budget)
-                (continue-context-calls)))]
+                (set! next-state
+                      (make-state messages compactions last-usage context-budget
+                                  model reasoning service-tier "working" "" 0))
+                (request-effect messages last-usage model reasoning service-tier)))]
          [(equal? activity "compacting")
           (define result
             (complete-selected-compaction
@@ -344,6 +649,7 @@
                                               'content content)))))
                 (if (selected-compaction-needed? messages last-usage context-budget)
                     (begin
+                      (context-cancel-pending! "superseded by automatic full compaction")
                       (set! next-state
                             (make-state messages compactions last-usage
                                         context-budget model reasoning service-tier
@@ -363,6 +669,7 @@
            (continue-context-calls)
            (if (selected-compaction-needed? messages last-usage context-budget)
                (begin
+                 (context-cancel-pending! "superseded by automatic full compaction")
                  (set! next-state
                        (make-state messages compactions last-usage context-budget
                                    model reasoning service-tier "compacting" "" 0))
@@ -497,7 +804,8 @@
         'next_context_summary next-context-summary
         'pending_context pending-context
         'pending_context_calls pending-context-calls
-        'context_reservations context-reservations
+        'context_jobs context-jobs
+        'next_context_job next-context-job
         'next_context_notification next-context-notification
         'context_window (hash-ref (model-spec model) 'context_window)))
 

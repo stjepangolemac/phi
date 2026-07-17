@@ -29,6 +29,24 @@ pub enum Event {
         events: Vec<serde_json::Value>,
         error: String,
     },
+    ContextCompactionStarted {
+        job_id: String,
+    },
+    ContextCompactionCompleted {
+        job_id: String,
+        success: bool,
+        status: u16,
+        events: Vec<serde_json::Value>,
+        error: String,
+    },
+    ContextWaitCompleted {
+        call_id: String,
+        job_ids: Vec<String>,
+    },
+    ContextCompactionsCancelled {
+        job_ids: Vec<String>,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -52,6 +70,22 @@ pub enum Effect {
         #[serde(default)]
         stream: Vec<StreamRule>,
     },
+    QueueContextCompaction {
+        job_id: String,
+        url: String,
+        secret: String,
+        headers: std::collections::BTreeMap<String, String>,
+        body: serde_json::Value,
+        timeout_ms: u64,
+        #[serde(default)]
+        stream: Vec<StreamRule>,
+        next: Box<Effect>,
+    },
+    WaitForContextCompactions {
+        call_id: String,
+        job_ids: Vec<String>,
+    },
+    Continue,
     Finish {
         content: String,
     },

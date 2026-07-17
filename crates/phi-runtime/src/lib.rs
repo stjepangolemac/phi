@@ -60,6 +60,10 @@ pub enum RuntimeEvent {
     ActivityChanged {
         activity: String,
     },
+    ContextCompactionStatus {
+        job_id: String,
+        status: String,
+    },
     ToolRouteSelected {
         capability: String,
         implementation: String,
@@ -1253,6 +1257,7 @@ fn start_events(options: RunOptions, initial_events: Vec<Event>) -> Handle {
     }
 }
 
+#[allow(clippy::while_let_loop)] // The final non-queue effect must remain available for dispatch.
 async fn run(
     options: RunOptions,
     initial_events: Vec<Event>,
@@ -1289,6 +1294,7 @@ async fn run(
     )?;
     let mut capabilities = bootstrap.capabilities;
     let mut policy = bootstrap.policy;
+    let mut context_statuses = context_job_statuses(policy.state())?;
     let mut file_editor_tool = policy.file_editor_tool_name()?;
     let selected_model = state_string(policy.state(), "model")?;
     let tool_routes = policy.resolved_tool_routes(&selected_model)?;
@@ -1302,6 +1308,18 @@ async fn run(
         )?;
     }
     let mut pending_events = VecDeque::from(initial_events);
+    let abandoned_jobs = pending_context_job_ids(policy.state())?;
+    if !abandoned_jobs.is_empty() {
+        let cancelled = Event::ContextCompactionsCancelled {
+            job_ids: abandoned_jobs,
+            reason: "session resumed without its background workers".into(),
+        };
+        if matches!(pending_events.front(), Some(Event::ToolsCompleted { .. })) {
+            pending_events.insert(1, cancelled);
+        } else {
+            pending_events.push_front(cancelled);
+        }
+    }
     let mut event = pending_events
         .pop_front()
         .expect("initial events were checked above");
@@ -1311,11 +1329,38 @@ async fn run(
         allow_write: options.allow_write,
     };
     let shell_sessions = Arc::clone(&options.processes);
+    let (context_tx, mut context_rx) = mpsc::unbounded_channel::<Event>();
+    let context_cancellation = cancellation.child_token();
+
+    macro_rules! cancellable_or_cancel_jobs {
+        ($future:expr) => {
+            match cancellable(cancellation, $future).await {
+                Ok(value) => value,
+                Err(error) => {
+                    cancel_pending_context_compactions(
+                        &mut policy,
+                        &session,
+                        events,
+                        &mut context_statuses,
+                        "agent turn cancelled",
+                    )?;
+                    return Err(error);
+                }
+            }
+        };
+    }
 
     loop {
         let settle_cancelled_tools =
             cancellation.is_cancelled() && matches!(&event, Event::ToolsCompleted { .. });
         if cancellation.is_cancelled() && !settle_cancelled_tools {
+            cancel_pending_context_compactions(
+                &mut policy,
+                &session,
+                events,
+                &mut context_statuses,
+                "agent turn cancelled",
+            )?;
             bail!("cancelled");
         }
         if let Event::UserMessage { content } = &event {
@@ -1328,11 +1373,12 @@ async fn run(
         }
         session.append(&event)?;
         let previous_policy_state = policy.state().to_owned();
-        let output = policy.on_event(&event)?;
+        let mut output = policy.on_event(&event)?;
         emit_context_tool_events(events, &previous_policy_state, policy.state())?;
         session.append(&output)?;
         session.save_state(policy.state())?;
         send_context(events, policy.state())?;
+        report_context_job_statuses(events, policy.state(), &mut context_statuses)?;
         let next_activity = state_activity(policy.state())?;
         if next_activity != activity {
             send(
@@ -1344,6 +1390,13 @@ async fn run(
             activity = next_activity;
         }
         if cancellation.is_cancelled() {
+            cancel_pending_context_compactions(
+                &mut policy,
+                &session,
+                events,
+                &mut context_statuses,
+                "agent turn cancelled",
+            )?;
             bail!("cancelled");
         }
         if matches!(&event, Event::ToolsCompleted { .. }) {
@@ -1370,11 +1423,90 @@ async fn run(
             continue;
         }
         let stream_output = activity == "working";
-        let effect = output
+        let mut effect = output
             .effects
             .into_iter()
             .next()
             .context("policy emitted no effect")?;
+        loop {
+            let Effect::QueueContextCompaction {
+                job_id,
+                url,
+                secret,
+                headers,
+                body,
+                timeout_ms,
+                stream,
+                next,
+            } = effect
+            else {
+                break;
+            };
+            let started = Event::ContextCompactionStarted {
+                job_id: job_id.clone(),
+            };
+            session.append(&started)?;
+            let started_output = policy.on_event(&started)?;
+            session.append(&started_output)?;
+            session.save_state(policy.state())?;
+            send_context(events, policy.state())?;
+            report_context_job_statuses(events, policy.state(), &mut context_statuses)?;
+            spawn_context_compaction(
+                job_id,
+                url,
+                secret,
+                headers,
+                body,
+                timeout_ms,
+                stream,
+                config.clone(),
+                context_tx.clone(),
+                context_cancellation.clone(),
+            );
+            effect = *next;
+        }
+        while let Ok(completed) = context_rx.try_recv() {
+            session.append(&completed)?;
+            output = policy.on_event(&completed)?;
+            session.append(&output)?;
+            session.save_state(policy.state())?;
+            send_context(events, policy.state())?;
+            report_context_job_statuses(events, policy.state(), &mut context_statuses)?;
+            let mut completed_effect = output
+                .effects
+                .into_iter()
+                .next()
+                .context("policy emitted no effect")?;
+            loop {
+                let Effect::QueueContextCompaction {
+                    job_id,
+                    url,
+                    secret,
+                    headers,
+                    body,
+                    timeout_ms,
+                    stream,
+                    next,
+                } = completed_effect
+                else {
+                    break;
+                };
+                spawn_context_compaction(
+                    job_id,
+                    url,
+                    secret,
+                    headers,
+                    body,
+                    timeout_ms,
+                    stream,
+                    config.clone(),
+                    context_tx.clone(),
+                    context_cancellation.clone(),
+                );
+                completed_effect = *next;
+            }
+            effect = merge_context_completion_effect(effect, completed_effect);
+        }
         match effect {
             Effect::Process {
                 program,
@@ -1382,18 +1514,14 @@ async fn run(
                 stdin,
                 timeout_ms,
             } => {
-                event = cancellable(
-                    cancellation,
-                    phi_core::process::run(
-                        &workspace,
-                        &config.allowed_programs,
-                        &program,
-                        &args,
-                        &stdin,
-                        timeout_ms,
-                    ),
-                )
-                .await??;
+                event = cancellable_or_cancel_jobs!(phi_core::process::run(
+                    &workspace,
+                    &config.allowed_programs,
+                    &program,
+                    &args,
+                    &stdin,
+                    timeout_ms,
+                ))?;
             }
             Effect::RunTools { calls } => {
                 let executor = ToolBatchExecutor {
@@ -1473,11 +1601,71 @@ async fn run(
                         }
                     },
                 );
-                event = cancellable(cancellation, request).await??;
+                event = cancellable_or_cancel_jobs!(request)?;
             }
             Effect::Finish { content } => {
+                context_cancellation.cancel();
+                cancel_pending_context_compactions(
+                    &mut policy,
+                    &session,
+                    events,
+                    &mut context_statuses,
+                    "agent turn finished",
+                )?;
                 send(events, RuntimeEvent::Finished { content })?;
                 return Ok(());
+            }
+            Effect::WaitForContextCompactions { call_id, job_ids } => {
+                while job_ids.iter().any(|id| {
+                    context_job_status(policy.state(), id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|status| !is_terminal_context_status(&status))
+                }) {
+                    let completed = cancellable_or_cancel_jobs!(context_rx.recv())
+                        .context("context compaction worker stopped")?;
+                    session.append(&completed)?;
+                    let mut completion_output = policy.on_event(&completed)?;
+                    session.append(&completion_output)?;
+                    session.save_state(policy.state())?;
+                    send_context(events, policy.state())?;
+                    report_context_job_statuses(events, policy.state(), &mut context_statuses)?;
+                    if let Some(Effect::QueueContextCompaction {
+                        job_id,
+                        url,
+                        secret,
+                        headers,
+                        body,
+                        timeout_ms,
+                        stream,
+                        ..
+                    }) = completion_output.effects.pop()
+                    {
+                        spawn_context_compaction(
+                            job_id,
+                            url,
+                            secret,
+                            headers,
+                            body,
+                            timeout_ms,
+                            stream,
+                            config.clone(),
+                            context_tx.clone(),
+                            context_cancellation.clone(),
+                        );
+                    }
+                }
+                event = Event::ContextWaitCompleted { call_id, job_ids };
+            }
+            Effect::Continue => {
+                if pending_context_job_ids(policy.state())?.is_empty() {
+                    bail!("policy requested continuation without pending work");
+                }
+                event = cancellable_or_cancel_jobs!(context_rx.recv())
+                    .context("context compaction worker stopped")?;
+            }
+            Effect::QueueContextCompaction { .. } => {
+                unreachable!("queued compactions are unwrapped before dispatch")
             }
         }
     }
@@ -1561,7 +1749,7 @@ fn context_tool_message_key(
     };
     if !matches!(
         name,
-        Some("context_mark" | "context_inspect" | "context_compact")
+        Some("context_mark" | "context_inspect" | "context_compact" | "context_wait")
     ) {
         return None;
     }
@@ -2132,6 +2320,156 @@ fn emit_stream_events(
     emitted
 }
 
+#[allow(clippy::too_many_arguments)]
+fn spawn_context_compaction(
+    job_id: String,
+    url: String,
+    secret: String,
+    headers: BTreeMap<String, String>,
+    body: serde_json::Value,
+    timeout_ms: u64,
+    _stream: Vec<StreamRule>,
+    config: Config,
+    completed: mpsc::UnboundedSender<Event>,
+    cancellation: CancellationToken,
+) {
+    tokio::task::spawn_local(async move {
+        let request = phi_core::http::post_sse(
+            phi_core::http::SseRequest {
+                allowed_origins: &config.allowed_http_origins,
+                secrets: &config.secrets,
+                url: &url,
+                secret_name: &secret,
+                headers: &headers,
+                body,
+                timeout_ms,
+            },
+            |_| false,
+        );
+        let event = match cancellable(&cancellation, request).await {
+            Ok(Ok(Event::HttpCompleted {
+                success,
+                status,
+                events,
+                error,
+            })) => Event::ContextCompactionCompleted {
+                job_id,
+                success,
+                status,
+                events,
+                error,
+            },
+            Ok(Ok(_)) => unreachable!("HTTP client returned a non-HTTP event"),
+            Ok(Err(error)) | Err(error) => Event::ContextCompactionCompleted {
+                job_id,
+                success: false,
+                status: 0,
+                events: Vec::new(),
+                error: runtime_error(&error),
+            },
+        };
+        let _ = completed.send(event);
+    });
+}
+
+fn pending_context_job_ids(state: &str) -> Result<Vec<String>> {
+    let state: serde_json::Value = serde_json::from_str(state)?;
+    Ok(state["context_jobs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|job| {
+            job["status"]
+                .as_str()
+                .is_some_and(|status| !is_terminal_context_status(status))
+        })
+        .filter_map(|job| job["id"].as_str().map(str::to_owned))
+        .collect())
+}
+
+fn context_job_status(state: &str, job_id: &str) -> Result<Option<String>> {
+    let state: serde_json::Value = serde_json::from_str(state)?;
+    Ok(state["context_jobs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|job| job["id"] == job_id)
+        .and_then(|job| job["status"].as_str().map(str::to_owned)))
+}
+
+fn context_job_statuses(state: &str) -> Result<BTreeMap<String, String>> {
+    let state: serde_json::Value = serde_json::from_str(state)?;
+    Ok(state["context_jobs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|job| {
+            Some((
+                job["id"].as_str()?.to_owned(),
+                job["status"].as_str()?.to_owned(),
+            ))
+        })
+        .collect())
+}
+
+fn report_context_job_statuses(
+    events: &mpsc::UnboundedSender<RuntimeEvent>,
+    state: &str,
+    reported: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    let current = context_job_statuses(state)?;
+    for (job_id, status) in &current {
+        if reported.get(job_id) != Some(status) {
+            send(
+                events,
+                RuntimeEvent::ContextCompactionStatus {
+                    job_id: job_id.clone(),
+                    status: status.clone(),
+                },
+            )?;
+        }
+    }
+    *reported = current;
+    Ok(())
+}
+
+fn cancel_pending_context_compactions(
+    policy: &mut phi_steel::Policy,
+    session: &phi_core::session::Session,
+    events: &mpsc::UnboundedSender<RuntimeEvent>,
+    reported: &mut BTreeMap<String, String>,
+    reason: &str,
+) -> Result<()> {
+    let job_ids = pending_context_job_ids(policy.state())?;
+    if job_ids.is_empty() {
+        return Ok(());
+    }
+    let cancelled = Event::ContextCompactionsCancelled {
+        job_ids,
+        reason: reason.into(),
+    };
+    session.append(&cancelled)?;
+    let output = policy.on_event(&cancelled)?;
+    session.append(&output)?;
+    session.save_state(policy.state())?;
+    send_context(events, policy.state())?;
+    report_context_job_statuses(events, policy.state(), reported)
+}
+
+fn is_terminal_context_status(status: &str) -> bool {
+    matches!(status, "applied" | "failed" | "cancelled" | "stale")
+}
+
+fn merge_context_completion_effect(foreground: Effect, completed: Effect) -> Effect {
+    if matches!(foreground, Effect::HttpRequest { .. } | Effect::Continue)
+        && matches!(completed, Effect::HttpRequest { .. })
+    {
+        completed
+    } else {
+        foreground
+    }
+}
+
 async fn cancellable<T>(
     cancellation: &CancellationToken,
     future: impl std::future::Future<Output = T>,
@@ -2339,6 +2677,17 @@ mod tests {
                 },
                 {
                     "kind": "tool_call",
+                    "call_id": "wait-c",
+                    "name": "context_wait",
+                    "arguments": "{\"job_ids\":[\"J1\"]}"
+                },
+                {
+                    "kind": "tool_result",
+                    "call_id": "wait-c",
+                    "content": "{\"jobs\":[]}"
+                },
+                {
+                    "kind": "tool_call",
                     "call_id": "ordinary",
                     "name": "read_file",
                     "arguments": "{\"path\":\"README.md\"}"
@@ -2356,7 +2705,7 @@ mod tests {
         emit_context_tool_events(&event_tx, &previous, &next).unwrap();
 
         let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
-        assert_eq!(events.len(), 4);
+        assert_eq!(events.len(), 6);
         assert!(
             matches!(&events[0], RuntimeEvent::ToolStarted { call_id, name, .. }
             if call_id == "inspect-a" && name == "context_inspect")
@@ -2373,6 +2722,69 @@ mod tests {
             matches!(&events[3], RuntimeEvent::ToolCompleted { call_id, name, .. }
             if call_id == "mark-b" && name == "context_mark")
         );
+        assert!(
+            matches!(&events[4], RuntimeEvent::ToolStarted { call_id, name, .. }
+            if call_id == "wait-c" && name == "context_wait")
+        );
+        assert!(
+            matches!(&events[5], RuntimeEvent::ToolCompleted { call_id, name, .. }
+            if call_id == "wait-c" && name == "context_wait")
+        );
+    }
+
+    fn test_http_effect(marker: &str) -> Effect {
+        Effect::HttpRequest {
+            url: format!("https://example.com/{marker}"),
+            secret: String::new(),
+            headers: BTreeMap::new(),
+            body: serde_json::json!({ "marker": marker }),
+            timeout_ms: 1,
+            stream: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn context_completion_refreshes_only_safe_foreground_requests() {
+        let refreshed =
+            merge_context_completion_effect(test_http_effect("before"), test_http_effect("after"));
+        assert!(matches!(
+            refreshed,
+            Effect::HttpRequest { body, .. } if body["marker"] == "after"
+        ));
+
+        let tools = Effect::RunTools { calls: Vec::new() };
+        assert_eq!(
+            merge_context_completion_effect(tools.clone(), test_http_effect("after")),
+            tools
+        );
+        let finished = Effect::Finish {
+            content: "done".into(),
+        };
+        assert_eq!(
+            merge_context_completion_effect(finished.clone(), test_http_effect("after")),
+            finished
+        );
+    }
+
+    #[test]
+    fn persisted_context_job_statuses_distinguish_pending_and_terminal_jobs() {
+        let state = serde_json::json!({
+            "context_jobs": [
+                { "id": "J1", "status": "queued" },
+                { "id": "J2", "status": "running" },
+                { "id": "J3", "status": "applied" },
+                { "id": "J4", "status": "failed" },
+                { "id": "J5", "status": "cancelled" },
+                { "id": "J6", "status": "stale" }
+            ]
+        })
+        .to_string();
+        assert_eq!(pending_context_job_ids(&state).unwrap(), vec!["J1", "J2"]);
+        assert_eq!(
+            context_job_status(&state, "J3").unwrap().as_deref(),
+            Some("applied")
+        );
+        assert_eq!(context_job_status(&state, "unknown").unwrap(), None);
     }
 
     struct ConcurrentTool {
@@ -3076,7 +3488,7 @@ mod tests {
                     && body["parallel_tool_calls"] == true
                     && body["prompt_cache_key"] == execution.session_id
                     && headers["session_id"] == execution.session_id
-                    && body["tools"].as_array().unwrap().len() == 14
+                    && body["tools"].as_array().unwrap().len() == 15
                     && body["tools"].as_array().unwrap().iter()
                         .any(|tool| tool["name"] == "read_file"
                             && tool["description"].as_str().unwrap()
@@ -3099,6 +3511,8 @@ mod tests {
                         .any(|tool| tool["name"] == "context_inspect")
                     && body["tools"].as_array().unwrap().iter()
                         .any(|tool| tool["name"] == "context_compact")
+                    && body["tools"].as_array().unwrap().iter()
+                        .any(|tool| tool["name"] == "context_wait")
                     && !body["tools"].as_array().unwrap().iter()
                         .any(|tool| tool["name"] == "load_skill")
                     && body["tools"].as_array().unwrap().iter()
@@ -3454,7 +3868,18 @@ mod tests {
                     })
                     .unwrap();
                 assert!(matches!(&output.effects[0], Effect::RunTools { .. }));
-                session.save_state(policy.state()).unwrap();
+                let mut saved_state: serde_json::Value =
+                    serde_json::from_str(policy.state()).unwrap();
+                saved_state["context_jobs"] = serde_json::json!([{
+                    "id": "J1",
+                    "items": [],
+                    "label": "pending",
+                    "status": "running",
+                    "error": "",
+                    "attempt": 0,
+                    "snapshot": []
+                }]);
+                session.save_state(&saved_state.to_string()).unwrap();
                 options.session_id = Some(session.id().into());
 
                 let (event_tx, _event_rx) = mpsc::unbounded_channel();
@@ -3489,6 +3914,8 @@ mod tests {
                 assert!(messages.iter().any(|message| {
                     message["kind"] == "tool_result" && message["call_id"] == "waiting-call"
                 }));
+                assert_eq!(state["context_jobs"][0]["status"], "cancelled");
+                assert_eq!(state["context_jobs"][0]["error"], "agent turn cancelled");
             })
             .await;
     }
