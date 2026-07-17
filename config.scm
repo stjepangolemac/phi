@@ -5,11 +5,11 @@
 (define next-context-span 2)
 (define next-context-summary 1)
 (define pending-context (hash))
-(define context-pressure-thresholds (list 50 60 70 80 90))
-(define next-context-notification 50)
+(define context-pressure-thresholds (list 25 50 75))
+(define next-context-notification 25)
 
 (define (init encoded-config)
-  (set! next-context-notification 50)
+  (set! next-context-notification 25)
   (define config (string->jsexpr encoded-config))
   (define model (or (hash-try-get config 'model) ""))
   (define context-budget
@@ -60,7 +60,7 @@
   (set! next-context-summary (or (hash-try-get state 'next_context_summary) 1))
   (set! pending-context (or (hash-try-get state 'pending_context) (hash)))
   (set! next-context-notification
-        (or (hash-try-get state 'next_context_notification) 50))
+        (or (hash-try-get state 'next_context_notification) 25))
   (define compactions (hash-ref state 'compactions))
   (define last-usage (hash-ref state 'last_usage))
   (define model (hash-ref state 'model))
@@ -421,12 +421,26 @@
       "Internal context-management notice: active context has crossed "
       (number->string threshold) "% of the usable window (approximately "
       (number->string percent) "%, " (number->string used) " of "
-      (number->string limit) " tokens). Before continuing, use context_inspect. "
-      "If substantial closed older items can be summarized without losing "
-      "details needed for the remaining work, call context_compact now. Never "
-      "compact the open item or fixed context. If nothing is eligible yet, "
-      "continue the task and use context_mark at the next meaningful phase "
-      "transition so completed work can be compacted later.")))
+      (number->string limit) " tokens). "
+      (cond
+        [(= threshold 25)
+         (string-append
+           "Advisory housekeeping only: when it is easy and low-risk, consider "
+           "using context_inspect and compacting one or more obviously completed "
+           "closed spans. This is optional and should not interrupt the task.")]
+        [(= threshold 50)
+         (string-append
+           "Context cleanup is encouraged soon: make a deliberate pass with "
+           "context_inspect and compact substantial completed closed spans when "
+           "that can be done safely. This is not critical and does not require "
+           "immediate action.")]
+        [else
+         (string-append
+           "Give high priority to reducing active context before undertaking "
+           "substantial new work. Use context_inspect and compact eligible "
+           "completed closed spans, potentially combining adjacent spans in one "
+           "context_compact call. Do not compact the open item or fixed context, "
+           "and continue without compaction if nothing safe is eligible.")]))))
 
 (define (make-state messages compactions last-usage context-budget
                     model reasoning service-tier activity pending-finish

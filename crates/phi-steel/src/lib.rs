@@ -926,8 +926,21 @@ mod tests {
     }
 
     #[test]
-    fn context_pressure_notifies_once_at_fifty_percent_using_provider_usage() {
+    fn context_pressure_notices_have_distinct_urgency() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+
+        let mut advisory = compact_policy(&root, 10_000);
+        let advisory_output = advisory
+            .on_event(&Event::UserMessage {
+                content: "x".repeat(11_000),
+            })
+            .unwrap();
+        let advisory_body = effect_body(&advisory_output).to_string();
+        assert!(advisory_body.contains("crossed 25%"));
+        assert!(advisory_body.contains("Advisory housekeeping only"));
+        assert!(advisory_body.contains("This is optional"));
+        assert_eq!(state_json(&advisory)["next_context_notification"], 50.0);
+
         let mut policy = compact_policy(&root, 10_000);
         let initial = policy
             .on_event(&Event::UserMessage {
@@ -972,11 +985,12 @@ mod tests {
         let body = effect_body(&notified).to_string();
         assert!(body.contains(CONTEXT_NOTICE));
         assert!(body.contains("crossed 50%"));
-        assert!(body.contains("Before continuing, use context_inspect"));
-        assert!(body.contains("call context_compact now"));
+        assert!(body.contains("Context cleanup is encouraged soon"));
+        assert!(body.contains("This is not critical"));
+        assert!(body.contains("does not require immediate action"));
         assert!(!body.contains("do not mention"));
         let state = state_json(&policy);
-        assert_eq!(state["next_context_notification"], 60.0);
+        assert_eq!(state["next_context_notification"], 75.0);
         assert!(!state["messages"].to_string().contains(CONTEXT_NOTICE));
 
         let duplicate = policy
@@ -985,7 +999,23 @@ mod tests {
             })
             .unwrap();
         assert!(!effect_body(&duplicate).to_string().contains(CONTEXT_NOTICE));
-        assert_eq!(state_json(&policy)["next_context_notification"], 60.0);
+        assert_eq!(state_json(&policy)["next_context_notification"], 75.0);
+
+        let mut high_priority = compact_policy(&root, 10_000);
+        let high_priority_output = high_priority
+            .on_event(&Event::UserMessage {
+                content: "x".repeat(31_000),
+            })
+            .unwrap();
+        let high_priority_body = effect_body(&high_priority_output).to_string();
+        assert!(high_priority_body.contains("crossed 75%"));
+        assert!(high_priority_body.contains("Give high priority"));
+        assert!(high_priority_body.contains("before undertaking substantial new work"));
+        assert!(high_priority_body.contains("if nothing safe is eligible"));
+        assert_eq!(
+            state_json(&high_priority)["next_context_notification"],
+            101.0
+        );
     }
 
     #[test]
@@ -1047,24 +1077,19 @@ mod tests {
             })
             .unwrap();
         let body = effect_body(&output).to_string();
-        assert!(body.contains("crossed 80%"));
+        assert!(body.contains("crossed 75%"));
+        assert!(!body.contains("crossed 25%"));
         assert!(!body.contains("crossed 50%"));
-        assert!(!body.contains("crossed 60%"));
-        assert!(!body.contains("crossed 70%"));
         let state = state_json(&policy);
-        assert_eq!(state["next_context_notification"], 90.0);
+        assert_eq!(state["next_context_notification"], 101.0);
         assert!(!state["messages"].to_string().contains(CONTEXT_NOTICE));
     }
 
     #[test]
     fn context_pressure_supports_every_configured_band() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        for (characters, threshold, next) in [
-            (25_000, 60, 70),
-            (29_000, 70, 80),
-            (33_000, 80, 90),
-            (37_000, 90, 101),
-        ] {
+        for (characters, threshold, next) in [(11_000, 25, 50), (21_000, 50, 75), (31_000, 75, 101)]
+        {
             let mut policy = compact_policy(&root, 10_000);
             let output = policy
                 .on_event(&Event::UserMessage {
@@ -1110,7 +1135,7 @@ mod tests {
             .unwrap();
         assert_eq!(effect_body(&output)["parallel_tool_calls"], true);
         assert!(!effect_body(&output).to_string().contains(CONTEXT_NOTICE));
-        assert_eq!(state_json(&policy)["next_context_notification"], 50.0);
+        assert_eq!(state_json(&policy)["next_context_notification"], 25.0);
     }
 
     #[test]
@@ -1122,7 +1147,7 @@ mod tests {
                 content: "x".repeat(21_000),
             })
             .unwrap();
-        assert_eq!(state_json(&policy)["next_context_notification"], 60.0);
+        assert_eq!(state_json(&policy)["next_context_notification"], 75.0);
         policy
             .on_event(&response_call(
                 "context_mark",
@@ -1143,7 +1168,7 @@ mod tests {
 
         assert!(!effect_body(&continued).to_string().contains(CONTEXT_NOTICE));
         let state = state_json(&policy);
-        assert_eq!(state["next_context_notification"], 50.0);
+        assert_eq!(state["next_context_notification"], 25.0);
         assert_eq!(state["context_items"][0]["id"], "C1");
         assert!(!state["messages"].to_string().contains(CONTEXT_NOTICE));
     }
@@ -1157,7 +1182,7 @@ mod tests {
                 content: "x".repeat(6_000),
             })
             .unwrap();
-        assert!(effect_body(&initial).to_string().contains("crossed 90%"));
+        assert!(effect_body(&initial).to_string().contains("crossed 75%"));
         assert_eq!(state_json(&policy)["next_context_notification"], 101.0);
 
         let compacting = policy.on_event(&response_text("answer")).unwrap();
@@ -1182,7 +1207,7 @@ mod tests {
         );
         let state = state_json(&policy);
         assert_eq!(state["activity"], "ready");
-        assert_eq!(state["next_context_notification"], 50.0);
+        assert_eq!(state["next_context_notification"], 25.0);
         assert!(!state["messages"].to_string().contains(CONTEXT_NOTICE));
     }
 
