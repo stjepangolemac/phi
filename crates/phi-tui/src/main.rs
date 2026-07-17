@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -114,6 +114,7 @@ struct App {
     turn_started: Option<Instant>,
     compaction_started: Option<Instant>,
     throbber_state: ThrobberState,
+    context_jobs: BTreeMap<String, String>,
     tool_started: HashMap<String, (String, Instant)>,
     tool_blocks: HashMap<String, usize>,
     workflow_names: HashMap<String, String>,
@@ -194,6 +195,7 @@ impl App {
             turn_started: None,
             compaction_started: None,
             throbber_state: ThrobberState::default(),
+            context_jobs: BTreeMap::new(),
             tool_started: HashMap::new(),
             tool_blocks: HashMap::new(),
             workflow_names: HashMap::new(),
@@ -223,6 +225,19 @@ impl App {
     fn push_transcript(&mut self, role: impl Into<String>, content: impl Into<String>) {
         self.transcript.push((role.into(), content.into()));
         self.transcript_cache.push(None);
+    }
+
+    fn refresh_context_job_status(&mut self) {
+        if let Some((job_id, status)) = self.context_jobs.first_key_value() {
+            let others = self.context_jobs.len() - 1;
+            self.status = if others == 0 {
+                format!("context {job_id} {status}")
+            } else {
+                format!("context {job_id} {status} (+{others})")
+            };
+        } else {
+            self.status = "working".into();
+        }
     }
 
     fn transcript_changed(&mut self, index: usize) {
@@ -594,9 +609,24 @@ impl App {
                     self.flush_model();
                     self.status = activity;
                 }
-                "working" => self.status = activity,
+                "working" => {
+                    if self.context_jobs.is_empty() {
+                        self.status = activity;
+                    } else {
+                        self.refresh_context_job_status();
+                    }
+                }
                 _ => {}
             },
+            RuntimeEvent::ContextCompactionStatus { job_id, status } => {
+                if matches!(status.as_str(), "queued" | "running") {
+                    self.context_jobs.insert(job_id, status);
+                } else {
+                    self.context_jobs.remove(&job_id);
+                    self.push_transcript("note", format!("Context compaction {job_id}: {status}"));
+                }
+                self.refresh_context_job_status();
+            }
             RuntimeEvent::ToolRouteSelected { .. } => {}
             RuntimeEvent::ModelDelta { content } => {
                 self.current_reasoning_summary = None;
@@ -2626,6 +2656,42 @@ mod tests {
         });
         assert_eq!(app.transcript[0], ("phi".into(), "hi".into()));
         assert_eq!(app.transcript[1].1, "Read src/main.rs");
+    }
+
+    #[test]
+    fn shows_context_compaction_lifecycle_without_blocking_the_transcript() {
+        let mut app = app();
+        app.on_runtime(RuntimeEvent::ContextCompactionStatus {
+            job_id: "J1".into(),
+            status: "queued".into(),
+        });
+        assert_eq!(app.status, "context J1 queued");
+        assert!(app.transcript.is_empty());
+
+        app.on_runtime(RuntimeEvent::ContextCompactionStatus {
+            job_id: "J1".into(),
+            status: "running".into(),
+        });
+        assert_eq!(app.status, "context J1 running");
+        app.on_runtime(RuntimeEvent::ContextCompactionStatus {
+            job_id: "J2".into(),
+            status: "running".into(),
+        });
+        assert_eq!(app.status, "context J1 running (+1)");
+        app.on_runtime(RuntimeEvent::ContextCompactionStatus {
+            job_id: "J1".into(),
+            status: "applied".into(),
+        });
+        assert_eq!(app.status, "context J2 running");
+        assert_eq!(
+            app.transcript[0],
+            ("note".into(), "Context compaction J1: applied".into())
+        );
+        app.on_runtime(RuntimeEvent::ContextCompactionStatus {
+            job_id: "J2".into(),
+            status: "failed".into(),
+        });
+        assert_eq!(app.status, "working");
     }
 
     #[test]

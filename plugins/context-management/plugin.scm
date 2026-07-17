@@ -29,6 +29,18 @@
               'required (list "items" "label")
               'additionalProperties #f)))
 
+(define context-wait-spec
+  (hash 'name "context_wait"
+        'description "Wait for selected context-compaction jobs, or for all jobs pending when the call begins. Completed jobs return immediately."
+        'parameters
+        (hash 'type "object"
+              'properties
+              (hash 'job_ids
+                    (hash 'type "array"
+                          'items (hash 'type "string")))
+              'additionalProperties #f)))
+
 (register-tool! (lambda () context-mark-spec))
 (register-tool! (lambda () context-inspect-spec))
 (register-tool! (lambda () context-compact-spec))
+(register-tool! (lambda () context-wait-spec))

@@ -122,7 +122,8 @@
 (define (context-tool-name? name)
   (or (equal? name "context_mark")
       (equal? name "context_inspect")
-      (equal? name "context_compact")))
+      (equal? name "context_compact")
+      (equal? name "context_wait")))
 
 (define (context-tools-available? tools)
   (cond
