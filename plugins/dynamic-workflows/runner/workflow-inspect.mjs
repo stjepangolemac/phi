@@ -9,7 +9,9 @@ for await (const chunk of process.stdin) input += chunk
 
 try {
   const request = JSON.parse(input)
-  const source = await readFile(request.workflowPath, "utf8")
+  const source = typeof request.source === "string"
+    ? request.source
+    : await readFile(request.workflowPath, "utf8")
   const temporary = await mkdtemp(join(tmpdir(), "phi-workflow-inspect-"))
   try {
     const apiUrl = pathToFileURL(join(temporary, "api.mjs")).href

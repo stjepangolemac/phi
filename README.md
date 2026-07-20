@@ -185,6 +185,17 @@ LOADED_PLUGIN/workflows/NAME.js
 
 `Workflow` also accepts an optional exact `path` to select a same-named definition regardless of discovery precedence. Relative paths resolve from the current workspace; absolute paths are accepted too. Exact paths must name a regular `.js` file contained in the global, current-workspace, or a loaded-plugin workflow root. Parent traversal, escaping symlinks, unloaded-plugin paths, and paths outside those roots are rejected. The module's `meta.name` must equal the requested `name`.
 
+For a one-off run, pass `source` instead of `name` or `path`. The source must export the same `meta` and default async function as a reusable definition; its validated `meta.name` becomes the task display name. `source` is mutually exclusive with both reusable-selection fields in the tool schema and at runtime:
+
+```json
+{
+  "source": "import { agent } from \"phi:workflow\"\nexport const meta = { name: \"one-off-review\", description: \"Review the current diff once.\" }\nexport default async () => agent(\"Review the current diff.\", { capabilities: \"read-only\" })\n",
+  "args": null
+}
+```
+
+Phi checks syntax, metadata, imports/runtime APIs, input schema, and args before creating a task or child. A valid submission is atomically persisted byte-for-byte as `workflow.js` only inside its new durable task run directory, then executed by the normal isolated workflow runner; it never creates or changes a global, workspace, or plugin definition. Ephemeral runs therefore use the same agent limits, deadline, effective parent capabilities and approval policy, durable TaskOutput/TaskStop records, cancellation, timeout, failure handling, and managed-worktree cleanup as reusable workflows. One-off source cannot grant child agents authority the parent does not have.
+
 Create project-specific definitions in `.phi/workflows/`. Copy or promote one to `~/.phi/workflows/` only when the user explicitly asks to make it global.
 
 Each module exports `meta` and a default async function. The `phi:workflow` module supplies `agent`, `parallel`, `batch`, `pipeline`, `phase`, `log`, and `budget`:
@@ -218,7 +229,7 @@ export default async function ({ args }) {
 }
 ```
 
-`meta.inputSchema` is optional. When present, it is validated when the workflow is discovered and `Workflow.args` is validated before Phi creates a task directory, launches the runner, or creates a child session. Validation failures report JSON Pointer-style instance and schema paths. The `Workflow` tool description lists each name-discovered workflow's description and schema; a successful launch also returns `description` and `input_schema`, identically for name and exact-path selection. Without `inputSchema`, `args` remains an arbitrary JSON value for backward compatibility.
+`meta.inputSchema` is optional. When present, it is validated when the workflow is discovered or ephemeral source is submitted, and `Workflow.args` is validated before Phi creates a task directory, launches the runner, or creates a child session. Validation failures report JSON Pointer-style instance and schema paths. The `Workflow` tool description lists each name-discovered workflow's description and schema; a successful launch also returns `description` and `input_schema` identically for name, exact-path, and source selection. Without `inputSchema`, `args` remains an arbitrary JSON value for backward compatibility.
 
 Input schemas support boolean schemas and the common draft 2020-12/draft-07 subset: `type`, `enum`, `const`, `properties`, `required`, `additionalProperties`, `items`, string/array/object size limits, `pattern`, numeric limits, `multipleOf`, `uniqueItems`, and `allOf`/`anyOf`/`oneOf`/`not`, plus standard annotation keywords. Unsupported features such as `$ref`, `$defs`, conditionals, tuple/prefix items, dependencies, and formats are rejected with the unsupported keyword's schema path rather than ignored.
 

@@ -53,21 +53,41 @@ impl WorkflowTasks {
         agent_context: WorkflowAgentContext,
         arguments: &Value,
     ) -> Result<Value> {
-        let name = arguments
-            .get("name")
-            .and_then(Value::as_str)
-            .context("Workflow requires name")?;
-        validate_name(name)?;
-        let requested_path = arguments
-            .get("path")
-            .map(|path| path.as_str().context("Workflow path must be a string"))
-            .transpose()?;
-        let workflow_path = resolve_workflow(workspace, home, plugin_roots, name, requested_path)?;
         let args = arguments.get("args").cloned().unwrap_or(Value::Null);
         let plugin = plugin_roots
             .get("dynamic-workflows")
             .context("dynamic-workflows plugin is not loaded")?;
-        let metadata = inspect_workflow(plugin, &workflow_path, name, Some(&args))?;
+        let source = arguments
+            .get("source")
+            .map(|source| source.as_str().context("Workflow source must be a string"))
+            .transpose()?;
+        let (name, workflow_path, metadata) = if let Some(source) = source {
+            if arguments.get("name").is_some() || arguments.get("path").is_some() {
+                bail!("Workflow source is mutually exclusive with name and path");
+            }
+            let metadata = inspect_workflow_source(plugin, source, Some(&args))?;
+            let name = metadata["name"]
+                .as_str()
+                .context("ephemeral workflow metadata has no name")?
+                .to_owned();
+            validate_name(&name)?;
+            (name, None, metadata)
+        } else {
+            let name = arguments
+                .get("name")
+                .and_then(Value::as_str)
+                .context("Workflow requires name or source")?
+                .to_owned();
+            validate_name(&name)?;
+            let requested_path = arguments
+                .get("path")
+                .map(|path| path.as_str().context("Workflow path must be a string"))
+                .transpose()?;
+            let workflow_path =
+                resolve_workflow(workspace, home, plugin_roots, &name, requested_path)?;
+            let metadata = inspect_workflow(plugin, &workflow_path, &name, Some(&args))?;
+            (name, Some(workflow_path), metadata)
+        };
         let runner = plugin.join("runner/workflow-runner.mjs");
         if !runner.is_file() {
             bail!("dynamic workflow runner is missing");
@@ -76,6 +96,24 @@ impl WorkflowTasks {
         let task_id = Uuid::new_v4().to_string();
         let dir = session_dir.join("workflows").join(&task_id);
         fs::create_dir_all(&dir)?;
+        let (workflow_path, selection) = if let Some(source) = source {
+            let path = dir.join("workflow.js");
+            phi_core::write_atomic(
+                &path,
+                source.as_bytes(),
+                phi_core::AtomicWriteMode::Overwrite,
+            )?;
+            (path, "source")
+        } else {
+            (
+                workflow_path.context("resolved workflow path is missing")?,
+                if arguments.get("path").is_some() {
+                    "path"
+                } else {
+                    "name"
+                },
+            )
+        };
         let started_at = now_ms()?;
         let deadline_at = started_at + u128::from(MAX_DURATION_MS);
         write_json(
@@ -99,6 +137,7 @@ impl WorkflowTasks {
             "taskId": task_id,
             "parentSessionId": parent_session_id,
             "name": name,
+            "selection": selection,
             "workflowPath": workflow_path,
             "args": args,
             "workspace": workspace,
@@ -624,6 +663,31 @@ fn inspect_workflow(
     name: &str,
     args: Option<&Value>,
 ) -> Result<Value> {
+    inspect_workflow_request(
+        plugin,
+        json!({
+            "workflowPath": workflow_path,
+            "name": name,
+            "args": args.cloned().unwrap_or(Value::Null),
+            "validateArgs": args.is_some(),
+        }),
+    )
+    .with_context(|| format!("inspect workflow {}", workflow_path.display()))
+}
+
+fn inspect_workflow_source(plugin: &Path, source: &str, args: Option<&Value>) -> Result<Value> {
+    inspect_workflow_request(
+        plugin,
+        json!({
+            "source": source,
+            "args": args.cloned().unwrap_or(Value::Null),
+            "validateArgs": args.is_some(),
+        }),
+    )
+    .context("inspect ephemeral workflow source")
+}
+
+fn inspect_workflow_request(plugin: &Path, request: Value) -> Result<Value> {
     let inspector = plugin.join("runner/workflow-inspect.mjs");
     if !inspector.is_file() {
         bail!("dynamic workflow inspector is missing");
@@ -635,12 +699,6 @@ fn inspect_workflow(
         .stderr(Stdio::piped())
         .spawn()
         .context("start workflow metadata inspector")?;
-    let request = json!({
-        "workflowPath": workflow_path,
-        "name": name,
-        "args": args.cloned().unwrap_or(Value::Null),
-        "validateArgs": args.is_some(),
-    });
     serde_json::to_writer(
         child
             .stdin
@@ -655,10 +713,9 @@ fn inspect_workflow(
     if !output.status.success() {
         let error = String::from_utf8_lossy(&output.stderr);
         let message = error.lines().next().unwrap_or("workflow inspection failed");
-        bail!("inspect workflow {}: {message}", workflow_path.display());
+        bail!("{message}");
     }
-    serde_json::from_slice(&output.stdout)
-        .with_context(|| format!("decode workflow metadata for {}", workflow_path.display()))
+    serde_json::from_slice(&output.stdout).context("decode workflow metadata")
 }
 
 pub(crate) fn discovery_help(
@@ -1323,6 +1380,285 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("workflow_started")
+        );
+        tasks.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ephemeral_source_is_preflighted_persisted_exactly_and_remains_inspectable() {
+        if Command::new("node")
+            .arg("--version")
+            .output()
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let session = home.path().join("sessions/test");
+        fs::create_dir_all(&session).unwrap();
+        let plugins = HashMap::from([(
+            "dynamic-workflows".into(),
+            root.join("plugins/dynamic-workflows"),
+        )]);
+        let source = concat!(
+            "export const meta = {\n",
+            "  name: \"one-off-review\",\n",
+            "  description: \"one-off test\",\n",
+            "  inputSchema: { type: \"string\", minLength: 2 }\n",
+            "}\n",
+            "export default async function ({ args }) { return `ephemeral:${args}` }\n",
+            "// exact trailing source bytes are durable\n",
+        );
+        let tasks = WorkflowTasks::default();
+        let launched = tasks
+            .launch(
+                workspace.path(),
+                home.path(),
+                "11111111-1111-4111-8111-111111111111",
+                &session,
+                &plugins,
+                agent_context(),
+                &json!({ "source": source, "args": "ok" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(launched["workflow"], "one-off-review");
+        assert_eq!(launched["description"], "one-off test");
+        assert_eq!(launched["input_schema"]["minLength"], 2);
+
+        let task_id = launched["task_id"].as_str().unwrap();
+        let task_dir = session.join("workflows").join(task_id);
+        assert_eq!(
+            fs::read_to_string(task_dir.join("workflow.js")).unwrap(),
+            source
+        );
+        let request = read_json(&task_dir.join("request.json")).unwrap();
+        assert_eq!(request["selection"], "source");
+        assert_eq!(
+            PathBuf::from(request["workflowPath"].as_str().unwrap()),
+            task_dir.join("workflow.js")
+        );
+        assert!(request.get("source").is_none());
+        assert!(!workspace.path().join(".phi/workflows").exists());
+        assert!(!home.path().join("workflows").exists());
+
+        let output = tasks
+            .output(&session, &json!({ "task_id": task_id, "wait_ms": null }))
+            .await
+            .unwrap();
+        assert_eq!(output["status"], "completed");
+        assert_eq!(output["workflow"], "one-off-review");
+        assert_eq!(output["result"]["value"], "ephemeral:ok");
+        assert_eq!(
+            fs::read_to_string(task_dir.join("workflow.js")).unwrap(),
+            source
+        );
+        tasks.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ephemeral_source_rejects_selection_and_preflight_failures_before_task_creation() {
+        if Command::new("node")
+            .arg("--version")
+            .output()
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let session = home.path().join("sessions/test");
+        fs::create_dir_all(&session).unwrap();
+        let plugins = HashMap::from([(
+            "dynamic-workflows".into(),
+            root.join("plugins/dynamic-workflows"),
+        )]);
+        let tasks = WorkflowTasks::default();
+        let valid = "export const meta = { name: 'one-off', description: 'test' }; export default async () => null";
+
+        for arguments in [
+            json!({ "name": "one-off", "source": valid, "args": null }),
+            json!({ "path": ".phi/workflows/one-off.js", "source": valid, "args": null }),
+        ] {
+            let error = tasks
+                .launch(
+                    workspace.path(),
+                    home.path(),
+                    "11111111-1111-4111-8111-111111111111",
+                    &session,
+                    &plugins,
+                    agent_context(),
+                    &arguments,
+                )
+                .await
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("mutually exclusive"));
+        }
+
+        for (source, args, expected) in [
+            ("export const meta =", Value::Null, "SyntaxError"),
+            (
+                "export default async () => null",
+                Value::Null,
+                "must export meta",
+            ),
+            (
+                "export const meta = { name: 'bad-schema', description: 'test', inputSchema: { $ref: '#' } }; export default async () => null",
+                Value::Null,
+                "invalid workflow input schema at /$ref",
+            ),
+            (
+                "export const meta = { name: 'bad-args', description: 'test', inputSchema: { type: 'object', required: ['prompt'] } }; export default async () => null",
+                json!({}),
+                "workflow args at /prompt violate input schema at /required",
+            ),
+            (
+                "import { readFile } from 'node:fs'; export const meta = { name: 'bad-import', description: 'test' }; export default async () => readFile",
+                Value::Null,
+                "workflow import is not allowed: node:fs",
+            ),
+            (
+                "export const meta = { name: 'bad-api', description: 'test' }; export default async () => process.pid",
+                Value::Null,
+                "workflow uses a forbidden runtime API",
+            ),
+        ] {
+            let error = tasks
+                .launch(
+                    workspace.path(),
+                    home.path(),
+                    "11111111-1111-4111-8111-111111111111",
+                    &session,
+                    &plugins,
+                    agent_context(),
+                    &json!({ "source": source, "args": args }),
+                )
+                .await
+                .unwrap_err();
+            let error = format!("{error:#}");
+            assert!(error.contains(expected), "{error}");
+        }
+        assert!(!session.join("workflows").exists());
+        assert!(!workspace.path().join(".phi/workflows").exists());
+        assert!(!home.path().join("workflows").exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ephemeral_source_cannot_expand_parent_agent_authority() {
+        if Command::new("node")
+            .arg("--version")
+            .output()
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let session = home.path().join("sessions/test");
+        fs::create_dir_all(&session).unwrap();
+        let plugins = HashMap::from([(
+            "dynamic-workflows".into(),
+            root.join("plugins/dynamic-workflows"),
+        )]);
+        let source = concat!(
+            "import { agent } from 'phi:workflow'\n",
+            "export const meta = { name: 'authority-check', description: 'test' }\n",
+            "export default async () => agent('should not start', { capabilities: 'workspace-write' })\n",
+        );
+        let tasks = WorkflowTasks::default();
+        let launched = tasks
+            .launch(
+                workspace.path(),
+                home.path(),
+                "11111111-1111-4111-8111-111111111111",
+                &session,
+                &plugins,
+                agent_context(),
+                &json!({ "source": source, "args": null }),
+            )
+            .await
+            .unwrap();
+        let task_id = launched["task_id"].as_str().unwrap();
+        let output = tasks
+            .output(&session, &json!({ "task_id": task_id, "wait_ms": null }))
+            .await
+            .unwrap();
+        assert_eq!(output["status"], "failed");
+        assert!(
+            output["state"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("workspace-write capabilities exceed parent authority")
+        );
+        assert!(
+            !session
+                .join("workflows")
+                .join(task_id)
+                .join("children.jsonl")
+                .exists()
+        );
+        tasks.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ephemeral_source_uses_normal_cancellation_records() {
+        if Command::new("node")
+            .arg("--version")
+            .output()
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let session = home.path().join("sessions/test");
+        fs::create_dir_all(&session).unwrap();
+        let plugins = HashMap::from([(
+            "dynamic-workflows".into(),
+            root.join("plugins/dynamic-workflows"),
+        )]);
+        let source = concat!(
+            "export const meta = { name: 'cancel-one-off', description: 'test' }\n",
+            "export default async () => new Promise(resolve => setTimeout(resolve, 60_000))\n",
+        );
+        let tasks = WorkflowTasks::default();
+        let launched = tasks
+            .launch(
+                workspace.path(),
+                home.path(),
+                "11111111-1111-4111-8111-111111111111",
+                &session,
+                &plugins,
+                agent_context(),
+                &json!({ "source": source, "args": null }),
+            )
+            .await
+            .unwrap();
+        let task_id = launched["task_id"].as_str().unwrap();
+        let stopped = tasks
+            .stop(&session, &json!({ "task_id": task_id }))
+            .await
+            .unwrap();
+        assert_eq!(stopped["status"], "cancelled");
+        assert_eq!(stopped["workflow"], "cancel-one-off");
+        let output = tasks
+            .output(&session, &json!({ "task_id": task_id, "wait_ms": 0 }))
+            .await
+            .unwrap();
+        assert_eq!(output["status"], "cancelled");
+        assert_eq!(
+            fs::read_to_string(session.join("workflows").join(task_id).join("workflow.js"))
+                .unwrap(),
+            source
         );
         tasks.shutdown().await;
     }

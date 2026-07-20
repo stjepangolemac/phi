@@ -51,6 +51,12 @@ test("workflows without schemas preserve arbitrary JSON args", () => {
   assert.doesNotThrow(() => validateWorkflowModule(module, "review", ["arbitrary"], true))
 })
 
+test("ephemeral workflows derive identity from validated module metadata", () => {
+  const metadata = validateWorkflowModule(workflow(), undefined, { review: { files: ["ok"] } }, true)
+  assert.equal(metadata.name, "review")
+  assert.equal(metadata.description, "Review files")
+})
+
 test("invalid and unsupported schema features have schema paths", () => {
   assert.throws(
     () => validateInputSchema({ type: "object", properties: { value: { $ref: "#/$defs/value" } } }),

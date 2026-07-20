@@ -4759,11 +4759,13 @@ mod tests {
                         .any(|tool| tool["name"] == "Workflow"
                             && tool["strict"] == false
                             && tool["parameters"]["properties"]["path"]["type"] == "string"
+                            && tool["parameters"]["properties"]["source"]["type"] == "string"
                             && tool["parameters"]["properties"]["args"].get("type").is_none()
                             && tool["parameters"]["properties"]["args"]["description"]
                                 .as_str().unwrap().contains("Declared input schemas")
                             && tool["parameters"]["required"]
-                                == serde_json::json!(["name", "args"]))
+                                == serde_json::json!(["args"])
+                            && tool["parameters"]["oneOf"].as_array().unwrap().len() == 2)
                     && body["tools"].as_array().unwrap().iter()
                         .any(|tool| tool["name"] == "TaskOutput"
                             && tool["strict"] == true

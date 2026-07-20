@@ -286,7 +286,7 @@ export function validateWorkflowModule(module, expectedName, args, validateArgs)
       || typeof module.meta.description !== "string") {
     throw new Error("workflow must export meta with name and description")
   }
-  if (module.meta.name !== expectedName) {
+  if (expectedName !== undefined && expectedName !== null && module.meta.name !== expectedName) {
     throw new Error(`workflow meta.name must match requested name: ${expectedName}`)
   }
   if (typeof module.default !== "function") {

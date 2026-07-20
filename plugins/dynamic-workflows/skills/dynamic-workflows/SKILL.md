@@ -16,6 +16,15 @@ When looking for an existing definition, inspect global workflows first, then wo
 
 Pass optional `path` to select an exact same-named definition instead of using discovery precedence. Relative paths resolve from the current workspace, while absolute paths are accepted within the same allowed roots. The path must be a regular `.js` file inside the global, current-workspace, or a loaded-plugin workflow root; traversal, escaping symlinks, unloaded-plugin paths, and outside paths are rejected. The module's `meta.name` must match the requested `name`. Each launch still gets a unique session-local task ID and run directory.
 
+For a one-off workflow, pass `source` and `args` without `name` or `path`. The tool schema and runtime reject mixed selection. Source modules use the same contract, and validated `meta.name` supplies the task display name. Phi validates syntax, metadata, imports/runtime APIs, input schema, and args before task or child creation, then atomically persists the exact source as the run directory's `workflow.js`. It does not create or modify any reusable definition. Use source for genuinely ephemeral orchestration; create `.phi/workflows/NAME.js` when the workflow should be maintained or reused.
+
+```json
+{
+  "source": "import { agent } from \"phi:workflow\"\nexport const meta = { name: \"one-off-review\", description: \"Review once\" }\nexport default async () => agent(\"Review the current diff.\", { capabilities: \"read-only\" })\n",
+  "args": null
+}
+```
+
 Modules export `meta` with `name` and `description`, plus a default async `({ args }) => value` function. Import `agent`, `parallel`, `batch`, `pipeline`, `phase`, `log`, and `budget` from `phi:workflow`.
 
 ```js
@@ -40,13 +49,13 @@ export default async function ({ args }) {
 }
 ```
 
-Declare optional `meta.inputSchema` when callers need discoverable, validated inputs. Phi adds name-discovered schemas to the `Workflow` tool description and returns `description` plus `input_schema` from successful name or exact-path launches. It validates the schema and `Workflow.args` before task, runner, or child creation, with JSON Pointer-style instance and schema paths in errors. Omitting the schema preserves arbitrary JSON args.
+Declare optional `meta.inputSchema` when callers need discoverable, validated inputs. Phi adds name-discovered schemas to the `Workflow` tool description and returns `description` plus `input_schema` from successful name, exact-path, or source launches. It validates the schema and `Workflow.args` before task, runner, or child creation, with JSON Pointer-style instance and schema paths in errors. Omitting the schema preserves arbitrary JSON args.
 
 The supported draft 2020-12/draft-07 subset includes boolean schemas, types, enums/constants, object properties/required/additional properties, homogeneous array items, size and numeric limits, patterns, uniqueness, and schema combinators. Standard annotations are accepted. Unsupported keywords such as `$ref`, `$defs`, conditionals, tuple/prefix items, dependencies, and formats fail explicitly at their schema path.
 
 Tasks passed to `parallel` or `batch` must be functions so work starts only when scheduled. `parallel` continuously fills its concurrency limit; `batch` runs fixed-size waves. Workflows are limited to 8 concurrent agents, 32 total agents, and 60 minutes.
 
-`agent(prompt, { label?, schema?, branch?, branch_off?, model?, reasoning?, timeout_ms?, capabilities? })` allocates a fresh durable child session under `$PHI_HOME/sessions/` before starting a one-shot RPC child. Omitted model and reasoning values inherit the parent's effective pinned selection; explicit combinations are validated against the parent session catalog before launch. `timeout_ms` is bounded to 1–3,600,000 ms, includes queue/setup/model/tool time, and cannot extend the workflow deadline. The `parent`, `read-only`, and `workspace-write` capability profiles only preserve or reduce parent authority; `workspace-write` requires parent write authority. RPC children cannot satisfy interactive approvals. Run records and child metadata persist the effective model, reasoning, service tier, timeout, profile, parent, task, label, branch, workspace, and worktree relationships, with timeout recorded as `timed_out`. A schema requests strict JSON-schema output. Use `Workflow` with `name`, optional exact `path`, and `args` to launch; use `TaskOutput` to inspect or wait and `TaskStop` to cancel.
+`agent(prompt, { label?, schema?, branch?, branch_off?, model?, reasoning?, timeout_ms?, capabilities? })` allocates a fresh durable child session under `$PHI_HOME/sessions/` before starting a one-shot RPC child. Omitted model and reasoning values inherit the parent's effective pinned selection; explicit combinations are validated against the parent session catalog before launch. `timeout_ms` is bounded to 1–3,600,000 ms, includes queue/setup/model/tool time, and cannot extend the workflow deadline. The `parent`, `read-only`, and `workspace-write` capability profiles only preserve or reduce parent authority; `workspace-write` requires parent write authority. RPC children cannot satisfy interactive approvals. These limits and the parent's effective policy apply identically to ephemeral source, so it cannot expand authority or bypass an approval requirement. Run records and child metadata persist the effective model, reasoning, service tier, timeout, profile, parent, task, label, branch, workspace, and worktree relationships, with timeout recorded as `timed_out`. A schema requests strict JSON-schema output. Use `Workflow` with `name`, optional exact `path`, and `args`, or with mutually exclusive `source` and `args`; use `TaskOutput` to inspect or wait and `TaskStop` to cancel.
 
 For one focused child, use the bundled `delegate` workflow. Pass the prompt and the same currently supported `agent()` options under `options`; omit `options` for a plain text result:
 

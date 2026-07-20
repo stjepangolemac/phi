@@ -118,8 +118,8 @@ try {
     throw new Error("workflow runner requires a resolved workflow path")
   }
   const persistedPath = join(taskDir, "workflow.js")
-  await copyFile(sourcePath, persistedPath)
-  const source = await readFile(sourcePath, "utf8")
+  if (sourcePath !== persistedPath) await copyFile(sourcePath, persistedPath)
+  const source = await readFile(persistedPath, "utf8")
   const apiUrl = pathToFileURL(join(fileURLToPath(new URL(".", import.meta.url)), "api.mjs")).href
   const generatedPath = join(taskDir, "workflow.generated.mjs")
   await writeFile(generatedPath, prepareSource(source, apiUrl))

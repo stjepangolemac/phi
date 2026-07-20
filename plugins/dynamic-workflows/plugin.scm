@@ -7,7 +7,7 @@
     'strict_mode "loose"
     'description
     (string-append
-      "Launch a JavaScript workflow in the background. Name-only calls discover ~/.phi/workflows, .phi/workflows, then loaded plugins; path selects an exact file in one of those roots. Use TaskOutput to wait for or inspect the task and TaskStop to cancel it."
+      "Launch a JavaScript workflow in the background. Name-only calls discover ~/.phi/workflows, .phi/workflows, then loaded plugins; path selects an exact file in one of those roots; source runs one-off JavaScript without creating a reusable definition. Use TaskOutput to wait for or inspect the task and TaskStop to cancel it."
       (runtime-config-value 'workflow_help ""))
     'parameters
     (hash 'type "object"
@@ -16,9 +16,21 @@
                 'path
                 (hash 'type "string"
                       'description "Optional exact .js workflow path. Relative paths resolve from the workspace; absolute paths are also accepted within allowed workflow roots.")
+                'source
+                (hash 'type "string"
+                      'description "One-off JavaScript workflow source. Mutually exclusive with name and path; meta.name supplies the task display name.")
                 'args
                 (hash 'description "JSON value passed to the workflow function. Declared input schemas are listed in the tool description."))
-          'required (list "name" "args")
+          'required (list "args")
+          'oneOf
+          (list
+            (hash 'required (list "name")
+                  'not (hash 'required (list "source")))
+            (hash 'required (list "source")
+                  'not
+                  (hash 'anyOf
+                        (list (hash 'required (list "name"))
+                              (hash 'required (list "path"))))))
           'additionalProperties #f)))
 
 (define (task-output-tool)
