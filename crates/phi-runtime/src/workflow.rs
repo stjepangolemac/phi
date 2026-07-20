@@ -50,6 +50,7 @@ impl WorkflowTasks {
         let plugin = plugin_roots
             .get("dynamic-workflows")
             .context("dynamic-workflows plugin is not loaded")?;
+        let metadata = inspect_workflow(plugin, &workflow_path, name, Some(&args))?;
         let runner = plugin.join("runner/workflow-runner.mjs");
         if !runner.is_file() {
             bail!("dynamic workflow runner is missing");
@@ -124,6 +125,8 @@ impl WorkflowTasks {
             "status": "async_launched",
             "task_id": task_id,
             "workflow": name,
+            "description": metadata["description"],
+            "input_schema": metadata.get("inputSchema").cloned().unwrap_or(Value::Null),
             "task_dir": dir,
         }))
     }
@@ -594,6 +597,103 @@ fn resolve_workflow(
         .with_context(|| format!("workflow not found: {name}"))
 }
 
+fn inspect_workflow(
+    plugin: &Path,
+    workflow_path: &Path,
+    name: &str,
+    args: Option<&Value>,
+) -> Result<Value> {
+    let inspector = plugin.join("runner/workflow-inspect.mjs");
+    if !inspector.is_file() {
+        bail!("dynamic workflow inspector is missing");
+    }
+    let mut child = StdCommand::new("node")
+        .arg(&inspector)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("start workflow metadata inspector")?;
+    let request = json!({
+        "workflowPath": workflow_path,
+        "name": name,
+        "args": args.cloned().unwrap_or(Value::Null),
+        "validateArgs": args.is_some(),
+    });
+    serde_json::to_writer(
+        child
+            .stdin
+            .as_mut()
+            .context("open workflow inspector stdin")?,
+        &request,
+    )?;
+    drop(child.stdin.take());
+    let output = child
+        .wait_with_output()
+        .context("wait for workflow metadata inspector")?;
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr);
+        let message = error.lines().next().unwrap_or("workflow inspection failed");
+        bail!("inspect workflow {}: {message}", workflow_path.display());
+    }
+    serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("decode workflow metadata for {}", workflow_path.display()))
+}
+
+pub(crate) fn discovery_help(
+    workspace: &Path,
+    home: &Path,
+    plugin_roots: &HashMap<String, PathBuf>,
+) -> String {
+    let Some(plugin) = plugin_roots.get("dynamic-workflows") else {
+        return String::new();
+    };
+    let mut selected = HashMap::<String, PathBuf>::new();
+    for (_, root) in workflow_roots(workspace, home, plugin_roots) {
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        let mut paths = entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.is_file() && path.extension().and_then(|value| value.to_str()) == Some("js")
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        for path in paths {
+            let Some(name) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if validate_name(name).is_ok() {
+                selected.entry(name.to_owned()).or_insert(path);
+            }
+        }
+    }
+    let mut selected = selected.into_iter().collect::<Vec<_>>();
+    selected.sort_by(|left, right| left.0.cmp(&right.0));
+    if selected.is_empty() {
+        return String::new();
+    }
+    let lines = selected
+        .into_iter()
+        .map(
+            |(name, path)| match inspect_workflow(plugin, &path, &name, None) {
+                Ok(metadata) => format!(
+                    "- {name}: {} inputSchema={}",
+                    metadata["description"].as_str().unwrap_or(""),
+                    metadata
+                        .get("inputSchema")
+                        .map(Value::to_string)
+                        .unwrap_or_else(|| "<none; arbitrary JSON args>".into())
+                ),
+                Err(error) => format!("- {name}: unavailable ({error:#})"),
+            },
+        )
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("\n\nDiscovered name-only workflows and their declared input schemas:\n{lines}")
+}
+
 fn resolve_exact_workflow(
     workspace: &Path,
     home: &Path,
@@ -937,6 +1037,9 @@ mod tests {
         assert!(skill.contains("user explicitly asks to make one global"));
         assert!(skill.contains("$PHI_HOME/sessions/<parent-session-id>/workflows/<task-id>/"));
         assert!(skill.contains("child sessions and run records remain durable"));
+        assert!(skill.contains("meta.inputSchema"));
+        assert!(skill.contains("before task, runner, or child creation"));
+        assert!(skill.contains("Unsupported keywords"));
     }
 
     #[test]
@@ -1089,6 +1192,7 @@ mod tests {
             .args([
                 "--test",
                 "plugins/dynamic-workflows/runner/worktrees.test.mjs",
+                "plugins/dynamic-workflows/runner/workflow-module.test.mjs",
                 "plugins/dynamic-workflows/runner/workflow-runner.test.mjs",
             ])
             .current_dir(root)
@@ -1135,7 +1239,7 @@ mod tests {
                 "11111111-1111-4111-8111-111111111111",
                 &session,
                 &plugins,
-                &json!({ "name": ".hidden", "args": { "ok": true } }),
+                &json!({ "name": ".hidden", "args": ["arbitrary", 7] }),
             )
             .await
             .unwrap();
@@ -1157,7 +1261,7 @@ mod tests {
             .unwrap();
         assert_eq!(output["status"], "completed");
         assert_eq!(output["workflow"], ".hidden");
-        assert_eq!(output["result"]["value"], json!({ "ok": true }));
+        assert_eq!(output["result"]["value"], json!(["arbitrary", 7]));
         assert!(
             output["progress"]
                 .as_str()
@@ -1165,6 +1269,158 @@ mod tests {
                 .contains("workflow_started")
         );
         tasks.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn declared_input_schemas_validate_before_launch_and_are_discoverable() {
+        if Command::new("node")
+            .arg("--version")
+            .output()
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let session = home.path().join("sessions/test");
+        fs::create_dir_all(&session).unwrap();
+        let workflow = workspace.path().join(".phi/workflows/review.js");
+        fs::create_dir_all(workflow.parent().unwrap()).unwrap();
+        fs::write(
+            &workflow,
+            r#"
+                export const meta = {
+                  name: "review",
+                  description: "review selected files",
+                  inputSchema: {
+                    type: "object",
+                    properties: {
+                      request: {
+                        type: "object",
+                        properties: {
+                          files: { type: "array", items: { type: "string", minLength: 2 } }
+                        },
+                        required: ["files"],
+                        additionalProperties: false
+                      }
+                    },
+                    required: ["request"],
+                    additionalProperties: false
+                  }
+                }
+                export default async function ({ args }) { return args }
+            "#,
+        )
+        .unwrap();
+        let plugins = HashMap::from([(
+            "dynamic-workflows".into(),
+            root.join("plugins/dynamic-workflows"),
+        )]);
+        let tasks = WorkflowTasks::default();
+
+        let help = discovery_help(workspace.path(), home.path(), &plugins);
+        assert!(help.contains("review selected files"));
+        assert!(help.contains("\"minLength\":2"));
+
+        let error = tasks
+            .launch(
+                workspace.path(),
+                home.path(),
+                "11111111-1111-4111-8111-111111111111",
+                &session,
+                &plugins,
+                &json!({ "name": "review", "args": { "request": { "files": [""] } } }),
+            )
+            .await
+            .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("args at /request/files/0"), "{error}");
+        assert!(
+            error.contains("input schema at /properties/request/properties/files/items/minLength"),
+            "{error}"
+        );
+        assert!(!session.join("workflows").exists());
+
+        let args = json!({ "request": { "files": ["ok"] } });
+        let by_name = tasks
+            .launch(
+                workspace.path(),
+                home.path(),
+                "11111111-1111-4111-8111-111111111111",
+                &session,
+                &plugins,
+                &json!({ "name": "review", "args": args }),
+            )
+            .await
+            .unwrap();
+        let by_path = tasks
+            .launch(
+                workspace.path(),
+                home.path(),
+                "11111111-1111-4111-8111-111111111111",
+                &session,
+                &plugins,
+                &json!({
+                    "name": "review",
+                    "path": ".phi/workflows/review.js",
+                    "args": args
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(by_name["description"], "review selected files");
+        assert_eq!(by_name["input_schema"], meta_schema(&workflow));
+        assert_eq!(by_path["input_schema"], by_name["input_schema"]);
+        for launch in [&by_name, &by_path] {
+            let output = tasks
+                .output(
+                    &session,
+                    &json!({ "task_id": launch["task_id"], "wait_ms": null }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(output["status"], "completed");
+            assert_eq!(output["result"]["value"], args);
+        }
+        tasks.shutdown().await;
+    }
+
+    fn meta_schema(workflow: &Path) -> Value {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let plugin = root.join("plugins/dynamic-workflows");
+        inspect_workflow(&plugin, workflow, "review", None).unwrap()["inputSchema"].clone()
+    }
+
+    #[test]
+    fn invalid_and_unsupported_declared_schemas_fail_with_paths() {
+        if StdCommand::new("node").arg("--version").output().is_err() {
+            return;
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let plugin = root.join("plugins/dynamic-workflows");
+        let directory = tempfile::tempdir().unwrap();
+        let workflow = directory.path().join("invalid.js");
+        for (schema, expected) in [
+            ("{ type: 'array', minItems: -1 }", "/minItems"),
+            (
+                "{ type: 'object', properties: { item: { $ref: '#' } } }",
+                "/properties/item/$ref",
+            ),
+        ] {
+            fs::write(
+                &workflow,
+                format!(
+                    "export const meta = {{ name: 'invalid', description: 'invalid', inputSchema: {schema} }}; export default async () => null"
+                ),
+            )
+            .unwrap();
+            let error = inspect_workflow(&plugin, &workflow, "invalid", None).unwrap_err();
+            let error = format!("{error:#}");
+            assert!(error.contains("invalid workflow input schema"), "{error}");
+            assert!(error.contains(expected), "{error}");
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

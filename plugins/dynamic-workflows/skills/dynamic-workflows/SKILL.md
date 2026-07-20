@@ -23,7 +23,13 @@ import { agent, parallel, phase } from "phi:workflow"
 
 export const meta = {
   name: "review",
-  description: "Review a change from several perspectives."
+  description: "Review a change from several perspectives.",
+  inputSchema: {
+    type: "object",
+    properties: { files: { type: "array", items: { type: "string" } } },
+    required: ["files"],
+    additionalProperties: false
+  }
 }
 
 export default async function ({ args }) {
@@ -33,6 +39,10 @@ export default async function ({ args }) {
   ), { concurrency: 3 })
 }
 ```
+
+Declare optional `meta.inputSchema` when callers need discoverable, validated inputs. Phi adds name-discovered schemas to the `Workflow` tool description and returns `description` plus `input_schema` from successful name or exact-path launches. It validates the schema and `Workflow.args` before task, runner, or child creation, with JSON Pointer-style instance and schema paths in errors. Omitting the schema preserves arbitrary JSON args.
+
+The supported draft 2020-12/draft-07 subset includes boolean schemas, types, enums/constants, object properties/required/additional properties, homogeneous array items, size and numeric limits, patterns, uniqueness, and schema combinators. Standard annotations are accepted. Unsupported keywords such as `$ref`, `$defs`, conditionals, tuple/prefix items, dependencies, and formats fail explicitly at their schema path.
 
 Tasks passed to `parallel` or `batch` must be functions so work starts only when scheduled. `parallel` continuously fills its concurrency limit; `batch` runs fixed-size waves. Workflows are limited to 8 concurrent agents, 32 total agents, and 60 minutes.
 

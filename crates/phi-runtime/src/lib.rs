@@ -731,15 +731,22 @@ fn build_policy(
         sources.plugins.iter().any(|plugin| plugin.name == "skills"),
         Some(&home.sessions().join(session_id)),
     ));
+    let plugin_roots = sources
+        .plugins
+        .iter()
+        .map(|plugin| (plugin.name.clone(), plugin.root.clone()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let workflow_help = workflow::discovery_help(workspace, &home.root, &plugin_roots);
     let policy = phi_steel::Policy::load_with_state(
         &sources.config,
         &entrypoints(sources),
-        &policy_config_with_schema(
+        &policy_config_with_schema_and_workflows(
             &capabilities,
             session_id,
             &load_user_state(home)?,
             &skills.skills,
             output_schema,
+            &workflow_help,
         ),
         saved_state,
     )?;
@@ -1337,15 +1344,16 @@ fn policy_config(
     user_state: &UserState,
     skills: &[phi_core::skill::SkillSpec],
 ) -> String {
-    policy_config_with_schema(capabilities, session_id, user_state, skills, None)
+    policy_config_with_schema_and_workflows(capabilities, session_id, user_state, skills, None, "")
 }
 
-fn policy_config_with_schema(
+fn policy_config_with_schema_and_workflows(
     capabilities: &phi_core::capability::Registry,
     session_id: &str,
     user_state: &UserState,
     skills: &[phi_core::skill::SkillSpec],
     output_schema: Option<&serde_json::Value>,
+    workflow_help: &str,
 ) -> String {
     let mut tools = capabilities.specs();
     tools.push(phi_core::capability::exec_command_spec());
@@ -1358,6 +1366,7 @@ fn policy_config_with_schema(
         "session_id": session_id,
         "skills": skills,
         "tools": tools,
+        "workflow_help": workflow_help,
     });
     if let Some(model) = &user_state.model {
         value["model"] = model.id.clone().into();
@@ -3886,6 +3895,9 @@ mod tests {
                         .any(|tool| tool["name"] == "Workflow"
                             && tool["strict"] == false
                             && tool["parameters"]["properties"]["path"]["type"] == "string"
+                            && tool["parameters"]["properties"]["args"].get("type").is_none()
+                            && tool["parameters"]["properties"]["args"]["description"]
+                                .as_str().unwrap().contains("Declared input schemas")
                             && tool["parameters"]["required"]
                                 == serde_json::json!(["name", "args"]))
                     && body["tools"].as_array().unwrap().iter()
