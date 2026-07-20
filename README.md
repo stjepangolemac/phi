@@ -165,7 +165,16 @@ import { agent, batch, parallel, phase } from "phi:workflow"
 
 export const meta = {
   name: "review",
-  description: "Review a change from several perspectives."
+  description: "Review a change from several perspectives.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      files: { type: "array", items: { type: "string" } },
+      mode: { enum: ["batch", "parallel"] }
+    },
+    required: ["files", "mode"],
+    additionalProperties: false
+  }
 }
 
 export default async function ({ args }) {
@@ -179,6 +188,10 @@ export default async function ({ args }) {
     : parallel(reviews, { concurrency: 3 })
 }
 ```
+
+`meta.inputSchema` is optional. When present, it is validated when the workflow is discovered and `Workflow.args` is validated before Phi creates a task directory, launches the runner, or creates a child session. Validation failures report JSON Pointer-style instance and schema paths. The `Workflow` tool description lists each name-discovered workflow's description and schema; a successful launch also returns `description` and `input_schema`, identically for name and exact-path selection. Without `inputSchema`, `args` remains an arbitrary JSON value for backward compatibility.
+
+Input schemas support boolean schemas and the common draft 2020-12/draft-07 subset: `type`, `enum`, `const`, `properties`, `required`, `additionalProperties`, `items`, string/array/object size limits, `pattern`, numeric limits, `multipleOf`, `uniqueItems`, and `allOf`/`anyOf`/`oneOf`/`not`, plus standard annotation keywords. Unsupported features such as `$ref`, `$defs`, conditionals, tuple/prefix items, dependencies, and formats are rejected with the unsupported keyword's schema path rather than ignored.
 
 `parallel(tasks, { concurrency })` continuously fills up to the requested number of task slots while preserving result order. `batch(tasks, { size })` runs fixed-size waves through `parallel()` and waits for each wave before starting the next. Tasks are functions so their work does not start before the scheduler invokes them. Both APIs remain subject to the workflow runtime's global agent concurrency limit.
 

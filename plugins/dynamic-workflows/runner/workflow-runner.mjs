@@ -4,6 +4,7 @@ import { join } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import { configure } from "./api.mjs"
 import { createWorktreeManager } from "./worktrees.mjs"
+import { prepareSource, validateWorkflowModule } from "./workflow-module.mjs"
 
 const nodeProcess = globalThis.process
 const requestPath = nodeProcess.argv[2]
@@ -101,20 +102,6 @@ async function terminateFromSignal(code) {
 nodeProcess.on("SIGTERM", () => { void terminateFromSignal(143) })
 nodeProcess.on("SIGINT", () => { void terminateFromSignal(130) })
 
-function prepareSource(source, apiUrl) {
-  if (/\bimport\s*\(/.test(source)) throw new Error("dynamic imports are not allowed")
-  const imports = [...source.matchAll(/\bfrom\s*(["'])([^"']+)\1/g)]
-  for (const match of imports) {
-    if (match[2] !== "phi:workflow") {
-      throw new Error(`workflow import is not allowed: ${match[2]}`)
-    }
-  }
-  if (/\b(?:process|require|fetch|WebSocket|child_process)\b/.test(source)) {
-    throw new Error("workflow uses a forbidden runtime API")
-  }
-  return source.replace(/(["'])phi:workflow\1/g, JSON.stringify(apiUrl))
-}
-
 await mkdir(taskDir, { recursive: true })
 await atomicJson(statePath, {
   taskId: request.taskId,
@@ -161,17 +148,8 @@ try {
     agentFinished: operation => agents.delete(operation)
   })
   const module = await import(`${pathToFileURL(generatedPath).href}?task=${request.taskId}`)
-  if (!module.meta || typeof module.meta.name !== "string"
-      || typeof module.meta.description !== "string") {
-    throw new Error("workflow must export meta with name and description")
-  }
-  if (module.meta.name !== request.name) {
-    throw new Error(`workflow meta.name must match requested name: ${request.name}`)
-  }
-  if (typeof module.default !== "function") {
-    throw new Error("workflow must default-export an async function")
-  }
-  await progress({ type: "workflow_started", name: request.name, meta: module.meta })
+  const meta = validateWorkflowModule(module, request.name, request.args, true)
+  await progress({ type: "workflow_started", name: request.name, meta })
   const value = await module.default({ args: request.args })
   closing = true
   await stopChildren()
