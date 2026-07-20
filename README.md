@@ -197,6 +197,28 @@ Input schemas support boolean schemas and the common draft 2020-12/draft-07 subs
 
 `agent(prompt, { label?, schema?, branch?, branch_off? })` allocates a durable child session in the same Phi home before starting a one-shot Phi child. Child agents run with `--yolo`; workflows are therefore trusted local code. A schema requests strict JSON-schema output and makes `agent()` return the parsed JSON value. The initial runtime limits are 8 concurrent agents, 32 agents total per workflow, and 60 minutes per workflow. Workflow runs are distinct from definitions: task files, progress, logs, results, managed-worktree ownership metadata, and child relationships live under `$PHI_HOME/sessions/<parent-session-id>/workflows/<task-id>/`. Every launch receives a unique task ID and directory, including launches of same-named definitions. Each child has a separate flat `$PHI_HOME/sessions/<child-session-id>/` entry recording its parent session, workflow task, agent label, branch, workspace, and actual worktree path. Background tasks live for the duration of the parent Phi process and are cancelled when it exits, but their run records and child sessions remain durable.
 
+For a single focused child, the plugin bundles `delegate`. It takes a required `prompt` plus optional `options` matching the currently supported `agent()` options (`label`, `schema`, `branch`, and `branch_off`) and returns the child result directly:
+
+```json
+{
+  "name": "delegate",
+  "args": {
+    "prompt": "Summarize the current diff.",
+    "options": {
+      "label": "summary",
+      "schema": {
+        "type": "object",
+        "properties": { "summary": { "type": "string" } },
+        "required": ["summary"],
+        "additionalProperties": false
+      }
+    }
+  }
+}
+```
+
+Launch it through `Workflow`, inspect or wait through `TaskOutput`, and cancel through `TaskStop`. Because it is an ordinary workflow using one ordinary `agent()` call, it uses the same budgets, durable child/task records, terminal failure bookkeeping, and cleanup as every other workflow.
+
 For isolated edits, set `branch` to a workflow-local logical name. Phi creates a task-owned `phi/...` branch and deterministic temporary Git worktree from the workflow's launch commit, then starts that child in the corresponding repository-relative subdirectory. `branch_off` is valid only with `branch` and can name either an external Git ref or a completed managed logical branch. Integration agents receive the logical-to-actual branch map so they can merge completed managed work. Branched agents should commit and return commit hashes through schemas. All managed worktrees and refs are deleted on every workflow exit, including errors, timeouts, cancellation, and stale-task cleanup; wanted commits must therefore be promoted to a non-managed ref before exit, normally by a final explicit unbranched `agent()` call. Cleanup only operates on paths and refs recorded as created by that workflow task and never adopts pre-existing branches or worktrees.
 
 `TaskOutput` accepts required nullable `wait_ms`: `null` waits up to the 15-second default, `0` checks immediately, and an integer selects a wait up to 300 seconds. Its structured summary reports the active phase, latest workflow log, and running, completed, and failed agent counts so the TUI can show useful progress without dumping internal task paths or raw progress events.

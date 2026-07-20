@@ -1191,6 +1191,7 @@ mod tests {
         let status = StdCommand::new("node")
             .args([
                 "--test",
+                "plugins/dynamic-workflows/runner/delegate.test.mjs",
                 "plugins/dynamic-workflows/runner/worktrees.test.mjs",
                 "plugins/dynamic-workflows/runner/workflow-module.test.mjs",
                 "plugins/dynamic-workflows/runner/workflow-runner.test.mjs",

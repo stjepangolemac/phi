@@ -13,7 +13,7 @@ function git(root, ...args) {
   return execFileSync("git", ["-C", root, ...args], { encoding: "utf8" }).trim()
 }
 
-async function fixture(source) {
+async function fixture(source, args = null, name = "managed-test") {
   const base = await mkdtemp(join(tmpdir(), "phi-workflow-runner-test-"))
   const repository = join(base, "repository")
   const home = join(base, "home")
@@ -67,9 +67,9 @@ process.stdin.on("end", () => {
   await writeFile(requestPath, JSON.stringify({
     taskId,
     parentSessionId: "11111111-1111-4111-8111-111111111111",
-    name: "managed-test",
+    name,
     workflowPath,
-    args: null,
+    args,
     workspace: repository,
     home,
     taskDir,
@@ -130,6 +130,30 @@ const header = `
 import { agent } from "phi:workflow"
 export const meta = { name: "managed-test", description: "managed test" }
 `
+
+test("runner persists bundled delegate results and child records", async () => {
+  const source = await readFile(new URL("../workflows/delegate.js", import.meta.url), "utf8")
+  const value = await fixture(source, {
+    prompt: "DELEGATE",
+    options: { label: "focused", schema: { type: "object" } }
+  }, "delegate")
+  try {
+    const result = await run(value.requestPath)
+    assert.equal(result.code, 0, result.stderr)
+    const state = JSON.parse(await readFile(join(value.taskDir, "state.json")))
+    const workflowResult = JSON.parse(await readFile(join(value.taskDir, "result.json")))
+    const summary = JSON.parse(await readFile(join(value.taskDir, "summary.json")))
+    const children = (await readFile(join(value.taskDir, "children.jsonl"), "utf8"))
+      .trim().split("\n").map(line => JSON.parse(line))
+    assert.equal(state.status, "completed")
+    assert.equal(workflowResult.value.commit, git(value.repository, "rev-parse", "HEAD"))
+    assert.deepEqual(summary.agents, { started: 1, running: 0, completed: 1, failed: 0 })
+    assert.ok(children.some(entry => entry.agentLabel === "focused" && entry.status === "created"))
+    assert.ok(children.some(entry => entry.agentLabel === "focused" && entry.status === "completed"))
+  } finally {
+    await rm(value.base, { recursive: true, force: true })
+  }
+})
 
 test("runner cleans managed worktrees after success and workflow failure", {
   skip: process.platform === "win32"

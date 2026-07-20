@@ -48,6 +48,28 @@ Tasks passed to `parallel` or `batch` must be functions so work starts only when
 
 `agent(prompt, { label?, schema?, branch?, branch_off? })` allocates a fresh durable child session under `$PHI_HOME/sessions/` before starting `phi --workspace WORKSPACE --yolo rpc --session CHILD_ID`. The run records parent, task, label, branch, workspace, and worktree relationships. A schema requests strict JSON-schema output. Use `Workflow` with `name`, optional exact `path`, and `args` to launch; use `TaskOutput` to inspect or wait and `TaskStop` to cancel.
 
+For one focused child, use the bundled `delegate` workflow. Pass the prompt and the same currently supported `agent()` options under `options`; omit `options` for a plain text result:
+
+```json
+{
+  "name": "delegate",
+  "args": {
+    "prompt": "Summarize the current diff.",
+    "options": {
+      "label": "summary",
+      "schema": {
+        "type": "object",
+        "properties": { "summary": { "type": "string" } },
+        "required": ["summary"],
+        "additionalProperties": false
+      }
+    }
+  }
+}
+```
+
+The launch is an ordinary durable workflow task: inspect it with `TaskOutput`, stop it with `TaskStop`, and expect the same child/task terminal records for success, failure, or cancellation as any other workflow.
+
 ## Managed Git branches
 
 Set `branch` to a workflow-local logical name when an agent should edit in an isolated Git worktree:
