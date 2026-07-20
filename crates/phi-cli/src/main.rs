@@ -10,6 +10,7 @@ struct Config {
 }
 
 #[derive(Parser)]
+#[command(name = "phi", version)]
 struct Cli {
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
@@ -527,10 +528,33 @@ fn emit_json(value: &impl serde::Serialize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::error::ErrorKind;
 
     #[test]
     fn yolo_preapproves_shell_and_writes() {
         let cli = Cli::try_parse_from(["phi", "--yolo"]).unwrap();
         assert_eq!(approval_settings(&cli), (true, true, false));
+    }
+
+    #[test]
+    fn version_flags_report_the_package_version() {
+        for flag in ["--version", "-V"] {
+            let error = Cli::try_parse_from(["phi", flag]).err().unwrap();
+            assert_eq!(error.kind(), ErrorKind::DisplayVersion);
+            assert_eq!(
+                error.to_string(),
+                format!("phi {}\n", env!("CARGO_PKG_VERSION"))
+            );
+        }
+    }
+
+    #[test]
+    fn standard_metadata_preserves_help_and_status_parsing() {
+        let help = Cli::try_parse_from(["phi", "--help"]).err().unwrap();
+        assert_eq!(help.kind(), ErrorKind::DisplayHelp);
+
+        let cli = Cli::try_parse_from(["phi", "--json", "status"]).unwrap();
+        assert!(cli.json);
+        assert!(matches!(cli.command, Some(Command::Status)));
     }
 }
