@@ -144,6 +144,8 @@ pub struct StreamRule {
     pub name: String,
     #[serde(default)]
     pub value: String,
+    #[serde(default)]
+    pub key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -1,5 +1,5 @@
 (set-agent-instructions!
-  "You are a coding agent running inside a Phi harness in the user's current workspace. Work directly on the user's requests using the available tools. Inspect before editing, verify changes, and continue until the requested outcome is complete. Keep responses concise. Use context_mark proactively after completing a substantial phase or when changing focus so older work becomes eligible for selective compaction. When context pressure rises, inspect the active context and compact substantial closed older items when that preserves focus without losing needed details. When working on or reconfiguring the Phi harness itself, read the phi-harness skill with read_file before acting. The user can already see tool calls and their output, so do not repeat them verbatim; state only the conclusion or necessary interpretation. When reconfiguring Phi, edit the active config.scm, validate the change, and reload it into the current conversation.")
+  "You are a coding agent running inside a Phi harness in the user's current workspace. Work directly on the user's requests using the available tools. Inspect before editing, verify changes, and continue until the requested outcome is complete. Keep responses concise. Before the first tool call, send a short commentary update when tool work is needed. Send additional commentary only at meaningful checkpoints, when the plan changes, or when an important finding should be surfaced; do not narrate every trivial command or repeat tool output. Reserve final_answer for the completed response to the user. Commentary is ordinary user-visible progress, not raw reasoning or private chain-of-thought. Use context_mark proactively after completing a substantial phase or when changing focus so older work becomes eligible for selective compaction. When context pressure rises, inspect the active context and compact substantial closed older items when that preserves focus without losing needed details. When working on or reconfiguring the Phi harness itself, read the phi-harness skill with read_file before acting. The user can already see tool calls and their output, so do not repeat them verbatim; state only the conclusion or necessary interpretation. When reconfiguring Phi, edit the active config.scm, validate the change, and reload it into the current conversation.")
 
 (define active-context-items '())
 (define next-context-span 2)
@@ -171,6 +171,16 @@
   (hash 'kind "tool_result"
         'call_id (hash-ref result 'call_id)
         'content (value->jsexpr-string (hash-ref result 'result))))
+
+(define (assistant-final-output messages)
+  (if (null? messages)
+      ""
+      (let* ([message (car messages)]
+             [phase (hash-try-get message 'phase)]
+             [rest (assistant-final-output (cdr messages))])
+        (if (equal? phase "commentary")
+            rest
+            (string-append (hash-ref message 'content) rest)))))
 
 (define (on-event encoded-state encoded-event)
   (define state (string->jsexpr encoded-state))
@@ -628,27 +638,20 @@
           (define calls (provider-calls-for model events))
           (define usage (provider-usage-for model events))
           (define preserved (provider-preserved-items-for model events))
+          (define output-messages (provider-output-messages-for model events))
           (if usage
               (set! last-usage
                     (hash-insert usage '_message_tokens
                                  (estimated-message-tokens messages))))
-          (set! messages (append messages preserved))
+          (set! messages (append messages preserved output-messages))
           (if (not (null? calls))
               (begin
                 (set! pending-context-calls calls)
                 (continue-context-calls))
-              (let* ([content (provider-output-for model events)]
+              (let* ([content (assistant-final-output output-messages)]
                      [finished-content (if (equal? content "")
                                            "Model returned no output."
-                                           content)]
-                     [phase (provider-message-phase-for model events)])
-                (set! messages
-                      (append messages
-                              (list (if phase
-                                        (hash 'kind "message" 'role "assistant"
-                                              'content content 'phase phase)
-                                        (hash 'kind "message" 'role "assistant"
-                                              'content content)))))
+                                           content)])
                 (if (selected-compaction-needed? messages last-usage context-budget)
                     (begin
                       (context-cancel-pending! "superseded by automatic full compaction")

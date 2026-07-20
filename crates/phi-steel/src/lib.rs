@@ -636,11 +636,18 @@ mod tests {
             .unwrap();
         assert!(matches!(
             &output.effects[0],
-            Effect::HttpRequest { url, body, .. }
+            Effect::HttpRequest {
+                url, body, stream, ..
+            }
                 if url.ends_with("/responses")
                     && body["model"] == "gpt-5.6-luna"
                     && body["reasoning"]["effort"] == "low"
-                    && body["reasoning"]["summary"] == "auto"
+                    && body["reasoning"]["summary"] == "none"
+                    && body["include"].as_array().unwrap().iter()
+                        .any(|item| item == "reasoning.encrypted_content")
+                    && stream.iter().any(|rule| rule.emit == "output_phase")
+                    && stream.iter().any(|rule| rule.emit == "output_delta")
+                    && stream.iter().all(|rule| rule.emit != "reasoning_summary_delta")
                     && body["prompt_cache_key"] == ""
                     && body["tools"].as_array().unwrap().iter()
                         .any(|tool| tool["type"] == "web_search")
@@ -756,6 +763,143 @@ mod tests {
                     && body["input"][3]["content"][0]["text"] == "answer"
                     && body["input"].as_array().unwrap().len() == 5
         ));
+    }
+
+    #[test]
+    fn persists_commentary_before_tool_calls_and_replays_its_phase() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut policy = policy(&root);
+        policy
+            .on_event(&Event::UserMessage {
+                content: "inspect".into(),
+            })
+            .unwrap();
+        let output = policy
+            .on_event(&Event::HttpCompleted {
+                success: true,
+                status: 200,
+                events: vec![
+                    serde_json::json!({
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": { "type": "message", "phase": "commentary" }
+                    }),
+                    serde_json::json!({
+                        "type": "response.output_text.delta",
+                        "output_index": 0,
+                        "delta": "I’ll inspect the configuration."
+                    }),
+                    serde_json::json!({
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": {
+                            "type": "message",
+                            "role": "assistant",
+                            "phase": "commentary",
+                            "content": []
+                        }
+                    }),
+                    serde_json::json!({
+                        "type": "response.output_item.done",
+                        "output_index": 1,
+                        "item": {
+                            "type": "function_call",
+                            "call_id": "call-1",
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"config.scm\"}"
+                        }
+                    }),
+                ],
+                error: String::new(),
+            })
+            .unwrap();
+        assert!(matches!(&output.effects[0], Effect::RunTools { calls }
+            if calls.len() == 1 && calls[0].call_id == "call-1"));
+        let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
+        assert_eq!(state["messages"][1]["phase"], "commentary");
+        assert_eq!(
+            state["messages"][1]["content"],
+            "I’ll inspect the configuration."
+        );
+        assert_eq!(state["messages"][2]["kind"], "tool_call");
+
+        let output = policy
+            .on_event(&Event::ToolsCompleted {
+                results: vec![phi_protocol::ToolResult {
+                    call_id: "call-1".into(),
+                    name: "read_file".into(),
+                    result: serde_json::json!({ "content": "config" }),
+                }],
+            })
+            .unwrap();
+        assert!(matches!(
+            &output.effects[0],
+            Effect::HttpRequest { body, .. }
+                if body["input"][1]["phase"] == "commentary"
+                    && body["input"][1]["content"][0]["text"]
+                        == "I’ll inspect the configuration."
+                    && body["input"][2]["type"] == "function_call"
+                    && body["input"][3]["type"] == "function_call_output"
+        ));
+    }
+
+    #[test]
+    fn separates_commentary_and_final_answer_items_in_one_response() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut policy = policy(&root);
+        policy
+            .on_event(&Event::UserMessage {
+                content: "answer".into(),
+            })
+            .unwrap();
+        let output = policy
+            .on_event(&Event::HttpCompleted {
+                success: true,
+                status: 200,
+                events: vec![
+                    serde_json::json!({
+                        "type": "response.output_text.delta",
+                        "output_index": 0,
+                        "delta": "I found the cause."
+                    }),
+                    serde_json::json!({
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": {
+                            "type": "message",
+                            "role": "assistant",
+                            "phase": "commentary",
+                            "content": []
+                        }
+                    }),
+                    serde_json::json!({
+                        "type": "response.output_text.delta",
+                        "output_index": 1,
+                        "delta": "Done."
+                    }),
+                    serde_json::json!({
+                        "type": "response.output_item.done",
+                        "output_index": 1,
+                        "item": {
+                            "type": "message",
+                            "role": "assistant",
+                            "phase": "final_answer",
+                            "content": []
+                        }
+                    }),
+                ],
+                error: String::new(),
+            })
+            .unwrap();
+        assert_eq!(
+            output.effects,
+            vec![Effect::Finish {
+                content: "Done.".into()
+            }]
+        );
+        let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
+        assert_eq!(state["messages"][1]["phase"], "commentary");
+        assert_eq!(state["messages"][2]["phase"], "final_answer");
     }
 
     #[test]

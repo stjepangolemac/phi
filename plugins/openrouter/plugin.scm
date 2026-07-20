@@ -54,4 +54,4 @@
   "openrouter" openrouter-provider-effect responses-calls responses-arguments
   responses-output responses-usage
   (lambda (events) (responses-preserved-items "openrouter" events))
-  responses-message-phase)
+  responses-output-messages)

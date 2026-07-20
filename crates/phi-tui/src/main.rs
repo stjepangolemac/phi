@@ -97,6 +97,7 @@ struct App {
     current_model: String,
     current_model_revision: u64,
     current_model_cache: Option<RenderedLiveModel>,
+    current_commentary: Option<usize>,
     current_reasoning_summary: Option<usize>,
     composer: Composer,
     handle: Option<Handle>,
@@ -156,6 +157,7 @@ struct RenderedTranscriptBlock {
 enum TranscriptBlockKind {
     User,
     Assistant,
+    Commentary,
     Reasoning,
     Tool,
     Patch,
@@ -174,6 +176,7 @@ impl TranscriptBlockKind {
         match role {
             "you" => Self::User,
             "phi" => Self::Assistant,
+            "commentary" => Self::Commentary,
             "reasoning_summary" => Self::Reasoning,
             "tool" => Self::Tool,
             "patch" => Self::Patch,
@@ -216,6 +219,7 @@ impl App {
             current_model: String::new(),
             current_model_revision: 0,
             current_model_cache: None,
+            current_commentary: None,
             current_reasoning_summary: None,
             composer: Composer::default(),
             handle: None,
@@ -612,6 +616,7 @@ impl App {
     fn on_runtime(&mut self, event: RuntimeEvent) {
         match event {
             RuntimeEvent::Session { id } => self.session_id = Some(id),
+            RuntimeEvent::History { messages } => self.restore_history(messages),
             RuntimeEvent::UserMessage { .. } => {}
             RuntimeEvent::QueuedMessagesInjected { contents } => {
                 for content in &contents {
@@ -705,12 +710,33 @@ impl App {
             }
             RuntimeEvent::ToolRouteSelected { .. } => {}
             RuntimeEvent::ModelDelta { content } => {
+                self.current_commentary = None;
                 self.current_reasoning_summary = None;
                 self.mark_response_start_after_tools();
                 self.current_model.push_str(&content);
                 self.current_model_changed();
             }
+            RuntimeEvent::CommentaryDelta { content } => {
+                self.flush_model();
+                let index = if let Some(index) = self.current_commentary {
+                    index
+                } else {
+                    let index = self.transcript.len();
+                    self.push_transcript("commentary", "");
+                    self.current_commentary = Some(index);
+                    index
+                };
+                if let Some((_, commentary)) = self.transcript.get_mut(index) {
+                    commentary.push_str(&content);
+                    self.transcript_changed(index);
+                }
+            }
+            RuntimeEvent::CommentaryStarted => {
+                self.flush_model();
+                self.current_commentary = None;
+            }
             RuntimeEvent::ReasoningSummaryDelta { content } => {
+                self.current_commentary = None;
                 self.flush_model();
                 let index = if let Some(index) = self.current_reasoning_summary {
                     index
@@ -730,6 +756,7 @@ impl App {
                 name,
                 arguments,
             } => {
+                self.current_commentary = None;
                 self.current_reasoning_summary = None;
                 self.flush_model();
                 self.tool_started
@@ -908,6 +935,7 @@ impl App {
             }
             RuntimeEvent::ApprovalRequested { name } => self.approval = Some(name),
             RuntimeEvent::Finished { content } => {
+                self.current_commentary = None;
                 self.current_reasoning_summary = None;
                 if !self.final_response_rendered
                     && self.current_model.is_empty()
@@ -941,6 +969,7 @@ impl App {
                 }
             }
             RuntimeEvent::Error { message } => {
+                self.current_commentary = None;
                 self.current_reasoning_summary = None;
                 self.flush_model();
                 let restarting = message == "cancelled" && self.restart_after_cancel.is_some();
@@ -987,12 +1016,86 @@ impl App {
         }
     }
 
+    fn restore_history(&mut self, messages: Vec<serde_json::Value>) {
+        let trailing = std::mem::take(&mut self.transcript);
+        self.transcript_cache.clear();
+        let mut tool_names = HashMap::new();
+        for message in messages {
+            match message["kind"].as_str() {
+                Some("message") => {
+                    let content = message["content"].as_str().unwrap_or_default();
+                    if content.trim().is_empty() {
+                        continue;
+                    }
+                    match message["role"].as_str() {
+                        Some("user") => self.push_transcript("you", content),
+                        Some("assistant") if message["phase"] == "commentary" => {
+                            self.push_transcript("commentary", content)
+                        }
+                        Some("assistant") => {
+                            self.mark_response_start_after_tools();
+                            self.push_transcript("phi", content);
+                        }
+                        _ => {}
+                    }
+                }
+                Some("reasoning_summary") => {
+                    let content = message["content"].as_str().unwrap_or_default();
+                    if !content.trim().is_empty() {
+                        self.push_transcript("reasoning_summary", content);
+                    }
+                }
+                Some("tool_call") => {
+                    let call_id = message["call_id"].as_str().unwrap_or_default().to_owned();
+                    let name = message["name"].as_str().unwrap_or_default().to_owned();
+                    let arguments = message["arguments"]
+                        .as_str()
+                        .and_then(|value| serde_json::from_str(value).ok())
+                        .unwrap_or_else(|| message["arguments"].clone());
+                    tool_names.insert(call_id.clone(), name.clone());
+                    self.on_runtime(RuntimeEvent::ToolStarted {
+                        call_id,
+                        name,
+                        arguments,
+                    });
+                }
+                Some("tool_result") => {
+                    let call_id = message["call_id"].as_str().unwrap_or_default().to_owned();
+                    let name = tool_names.get(&call_id).cloned().unwrap_or_default();
+                    let result = message["content"]
+                        .as_str()
+                        .and_then(|value| serde_json::from_str(value).ok())
+                        .unwrap_or_else(|| message["content"].clone());
+                    self.on_runtime(RuntimeEvent::ToolCompleted {
+                        call_id,
+                        name,
+                        result,
+                    });
+                }
+                _ => {}
+            }
+        }
+        for (role, content) in trailing {
+            self.push_transcript(role, content);
+        }
+    }
+
     fn mark_response_start_after_tools(&mut self) {
         if self.current_model.is_empty()
             && self
                 .transcript
-                .last()
-                .is_some_and(|(role, _)| matches!(role.as_str(), "tool" | "patch"))
+                .iter()
+                .rev()
+                .find(|(role, content)| {
+                    !matches!(role.as_str(), "commentary" | "reasoning_summary")
+                        || !content.trim().is_empty()
+                })
+                .is_some_and(|(role, _)| {
+                    matches!(
+                        role.as_str(),
+                        "commentary" | "reasoning_summary" | "tool" | "patch"
+                    )
+                })
         {
             self.push_transcript("response_start", "");
         }
@@ -2035,6 +2138,10 @@ fn push_message(lines: &mut Vec<Line<'static>>, role: &str, content: &str, width
         push_reasoning_summary(lines, content, width);
         return;
     }
+    if role == "commentary" {
+        push_commentary(lines, content, width);
+        return;
+    }
     if role == "you" || role == "phi" || role == "processes" {
         push_markdown(lines, role, content, width);
         return;
@@ -2084,6 +2191,26 @@ fn push_reasoning_summary(lines: &mut Vec<Line<'static>>, content: &str, width: 
             strong: Color::Gray,
             block: Style::default(),
             base: content_style,
+            marker: "  ",
+            code_inset: 0,
+            vertical_inset: 0,
+        },
+    );
+}
+
+fn push_commentary(lines: &mut Vec<Line<'static>>, content: &str, width: usize) {
+    if content.trim().is_empty() {
+        return;
+    }
+    push_markdown_content(
+        lines,
+        content,
+        width,
+        MarkdownBlockStyle {
+            normal: Color::DarkGray,
+            strong: Color::Gray,
+            block: Style::default(),
+            base: Style::default().fg(Color::DarkGray),
             marker: "  ",
             code_inset: 0,
             vertical_inset: 0,
@@ -3464,6 +3591,242 @@ mod tests {
     }
 
     #[test]
+    fn streams_commentary_around_tools_with_one_final_response_divider() {
+        let mut app = app();
+        app.on_runtime(RuntimeEvent::CommentaryDelta {
+            content: "Inspecting **the config**.".into(),
+        });
+        app.on_runtime(RuntimeEvent::ToolStarted {
+            call_id: "read".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({ "path": "config.scm" }),
+        });
+        app.on_runtime(RuntimeEvent::ToolCompleted {
+            call_id: "read".into(),
+            name: "read_file".into(),
+            result: serde_json::json!({ "content": "config" }),
+        });
+        app.on_runtime(RuntimeEvent::ToolStarted {
+            call_id: "status".into(),
+            name: "list_processes".into(),
+            arguments: serde_json::json!({}),
+        });
+        app.on_runtime(RuntimeEvent::ToolCompleted {
+            call_id: "status".into(),
+            name: "list_processes".into(),
+            result: serde_json::json!({ "processes": [] }),
+        });
+        app.on_runtime(RuntimeEvent::CommentaryDelta {
+            content: "The summary request is enabled.".into(),
+        });
+        app.on_runtime(RuntimeEvent::ModelDelta {
+            content: "Updated it.".into(),
+        });
+        app.on_runtime(RuntimeEvent::Finished {
+            content: "Updated it.".into(),
+        });
+
+        assert_eq!(
+            app.transcript
+                .iter()
+                .map(|(role, _)| role.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "commentary",
+                "tool",
+                "tool",
+                "commentary",
+                "response_start",
+                "phi",
+                "turn_end"
+            ]
+        );
+        assert_eq!(
+            app.transcript
+                .iter()
+                .filter(|(role, _)| role == "response_start")
+                .count(),
+            1
+        );
+        let rendered = transcript_text(&mut app, 48)
+            .lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<String>();
+        assert!(rendered.contains("Inspecting the config."));
+        assert!(!rendered.contains("**"));
+    }
+
+    #[test]
+    fn keeps_multiple_commentary_message_items_distinct_before_a_tool() {
+        let mut app = app();
+        app.on_runtime(RuntimeEvent::CommentaryStarted);
+        app.on_runtime(RuntimeEvent::CommentaryDelta {
+            content: "First checkpoint.".into(),
+        });
+        app.on_runtime(RuntimeEvent::CommentaryStarted);
+        app.on_runtime(RuntimeEvent::CommentaryDelta {
+            content: "Second checkpoint.".into(),
+        });
+        app.on_runtime(RuntimeEvent::ToolStarted {
+            call_id: "read".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({ "path": "config.scm" }),
+        });
+
+        assert_eq!(
+            app.transcript
+                .iter()
+                .map(|(role, content)| (role.as_str(), content.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("commentary", "First checkpoint."),
+                ("commentary", "Second checkpoint."),
+                ("tool", "Read config.scm")
+            ]
+        );
+    }
+
+    #[test]
+    fn streamed_commentary_matches_cached_rendering_at_narrow_widths() {
+        let mut streamed = app();
+        streamed.on_runtime(RuntimeEvent::CommentaryStarted);
+        streamed.on_runtime(RuntimeEvent::CommentaryDelta {
+            content: "Checking **the narrow transcript** carefully.".into(),
+        });
+        let live = transcript_text(&mut streamed, 16).lines;
+
+        let mut cached = app();
+        cached.push_transcript(
+            "commentary",
+            "Checking **the narrow transcript** carefully.",
+        );
+        let finalized = transcript_text(&mut cached, 16).lines;
+
+        assert_eq!(live, finalized);
+        assert_eq!(streamed.transcript_offsets, cached.transcript_offsets);
+    }
+
+    #[test]
+    fn empty_commentary_has_no_layout_effect() {
+        let mut with_empty = app();
+        with_empty.on_runtime(RuntimeEvent::CommentaryDelta {
+            content: " \n\t".into(),
+        });
+        with_empty.on_runtime(RuntimeEvent::ToolStarted {
+            call_id: "read".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({ "path": "config.scm" }),
+        });
+
+        let mut without_empty = app();
+        without_empty.on_runtime(RuntimeEvent::ToolStarted {
+            call_id: "read".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({ "path": "config.scm" }),
+        });
+
+        assert_eq!(
+            trimmed(&transcript_text(&mut with_empty, 30).lines),
+            trimmed(&transcript_text(&mut without_empty, 30).lines)
+        );
+
+        let mut before_answer = app();
+        before_answer.on_runtime(RuntimeEvent::CommentaryStarted);
+        before_answer.on_runtime(RuntimeEvent::CommentaryDelta {
+            content: " \n\t".into(),
+        });
+        before_answer.on_runtime(RuntimeEvent::ModelDelta {
+            content: "Answer".into(),
+        });
+        assert!(
+            !before_answer
+                .transcript
+                .iter()
+                .any(|(role, _)| role == "response_start")
+        );
+    }
+
+    #[test]
+    fn cancellation_keeps_streamed_commentary_visible() {
+        let mut app = app();
+        app.on_runtime(RuntimeEvent::CommentaryStarted);
+        app.on_runtime(RuntimeEvent::CommentaryDelta {
+            content: "Work completed before cancellation.".into(),
+        });
+        app.on_runtime(RuntimeEvent::Error {
+            message: "cancelled".into(),
+        });
+
+        assert_eq!(app.transcript[0].0, "commentary");
+        assert_eq!(app.transcript[1].1, "Cancelled by user");
+    }
+
+    #[test]
+    fn restored_history_preserves_commentary_tool_and_final_order() {
+        let mut app = app();
+        app.push_transcript("you", "new question");
+        app.on_runtime(RuntimeEvent::History {
+            messages: vec![
+                serde_json::json!({
+                    "kind": "message", "role": "user", "content": "old question"
+                }),
+                serde_json::json!({
+                    "kind": "message", "role": "assistant",
+                    "phase": "commentary", "content": "Checking."
+                }),
+                serde_json::json!({
+                    "kind": "tool_call", "call_id": "read", "name": "read_file",
+                    "arguments": "{\"path\":\"config.scm\"}"
+                }),
+                serde_json::json!({
+                    "kind": "tool_result", "call_id": "read",
+                    "content": "{\"content\":\"config\"}"
+                }),
+                serde_json::json!({
+                    "kind": "message", "role": "assistant",
+                    "phase": "final_answer", "content": "Done."
+                }),
+            ],
+        });
+
+        assert_eq!(
+            app.transcript
+                .iter()
+                .map(|(role, _)| role.as_str())
+                .collect::<Vec<_>>(),
+            ["you", "commentary", "tool", "response_start", "phi", "you"]
+        );
+        assert_eq!(app.transcript.last().unwrap().1, "new question");
+    }
+
+    #[test]
+    fn restored_history_keeps_legacy_reasoning_summaries_readable() {
+        let mut app = app();
+        app.on_runtime(RuntimeEvent::History {
+            messages: vec![
+                serde_json::json!({
+                    "kind": "reasoning_summary", "content": "Legacy **summary**."
+                }),
+                serde_json::json!({
+                    "kind": "message", "role": "assistant",
+                    "phase": "final_answer", "content": "Answer."
+                }),
+            ],
+        });
+
+        assert_eq!(app.transcript[0].0, "reasoning_summary");
+        assert_eq!(app.transcript[1].0, "response_start");
+        assert_eq!(app.transcript[2].1, "Answer.");
+        let rendered = transcript_text(&mut app, 30)
+            .lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<String>();
+        assert!(rendered.contains("Legacy summary."));
+    }
+
+    #[test]
     fn streamed_reasoning_matches_finalized_cached_rendering() {
         let mut streamed = app();
         streamed.on_runtime(RuntimeEvent::ReasoningSummaryDelta {
@@ -3487,18 +3850,21 @@ mod tests {
 
         let mut cached = app();
         cached.push_transcript("reasoning_summary", "Checked **the request** carefully.");
+        cached.push_transcript("response_start", "");
         cached.current_model = "Final answer".into();
         cached.current_model_changed();
         let finalized = transcript_text(&mut cached, 18).lines;
 
         assert_eq!(live, finalized);
         assert_eq!(streamed.transcript_offsets, cached.transcript_offsets);
-        assert_eq!(streamed.transcript_offsets, [2]);
+        assert_eq!(streamed.transcript_offsets, [2, 4]);
         assert_eq!(
             trimmed(&live),
             [
                 "  Checked the requ",
                 "  est carefully.",
+                "",
+                "──────────────────",
                 "",
                 "• Final answer",
                 ""

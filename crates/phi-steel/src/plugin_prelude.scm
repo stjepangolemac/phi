@@ -40,12 +40,12 @@
 (define (register-tool! builder)
   (set! plugin-tool-registry (append plugin-tool-registry (list builder))))
 
-(define (register-provider! name effect call arguments output usage preserved phase)
+(define (register-provider! name effect call arguments output usage preserved messages)
   (set! provider-registry
         (append provider-registry
                 (list (hash 'name name 'effect effect 'call call
                             'arguments arguments 'output output 'usage usage
-                            'preserved preserved 'phase phase)))))
+                            'preserved preserved 'messages messages)))))
 
 (define (remove-model-by-id models id)
   (cond [(null? models) '()]
@@ -586,8 +586,13 @@
   ((hash-ref (model-provider model) 'usage) events))
 (define (provider-preserved-items-for model events)
   ((hash-ref (model-provider model) 'preserved) events))
-(define (provider-message-phase-for model events)
-  ((hash-ref (model-provider model) 'phase) events))
+(define (provider-output-messages-for model events)
+  (define result ((hash-ref (model-provider model) 'messages) events))
+  (if (list? result)
+      result
+      (let ([message (hash 'kind "message" 'role "assistant"
+                           'content (provider-output-for model events))])
+        (list (if result (hash-insert message 'phase result) message)))))
 
 (define (build-selected-prompt messages instructions tools)
   ((hash-ref (find-named prompt-builder-registry selected-prompt-builder) 'builder)

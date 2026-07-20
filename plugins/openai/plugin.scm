@@ -48,7 +48,7 @@
           'prompt_cache_key (runtime-session-id)
           'tool_choice "auto"
           'parallel_tool_calls #t
-          'reasoning (hash 'effort reasoning 'summary "auto"
+          'reasoning (hash 'effort reasoning 'summary "none"
                            'context "all_turns")
           'service_tier service-tier
           'store #f
@@ -79,4 +79,4 @@
   "openai" provider-effect responses-calls responses-arguments responses-output
   responses-usage
   (lambda (events) (responses-preserved-items "openai" events))
-  responses-message-phase)
+  responses-output-messages)

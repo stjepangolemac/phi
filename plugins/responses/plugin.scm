@@ -2,10 +2,11 @@
 
 (define responses-stream-rules
   (list
-    (hash 'match (hash "/type" "response.reasoning_summary_text.delta")
-          'emit "reasoning_summary_delta" 'value "/delta")
+    (hash 'match (hash "/type" "response.output_item.added"
+                       "/item/type" "message")
+          'emit "output_phase" 'key "/output_index" 'value "/item/phase")
     (hash 'match (hash "/type" "response.output_text.delta")
-          'emit "model_delta" 'value "/delta")
+          'emit "output_delta" 'key "/output_index" 'value "/delta")
     (hash 'match (hash "/type" "response.output_item.added"
                        "/item/type" "web_search_call")
           'emit "tool_started" 'name "web_search" 'value "/item")
@@ -133,6 +134,57 @@
         (if (equal? (hash-ref event 'type) "response.output_text.delta")
             (string-append (hash-ref event 'delta) rest)
             rest))))
+
+(define (responses-message-content content)
+  (if (null? content)
+      ""
+      (let* ([part (car content)]
+             [text (or (hash-try-get part 'text) "")])
+        (string-append text (responses-message-content (cdr content))))))
+
+(define (responses-output-for-index events output-index)
+  (if (null? events)
+      ""
+      (let* ([event (car events)]
+             [event-index (hash-try-get event 'output_index)]
+             [rest (responses-output-for-index (cdr events) output-index)])
+        (if (and (equal? (hash-ref event 'type) "response.output_text.delta")
+                 (or (not output-index) (equal? event-index output-index)))
+            (string-append (hash-ref event 'delta) rest)
+            rest))))
+
+(define (responses-completed-messages events all-events)
+  (if (null? events)
+      '()
+      (let* ([event (car events)]
+             [item (hash-try-get event 'item)]
+             [rest (responses-completed-messages (cdr events) all-events)])
+        (if (and (equal? (hash-ref event 'type) "response.output_item.done")
+                 item
+                 (equal? (hash-ref item 'type) "message"))
+            (let* ([completed (responses-message-content
+                                (or (hash-try-get item 'content) '()))]
+                   [content (if (equal? completed "")
+                                (responses-output-for-index
+                                  all-events (hash-try-get event 'output_index))
+                                completed)]
+                   [phase (hash-try-get item 'phase)]
+                   [message (hash 'kind "message" 'role "assistant"
+                                  'content content)])
+              (cons (if phase (hash-insert message 'phase phase) message) rest))
+            rest))))
+
+(define (responses-output-messages events)
+  (define completed (responses-completed-messages events events))
+  (if (null? completed)
+      (let* ([content (responses-output events)]
+             [phase (responses-message-phase events)]
+             [message (hash 'kind "message" 'role "assistant"
+                            'content content)])
+        (if (equal? content "")
+            '()
+            (list (if phase (hash-insert message 'phase phase) message))))
+      completed))
 
 (define (responses-reasoning-summary events)
   (if (null? events)

@@ -41,6 +41,9 @@ pub enum RuntimeEvent {
     Session {
         id: String,
     },
+    History {
+        messages: Vec<serde_json::Value>,
+    },
     UserMessage {
         content: String,
     },
@@ -73,6 +76,10 @@ pub enum RuntimeEvent {
     ModelDelta {
         content: String,
     },
+    CommentaryDelta {
+        content: String,
+    },
+    CommentaryStarted,
     ReasoningSummaryDelta {
         content: String,
     },
@@ -1565,6 +1572,15 @@ async fn run(
     )?;
     let mut capabilities = bootstrap.capabilities;
     let mut policy = bootstrap.policy;
+    if options.session_id.is_some() {
+        let state: serde_json::Value = serde_json::from_str(policy.state())?;
+        send(
+            events,
+            RuntimeEvent::History {
+                messages: state["messages"].as_array().cloned().unwrap_or_default(),
+            },
+        )?;
+    }
     let mut context_statuses = context_job_statuses(policy.state())?;
     let mut file_editor_tool = policy.file_editor_tool_name()?;
     let selected_model = state_string(policy.state(), "model")?;
@@ -1854,6 +1870,7 @@ async fn run(
                 timeout_ms,
                 stream,
             } => {
+                let mut output_phases = BTreeMap::new();
                 let request = phi_core::http::post_sse(
                     phi_core::http::SseRequest {
                         allowed_origins: &config.allowed_http_origins,
@@ -1866,7 +1883,7 @@ async fn run(
                     },
                     |provider_event| {
                         if stream_output {
-                            emit_stream_events(events, provider_event, &stream)
+                            emit_stream_events(events, provider_event, &stream, &mut output_phases)
                         } else {
                             false
                         }
@@ -2547,6 +2564,7 @@ fn emit_stream_events(
     events: &mpsc::UnboundedSender<RuntimeEvent>,
     provider_event: &serde_json::Value,
     rules: &[StreamRule],
+    phases: &mut BTreeMap<String, String>,
 ) -> bool {
     let mut emitted = false;
     for rule in rules {
@@ -2561,7 +2579,31 @@ fn emit_stream_events(
             .pointer(&rule.value)
             .cloned()
             .unwrap_or(serde_json::Value::Null);
+        let key = provider_event
+            .pointer(&rule.key)
+            .map(serde_json::Value::to_string)
+            .unwrap_or_default();
+        if rule.emit == "output_phase" {
+            if let Some(phase) = value.as_str() {
+                phases.insert(key, phase.to_owned());
+                if phase == "commentary" {
+                    let _ = events.send(RuntimeEvent::CommentaryStarted);
+                }
+            }
+            continue;
+        }
         let event = match rule.emit.as_str() {
+            "output_delta" => value.as_str().map(|content| {
+                if phases.get(&key).is_some_and(|phase| phase == "commentary") {
+                    RuntimeEvent::CommentaryDelta {
+                        content: content.into(),
+                    }
+                } else {
+                    RuntimeEvent::ModelDelta {
+                        content: content.into(),
+                    }
+                }
+            }),
             "model_delta" => value.as_str().map(|content| RuntimeEvent::ModelDelta {
                 content: content.into(),
             }),
@@ -3656,11 +3698,18 @@ mod tests {
     }
 
     #[test]
-    fn provider_stream_rules_emit_generic_summary_and_tool_events() {
+    fn provider_stream_rules_classify_output_by_phase_and_emit_tool_events() {
         let rules: Vec<StreamRule> = serde_json::from_value(serde_json::json!([
             {
-                "match": { "/type": "response.reasoning_summary_text.delta" },
-                "emit": "reasoning_summary_delta",
+                "match": { "/type": "response.output_item.added", "/item/type": "message" },
+                "emit": "output_phase",
+                "key": "/output_index",
+                "value": "/item/phase"
+            },
+            {
+                "match": { "/type": "response.output_text.delta" },
+                "emit": "output_delta",
+                "key": "/output_index",
                 "value": "/delta"
             },
             {
@@ -3678,14 +3727,27 @@ mod tests {
         ]))
         .unwrap();
         let (events, mut received) = mpsc::unbounded_channel();
+        let mut phases = BTreeMap::new();
 
         emit_stream_events(
             &events,
             &serde_json::json!({
-                "type": "response.reasoning_summary_text.delta",
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": { "type": "message", "phase": "commentary" }
+            }),
+            &rules,
+            &mut phases,
+        );
+        emit_stream_events(
+            &events,
+            &serde_json::json!({
+                "type": "response.output_text.delta",
+                "output_index": 0,
                 "delta": "Checked the request."
             }),
             &rules,
+            &mut phases,
         );
         emit_stream_events(
             &events,
@@ -3694,6 +3756,7 @@ mod tests {
                 "item": { "type": "web_search_call" }
             }),
             &rules,
+            &mut phases,
         );
         emit_stream_events(
             &events,
@@ -3702,11 +3765,16 @@ mod tests {
                 "item": { "type": "web_search_call", "action": { "sources": [] } }
             }),
             &rules,
+            &mut phases,
         );
 
         assert!(matches!(
             received.try_recv().unwrap(),
-            RuntimeEvent::ReasoningSummaryDelta { content }
+            RuntimeEvent::CommentaryStarted
+        ));
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            RuntimeEvent::CommentaryDelta { content }
                 if content == "Checked the request."
         ));
         assert!(matches!(
@@ -3775,7 +3843,7 @@ mod tests {
             Effect::HttpRequest { body, headers, .. }
                 if body["model"] == "gpt-5.6-terra"
                     && body["reasoning"]["effort"] == "high"
-                    && body["reasoning"]["summary"] == "auto"
+                    && body["reasoning"]["summary"] == "none"
                     && body["service_tier"] == "priority"
                     && body["parallel_tool_calls"] == true
                     && body["prompt_cache_key"] == execution.session_id
