@@ -839,7 +839,7 @@ mod tests {
                 if url.ends_with("/responses")
                     && body["model"] == "gpt-5.6-luna"
                     && body["reasoning"]["effort"] == "low"
-                    && body["reasoning"]["summary"] == "none"
+                    && body["reasoning"].get("summary").is_none()
                     && body["include"].as_array().unwrap().iter()
                         .any(|item| item == "reasoning.encrypted_content")
                     && stream.iter().any(|rule| rule.emit == "output_phase")

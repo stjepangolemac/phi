@@ -4716,7 +4716,7 @@ mod tests {
             Effect::HttpRequest { body, headers, .. }
                 if body["model"] == "gpt-5.6-terra"
                     && body["reasoning"]["effort"] == "high"
-                    && body["reasoning"]["summary"] == "none"
+                    && body["reasoning"].get("summary").is_none()
                     && body["service_tier"] == "priority"
                     && body["parallel_tool_calls"] == true
                     && body["prompt_cache_key"] == execution.session_id

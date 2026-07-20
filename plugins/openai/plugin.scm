@@ -48,8 +48,7 @@
           'prompt_cache_key (runtime-session-id)
           'tool_choice "auto"
           'parallel_tool_calls #t
-          'reasoning (hash 'effort reasoning 'summary "none"
-                           'context "all_turns")
+          'reasoning (hash 'effort reasoning 'context "all_turns")
           'service_tier service-tier
           'store #f
           'stream #t
