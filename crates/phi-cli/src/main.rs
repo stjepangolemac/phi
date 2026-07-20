@@ -110,6 +110,7 @@ async fn main() -> Result<()> {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
+    let observability = phi_runtime::Observability::from_env()?;
     let workspace = cli
         .workspace
         .canonicalize()
@@ -129,6 +130,7 @@ async fn run() -> Result<()> {
         processes: std::sync::Arc::clone(&processes),
         workflows: std::sync::Arc::clone(&workflows),
         output_schema: None,
+        observability: observability.clone(),
     };
     let result = async {
         match cli.command {

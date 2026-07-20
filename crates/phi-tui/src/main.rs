@@ -3177,6 +3177,7 @@ mod tests {
                 processes: std::sync::Arc::new(phi_runtime::ProcessManager::default()),
                 workflows: std::sync::Arc::new(phi_runtime::WorkflowTasks::default()),
                 output_schema: None,
+                observability: None,
             },
             CommandCatalog {
                 commands: vec![

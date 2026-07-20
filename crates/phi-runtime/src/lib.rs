@@ -17,12 +17,22 @@ use similar::TextDiff;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+mod observability;
 mod workflow;
 
+pub use observability::Observability;
 pub use workflow::WorkflowTasks;
 
 pub use phi_core::process::ShellSessions as ProcessManager;
 pub use phi_protocol::{CommandInvocation, CommandSpec, ModelSpec, PickerOptionSpec};
+
+macro_rules! observe {
+    ($observer:expr, $event:expr, $level:expr, $fields:expr $(,)?) => {
+        if let Some(observer) = $observer {
+            observer.record($event, $level, $fields);
+        }
+    };
+}
 
 #[derive(Clone)]
 pub struct RunOptions {
@@ -36,6 +46,7 @@ pub struct RunOptions {
     pub processes: Arc<phi_core::process::ShellSessions>,
     pub workflows: Arc<WorkflowTasks>,
     pub output_schema: Option<serde_json::Value>,
+    pub observability: Option<Observability>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1506,11 +1517,14 @@ fn start_events(options: RunOptions, initial_events: Vec<Event>) -> Handle {
         !initial_events.is_empty(),
         "a run requires an initial event"
     );
-    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let (event_tx, mut internal_event_rx) = mpsc::unbounded_channel();
+    let (frontend_event_tx, event_rx) = mpsc::unbounded_channel();
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (steering_tx, steering_rx) = mpsc::unbounded_channel();
     let cancellation = CancellationToken::new();
     let run_cancellation = cancellation.clone();
+    let event_observer = options.observability.clone();
+    let run_observer = options.observability.clone();
     runtime_worker()
         .tasks
         .send(Box::new(move |local| {
@@ -1525,9 +1539,26 @@ fn start_events(options: RunOptions, initial_events: Vec<Event>) -> Handle {
                 )
                 .await
                 {
+                    if let Some(observer) = &run_observer {
+                        observer.record(
+                            "runtime.failed",
+                            "error",
+                            serde_json::json!({ "error": runtime_error(&error) }),
+                        );
+                    }
                     let _ = event_tx.send(RuntimeEvent::Error {
                         message: runtime_error(&error),
                     });
+                }
+            });
+            local.spawn_local(async move {
+                while let Some(event) = internal_event_rx.recv().await {
+                    if let Some(observer) = &event_observer {
+                        observer.runtime_event(&event);
+                    }
+                    if frontend_event_tx.send(event).is_err() {
+                        break;
+                    }
                 }
             });
         }))
@@ -1588,6 +1619,10 @@ async fn run(
     let home = home_for_config(&options.config_path)?;
     let resolved = resolve_session(&home, &workspace, options.session_id.as_deref())?;
     let session = resolved.session;
+    if let Some(observer) = &options.observability {
+        observer.bind_session(session.id(), session.dir());
+        observer.record("runtime.started", "info", serde_json::json!({}));
+    }
     let mut plugin_roots = resolved
         .sources
         .plugins
@@ -1625,6 +1660,15 @@ async fn run(
     let selected_model = state_string(policy.state(), "model")?;
     let tool_routes = policy.resolved_tool_routes(&selected_model)?;
     for route in tool_routes {
+        observe!(
+            options.observability.as_ref(),
+            "tool.route_selected",
+            "info",
+            serde_json::json!({
+                "capability": route.capability,
+                "implementation": route.implementation,
+            }),
+        );
         send(
             events,
             RuntimeEvent::ToolRouteSelected {
@@ -1680,6 +1724,12 @@ async fn run(
         let settle_cancelled_tools =
             cancellation.is_cancelled() && matches!(&event, Event::ToolsCompleted { .. });
         if cancellation.is_cancelled() && !settle_cancelled_tools {
+            observe!(
+                options.observability.as_ref(),
+                "runtime.cancelled",
+                "warn",
+                serde_json::json!({ "reason": "agent turn cancelled" }),
+            );
             cancel_pending_context_compactions(
                 &mut policy,
                 &session,
@@ -1697,11 +1747,41 @@ async fn run(
                 },
             )?;
         }
-        session.append(&event)?;
+        append_session(&session, &event, options.observability.as_ref(), "event")?;
         let previous_policy_state = policy.state().to_owned();
-        let mut output = policy.on_event(&event)?;
+        observe!(
+            options.observability.as_ref(),
+            "policy.evaluation_started",
+            "info",
+            serde_json::json!({ "input": protocol_event_name(&event) }),
+        );
+        let mut output = match policy.on_event(&event) {
+            Ok(output) => {
+                observe!(
+                    options.observability.as_ref(),
+                    "policy.evaluation_completed",
+                    "info",
+                    serde_json::json!({ "effect_count": output.effects.len() }),
+                );
+                output
+            }
+            Err(error) => {
+                observe!(
+                    options.observability.as_ref(),
+                    "policy.evaluation_failed",
+                    "error",
+                    serde_json::json!({ "error": runtime_error(&error) }),
+                );
+                return Err(error);
+            }
+        };
         emit_context_tool_events(events, &previous_policy_state, policy.state())?;
-        session.append(&output)?;
+        append_session(
+            &session,
+            &output,
+            options.observability.as_ref(),
+            "policy_output",
+        )?;
         session.save_state(policy.state())?;
         send_context(events, policy.state())?;
         report_context_job_statuses(events, policy.state(), &mut context_statuses)?;
@@ -1716,6 +1796,12 @@ async fn run(
             activity = next_activity;
         }
         if cancellation.is_cancelled() {
+            observe!(
+                options.observability.as_ref(),
+                "runtime.cancelled",
+                "warn",
+                serde_json::json!({ "reason": "agent turn cancelled" }),
+            );
             cancel_pending_context_compactions(
                 &mut policy,
                 &session,
@@ -1840,16 +1926,54 @@ async fn run(
                 stdin,
                 timeout_ms,
             } => {
-                event = cancellable_or_cancel_jobs!(phi_core::process::run(
+                observe!(
+                    options.observability.as_ref(),
+                    "process.started",
+                    "info",
+                    serde_json::json!({ "program": program, "argument_count": args.len() }),
+                );
+                let result = cancellable_or_cancel_jobs!(phi_core::process::run(
                     &workspace,
                     &config.allowed_programs,
                     &program,
                     &args,
                     &stdin,
                     timeout_ms,
-                ))?;
+                ));
+                match result {
+                    Ok(completed) => {
+                        let (success, exit_code) = match &completed {
+                            Event::ProcessCompleted {
+                                success, exit_code, ..
+                            } => (*success, *exit_code),
+                            _ => (false, None),
+                        };
+                        observe!(
+                            options.observability.as_ref(),
+                            "process.completed",
+                            if success { "info" } else { "error" },
+                            serde_json::json!({ "program": program, "success": success, "exit_code": exit_code }),
+                        );
+                        event = completed;
+                    }
+                    Err(error) => {
+                        observe!(
+                            options.observability.as_ref(),
+                            "process.failed",
+                            "error",
+                            serde_json::json!({ "program": program, "error": runtime_error(&error) }),
+                        );
+                        return Err(error);
+                    }
+                }
             }
             Effect::RunTools { calls } => {
+                observe!(
+                    options.observability.as_ref(),
+                    "tools.dispatch_started",
+                    "info",
+                    serde_json::json!({ "tool_count": calls.len() }),
+                );
                 let executor = ToolBatchExecutor {
                     workspace: &workspace,
                     home: &home,
@@ -1864,6 +1988,7 @@ async fn run(
                     output_schema: options.output_schema.as_ref(),
                     workflows: Arc::clone(&options.workflows),
                     plugin_roots: &plugin_roots,
+                    observability: options.observability.as_ref(),
                 };
                 let (results, reloaded) = execute_tool_calls(
                     calls,
@@ -1910,7 +2035,7 @@ async fn run(
                 stream,
             } => {
                 let mut output_phases = BTreeMap::new();
-                let request = phi_core::http::post_sse(
+                let request = phi_core::http::post_sse_observed(
                     phi_core::http::SseRequest {
                         allowed_origins: &config.allowed_http_origins,
                         secrets: &config.secrets,
@@ -1927,6 +2052,7 @@ async fn run(
                             false
                         }
                     },
+                    |observation| observe_http(options.observability.as_ref(), observation, None),
                 );
                 event = cancellable_or_cancel_jobs!(request)?;
             }
@@ -1940,6 +2066,12 @@ async fn run(
                     "agent turn finished",
                 )?;
                 send(events, RuntimeEvent::Finished { content })?;
+                observe!(
+                    options.observability.as_ref(),
+                    "runtime.finished",
+                    "info",
+                    serde_json::json!({}),
+                );
                 return Ok(());
             }
             Effect::WaitForContextCompactions { call_id, job_ids } => {
@@ -2139,6 +2271,7 @@ struct ToolBatchExecutor<'a> {
     output_schema: Option<&'a serde_json::Value>,
     workflows: Arc<WorkflowTasks>,
     plugin_roots: &'a std::collections::HashMap<String, PathBuf>,
+    observability: Option<&'a Observability>,
 }
 
 async fn execute_tool_calls(
@@ -2181,6 +2314,21 @@ async fn execute_tool_calls(
             &call.arguments,
             executor.full_access,
         )?;
+        let decision = match &authorization {
+            ToolAuthorization::Allow => "allow",
+            ToolAuthorization::Ask(_) => "ask",
+            ToolAuthorization::Deny(_) => "deny",
+        };
+        observe!(
+            executor.observability,
+            "policy.tool_authorization",
+            "info",
+            serde_json::json!({
+                "call_id": call.call_id,
+                "tool": call.name,
+                "decision": decision,
+            }),
+        );
         let (approved, denial) = match authorization {
             ToolAuthorization::Allow => (true, None),
             ToolAuthorization::Ask(detail) if interactive_approvals => {
@@ -2209,12 +2357,24 @@ async fn execute_tool_calls(
             ),
         };
         if approved {
+            observe!(
+                executor.observability,
+                "tool.execution_started",
+                "info",
+                serde_json::json!({ "call_id": call.call_id, "tool": call.name }),
+            );
             let pending = PendingToolCall { index, call };
             if parallel_safe {
                 parallel.push(pending);
             } else {
                 let raw = execute_serial_call(executor, pending, policy, shell_sessions).await;
-                reloaded |= finish_tool_call(raw, policy, executor.events, &mut completed)?;
+                reloaded |= finish_tool_call(
+                    raw,
+                    policy,
+                    executor.events,
+                    executor.observability,
+                    &mut completed,
+                )?;
             }
         } else {
             let result = serde_json::json!({
@@ -2429,7 +2589,13 @@ async fn flush_parallel_calls(
             .await?
             .context("parallel tool task missing")?
             .context("parallel tool task failed")?;
-        let _ = finish_tool_call(raw, policy, executor.events, completed)?;
+        let _ = finish_tool_call(
+            raw,
+            policy,
+            executor.events,
+            executor.observability,
+            completed,
+        )?;
     }
     Ok(())
 }
@@ -2555,6 +2721,17 @@ async fn execute_serial_call(
     };
     let (result, reloaded) = match execution {
         ToolExecution::Workflow { action } => {
+            observe!(
+                executor.observability,
+                "workflow.lifecycle",
+                "info",
+                serde_json::json!({
+                    "call_id": call_id,
+                    "task_id": arguments.get("task_id").and_then(serde_json::Value::as_str),
+                    "action": format!("{action:?}").to_ascii_lowercase(),
+                    "phase": "started",
+                }),
+            );
             let result = cancellable(executor.cancellation, async {
                 match action {
                     WorkflowAction::Launch => {
@@ -2587,6 +2764,23 @@ async fn execute_serial_call(
             .await
             .and_then(|result| result)
             .unwrap_or_else(|error| serde_json::json!({ "error": runtime_error(&error) }));
+            observe!(
+                executor.observability,
+                "workflow.lifecycle",
+                if result.get("error").is_some() {
+                    "error"
+                } else {
+                    "info"
+                },
+                serde_json::json!({
+                    "call_id": call_id,
+                    "task_id": result.get("task_id").and_then(serde_json::Value::as_str)
+                        .or_else(|| arguments.get("task_id").and_then(serde_json::Value::as_str)),
+                    "phase": "completed",
+                    "status": result.get("status").and_then(serde_json::Value::as_str),
+                    "error": result.get("error").and_then(serde_json::Value::as_str),
+                }),
+            );
             (value(result), false)
         }
         ToolExecution::ManagedProcess { action } => {
@@ -2708,6 +2902,7 @@ fn finish_tool_call(
     raw: RawToolResult,
     policy: &mut phi_steel::Policy,
     events: &mpsc::UnboundedSender<RuntimeEvent>,
+    observability: Option<&Observability>,
     completed: &mut Vec<(usize, ToolResult)>,
 ) -> Result<bool> {
     let reloaded = raw.reloaded;
@@ -2744,6 +2939,20 @@ fn finish_tool_call(
             result: display.unwrap_or_else(|| result.clone()),
         },
     )?;
+    observe!(
+        observability,
+        "tool.execution_completed",
+        if result.get("error").is_some() {
+            "error"
+        } else {
+            "info"
+        },
+        serde_json::json!({
+            "call_id": raw.call_id,
+            "tool": raw.name,
+            "success": result.get("error").is_none(),
+        }),
+    );
     completed.push((
         raw.index,
         ToolResult {
@@ -2991,6 +3200,80 @@ async fn cancellable<T>(
 
 fn runtime_error(error: &anyhow::Error) -> String {
     phi_steel::user_error_message(error).unwrap_or_else(|| format!("{error:#}"))
+}
+
+fn observe_http(
+    observer: Option<&Observability>,
+    observation: phi_core::http::HttpObservation,
+    call_id: Option<&str>,
+) {
+    let Some(observer) = observer else { return };
+    let (event, level, fields) = match observation {
+        phi_core::http::HttpObservation::Attempt { attempt } => (
+            "provider.http_attempt",
+            "info",
+            serde_json::json!({ "attempt": attempt, "call_id": call_id }),
+        ),
+        phi_core::http::HttpObservation::Status { attempt, status } => (
+            "provider.http_status",
+            if status < 400 { "info" } else { "error" },
+            serde_json::json!({ "attempt": attempt, "status": status, "call_id": call_id }),
+        ),
+        phi_core::http::HttpObservation::Retry { attempt, status } => (
+            "provider.http_retry",
+            "warn",
+            serde_json::json!({ "attempt": attempt, "status": status, "call_id": call_id }),
+        ),
+        phi_core::http::HttpObservation::Failure { attempt } => (
+            "provider.http_failure",
+            "error",
+            serde_json::json!({ "attempt": attempt, "call_id": call_id }),
+        ),
+    };
+    observer.record(event, level, fields);
+}
+
+fn append_session(
+    session: &phi_core::session::Session,
+    value: &impl Serialize,
+    observer: Option<&Observability>,
+    kind: &str,
+) -> Result<()> {
+    match session.append(value) {
+        Ok(()) => {
+            observe!(
+                observer,
+                "session.write_completed",
+                "info",
+                serde_json::json!({ "kind": kind }),
+            );
+            Ok(())
+        }
+        Err(error) => {
+            observe!(
+                observer,
+                "session.write_failed",
+                "error",
+                serde_json::json!({ "kind": kind, "error": runtime_error(&error) }),
+            );
+            Err(error)
+        }
+    }
+}
+
+fn protocol_event_name(event: &Event) -> &'static str {
+    match event {
+        Event::UserMessage { .. } => "user_message",
+        Event::CompactRequested => "compact_requested",
+        Event::ModelSelected { .. } => "model_selected",
+        Event::ProcessCompleted { .. } => "process_completed",
+        Event::ToolsCompleted { .. } => "tools_completed",
+        Event::HttpCompleted { .. } => "http_completed",
+        Event::ContextCompactionStarted { .. } => "context_compaction_started",
+        Event::ContextCompactionCompleted { .. } => "context_compaction_completed",
+        Event::ContextWaitCompleted { .. } => "context_wait_completed",
+        Event::ContextCompactionsCancelled { .. } => "context_compactions_cancelled",
+    }
 }
 
 fn send(events: &mpsc::UnboundedSender<RuntimeEvent>, event: RuntimeEvent) -> Result<()> {
@@ -3370,6 +3653,7 @@ mod tests {
             processes: Arc::new(phi_core::process::ShellSessions::default()),
             workflows: Arc::new(WorkflowTasks::default()),
             output_schema: None,
+            observability: None,
         };
         (workspace, options)
     }
@@ -3508,6 +3792,7 @@ mod tests {
                     output_schema: None,
                     workflows: Arc::new(WorkflowTasks::default()),
                     plugin_roots: &plugin_roots,
+                    observability: None,
                 };
                 let (results, _) = execute_tool_calls(
                     vec![ToolCall {
@@ -4542,6 +4827,7 @@ mod tests {
                     output_schema: None,
                     workflows: Arc::new(WorkflowTasks::default()),
                     plugin_roots: &plugin_roots,
+                    observability: None,
                 };
                 let (results, reloaded) = execute_tool_calls(
                     calls,
@@ -4804,6 +5090,7 @@ mod tests {
                     output_schema: None,
                     workflows: Arc::new(WorkflowTasks::default()),
                     plugin_roots: &plugin_roots,
+                    observability: None,
                 };
                 let (results, reloaded) = execute_tool_calls(
                     vec![ToolCall {

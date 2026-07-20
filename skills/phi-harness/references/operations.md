@@ -18,6 +18,19 @@ Run `/keys` in the TUI to see composer editing, history, scrolling, queueing, ca
 
 Direct file reads and edits normally allow the workspace and Phi home. Writes still require approval. `phi --yolo` removes approval and filesystem boundaries.
 
+## Runtime observability
+
+Runtime logging is explicitly opt-in:
+
+```sh
+PHI_LOG=~/.phi/phi.jsonl phi
+PHI_LOG=~/.phi/phi.jsonl PHI_RUNTIME_EVENTS=1 phi
+```
+
+`PHI_LOG` accepts an append-only file path or `-` for stdout. Each JSONL record carries a timestamp, event name, level, run correlation ID, and available session/task/call identifiers. High-value HTTP, process, policy, tool, session-write, workflow, cancellation, and failure boundaries are logged without request bodies, headers, secrets, encrypted reasoning, unrestricted arguments, process output, or conversation/model payloads. `PHI_RUNTIME_EVENTS=1` writes the separately sanitized frontend event sequence to the active session's `runtime.jsonl`.
+
+Failure is explicit and storage-safe: sink initialization errors fail CLI startup; later sink or runtime-event tee write errors disable observability and emit one stderr diagnostic while normal session `events.jsonl` and `state.json` persistence continues. Avoid `PHI_LOG=-` when stdout is a JSON or RPC protocol channel.
+
 ## Reconfigure
 
 Edit the `config.scm` path reported by `phi --json status`. Keep all plugin, provider, model, tool, prompt, compaction, and agent behavior configuration there; do not edit installed plugin files.

@@ -38,9 +38,29 @@ pub struct SseRequest<'a> {
     pub timeout_ms: u64,
 }
 
-pub async fn post_sse<F>(request: SseRequest<'_>, mut on_event: F) -> Result<Event>
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HttpObservation {
+    Attempt { attempt: u8 },
+    Status { attempt: u8, status: u16 },
+    Retry { attempt: u8, status: Option<u16> },
+    Failure { attempt: u8 },
+}
+
+pub async fn post_sse<F>(request: SseRequest<'_>, on_event: F) -> Result<Event>
 where
     F: FnMut(&Value) -> bool,
+{
+    post_sse_observed(request, on_event, |_| {}).await
+}
+
+pub async fn post_sse_observed<F, O>(
+    request: SseRequest<'_>,
+    mut on_event: F,
+    mut observe: O,
+) -> Result<Event>
+where
+    F: FnMut(&Value) -> bool,
+    O: FnMut(HttpObservation),
 {
     let SseRequest {
         allowed_origins,
@@ -75,6 +95,10 @@ where
         request = request.header(header, pointer_string(&values, pointer)?);
     }
     for attempt in 0..3 {
+        let attempt_number = attempt as u8 + 1;
+        observe(HttpObservation::Attempt {
+            attempt: attempt_number,
+        });
         let current = request
             .try_clone()
             .context("HTTP request is not retryable")?;
@@ -84,17 +108,38 @@ where
                     && (response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
                         || response.status().is_server_error()) =>
             {
+                observe(HttpObservation::Status {
+                    attempt: attempt_number,
+                    status: response.status().as_u16(),
+                });
+                observe(HttpObservation::Retry {
+                    attempt: attempt_number,
+                    status: Some(response.status().as_u16()),
+                });
                 retry_delay(attempt).await;
                 continue;
             }
             Ok(response) => response,
             Err(error) if attempt < 2 && (error.is_connect() || error.is_timeout()) => {
+                observe(HttpObservation::Retry {
+                    attempt: attempt_number,
+                    status: None,
+                });
                 retry_delay(attempt).await;
                 continue;
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                observe(HttpObservation::Failure {
+                    attempt: attempt_number,
+                });
+                return Err(error.into());
+            }
         };
         let status = response.status();
+        observe(HttpObservation::Status {
+            attempt: attempt_number,
+            status: status.as_u16(),
+        });
         if !status.is_success() {
             return Ok(Event::HttpCompleted {
                 success: false,
@@ -126,6 +171,10 @@ where
             }
         }
         if retry {
+            observe(HttpObservation::Retry {
+                attempt: attempt_number,
+                status: Some(status.as_u16()),
+            });
             retry_delay(attempt).await;
             continue;
         }
@@ -385,9 +434,11 @@ mod tests {
         let secrets = BTreeMap::from([("test".into(), secret(root.path().join("auth.json")))]);
         let headers = BTreeMap::new();
 
-        let event = post_sse(
+        let mut observations = Vec::new();
+        let event = post_sse_observed(
             request(&origin, &allowed_origins, &secrets, &headers, 50),
             |_| false,
+            |observation| observations.push(observation),
         )
         .await
         .unwrap();
@@ -396,6 +447,25 @@ mod tests {
             panic!("expected HTTP completion");
         };
         assert_eq!(events, vec![serde_json::json!({ "type": "done" })]);
+        assert_eq!(
+            observations,
+            vec![
+                HttpObservation::Attempt { attempt: 1 },
+                HttpObservation::Status {
+                    attempt: 1,
+                    status: 200,
+                },
+                HttpObservation::Retry {
+                    attempt: 1,
+                    status: Some(200),
+                },
+                HttpObservation::Attempt { attempt: 2 },
+                HttpObservation::Status {
+                    attempt: 2,
+                    status: 200,
+                },
+            ]
+        );
     }
 
     #[test]

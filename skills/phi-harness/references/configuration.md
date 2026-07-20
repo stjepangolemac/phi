@@ -6,13 +6,15 @@ Run `phi --json status` first to see the resolved composition and active configu
 
 `PHI_HOME` selects the home directory; otherwise Phi uses `~/.phi`.
 
+`PHI_LOG=<path|->` opts into append-only structured JSONL runtime logging. A path sink may create missing parent directories; `-` writes to stdout. `PHI_RUNTIME_EVENTS=1` additionally tees sanitized runtime events to the active session's `runtime.jsonl`. Both features are disabled when the variables are absent.
+
 - `config.scm`: the sole mutable Scheme configuration root. It defines agent behavior, loads plugins, configures providers and tools, and selects implementations.
 - `config.json`: allowed network origins and secret handles.
 - `state.json`: last selected model, reasoning, and service tier.
 - `plugins.lock.json`: Git sources and resolved commits.
 - `plugins/`: immutable installed plugin packages.
 - `skills/`: manually copied personal skills.
-- `sessions/<session-id>/`: durable flat conversation storage, including exact composition snapshots, `events.jsonl`, `state.json`, workflow runs, and numbered plans.
+- `sessions/<session-id>/`: durable flat conversation storage, including exact composition snapshots, `events.jsonl`, `state.json`, workflow runs, numbered plans, and opt-in sanitized `runtime.jsonl` observability.
 - `builtins/<version>/`: the official plugin snapshot embedded in that Phi build, plus bundled system skills.
 
 Never put secret values in `config.scm`, plugin configuration, status output, or the repository. Secret handles in `config.json` point to separate files.

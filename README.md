@@ -28,6 +28,20 @@ phi resume SESSION_ID "Continue"
 
 New sessions are stored durably at `$PHI_HOME/sessions/<session-id>/` (normally `~/.phi/sessions/<session-id>/`). The flat home store contains the conversation's events and state plus exact configuration, loaded plugin sources, and installed plugin skill resources. The working directory and temporary Git worktree are metadata only. Existing workspace-local `.phi/sessions/` data is left untouched and is not migrated or resumed implicitly.
 
+### Opt-in runtime observability
+
+Structured runtime logging is off by default. Set `PHI_LOG` to a file path to append JSON Lines records, or to `-` to write them to stdout:
+
+```sh
+PHI_LOG=~/.phi/phi.jsonl phi
+PHI_LOG=- phi doctor
+PHI_LOG=~/.phi/phi.jsonl PHI_RUNTIME_EVENTS=1 phi
+```
+
+Records include a Unix-millisecond timestamp, level, event name, run correlation ID, and session/task/call IDs when available. The runtime logs provider attempts/status/retries, process lifecycle, policy evaluation, tool authorization/execution, session writes, workflow lifecycle, cancellation, and actionable failures. Headers, secret values, request bodies, encrypted reasoning, unrestricted tool arguments, process output, and model/user payloads are never included. `PHI_RUNTIME_EVENTS=1` additionally writes a sanitized, provider-neutral event stream in delivery order to `$PHI_HOME/sessions/<session-id>/runtime.jsonl`; payload-bearing fields are replaced by counts or redaction markers.
+
+Failure behavior is isolated from durable conversation storage: an invalid or unwritable `PHI_LOG` destination fails CLI startup before a run begins, while a write failure after startup disables observability, prints one diagnostic to stderr, and does not stop session event/state writes. `PHI_LOG=-` intentionally shares stdout with the selected frontend, so use a file sink with `--json` or `rpc` when stdout must remain machine-readable.
+
 The shell tools run arbitrary commands through the user's shell, including pipelines and compound commands. Long-running commands yield a background session that survives model turns; the model can list sessions, poll them, or continue through stdin. Use `/ps` to inspect background processes and `/stop` to stop them. Use `/compact` to run the selected compactor immediately instead of waiting for the configured token threshold. PTYs are available for interactive programs. Tool approval is still required unless `--allow-shell` or `--yolo` is used. The bundled argument-aware policy intentionally still asks for destructive, local-mutating, remote-mutating, shell-composed, or ambiguous Git commands under `--allow-shell`; common simple reads such as `git status`, `git diff`, `git log`, and `git show` remain allowed. `--yolo` is the explicit bypass and also removes filesystem boundaries. OS sandboxing is intentionally not implemented yet.
 
 Run `/keys` in the TUI for the complete keybinding reference and detailed input, cached-input, cache-write, and output token counters. The essentials are: `Enter` sends or steers the active turn, `Tab` queues the next turn, `Shift+Enter` or `Ctrl+Enter` inserts a newline, `Up/Down` reaches composer history at the input boundaries, `Shift+Up/Down` or `PageUp/PageDown` scrolls, and `Ctrl+C` cancels an active turn or quits when idle. `Esc` manages queued input before cancelling a turn; pickers use `Up/Down`, `Enter`, and `Esc`; approvals use `y`, `n`, or `Esc`. Ctrl+C during a slash command reports that cancellation is unavailable rather than silently ignoring the key.
