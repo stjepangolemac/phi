@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{fs, path::PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -47,6 +47,30 @@ impl PhiHome {
     }
 
     pub fn builtins(&self) -> PathBuf {
+        let root = self.builtin_version_root();
+        let Ok(current) = fs::read_to_string(root.join("current")) else {
+            return root;
+        };
+        let current = current.trim();
+        if current.is_empty()
+            || !current
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return root;
+        }
+        let snapshot = root.join(current);
+        if matches!(
+            fs::symlink_metadata(&snapshot),
+            Ok(metadata) if metadata.file_type().is_dir()
+        ) {
+            snapshot
+        } else {
+            root
+        }
+    }
+
+    pub fn builtin_version_root(&self) -> PathBuf {
         self.root.join("builtins").join(env!("CARGO_PKG_VERSION"))
     }
 

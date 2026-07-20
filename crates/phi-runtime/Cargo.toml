@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
+fs2.workspace = true
 include_dir.workspace = true
 phi-core = { path = "../phi-core" }
 phi-protocol = { path = "../phi-protocol" }
@@ -15,10 +16,8 @@ serde_json.workspace = true
 similar.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+tempfile.workspace = true
 uuid.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true

@@ -1,10 +1,12 @@
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
+    io::Write,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use anyhow::{Context, Result, bail};
+use fs2::FileExt;
 use include_dir::{Dir, DirEntry, include_dir};
 use phi_protocol::{Effect, Event, StreamRule, ToolCall, ToolExecution, ToolResult};
 use serde::{Deserialize, Serialize};
@@ -254,6 +256,13 @@ pub fn initialize_home() -> Result<phi_core::home::PhiHome> {
 
 pub fn initialize_at(home: &phi_core::home::PhiHome) -> Result<()> {
     std::fs::create_dir_all(&home.root)?;
+    let initialization_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .truncate(false)
+        .write(true)
+        .open(home.root.join(".initialize.lock"))?;
+    initialization_lock.lock_exclusive()?;
     std::fs::create_dir_all(home.skills())?;
     write_if_missing(&home.config(), DEFAULT_CONFIG)?;
     initialize_scheme_config(home)?;
@@ -271,37 +280,219 @@ pub fn initialize_at(home: &phi_core::home::PhiHome) -> Result<()> {
     )?;
     write_if_missing(&home.plugin_lock(), "{\n  \"plugins\": []\n}\n")?;
     let official = phi_core::plugin::official_catalog()?;
-    for plugin in &official.plugins {
-        copy_official_plugin(home, &plugin.name, &plugin.path)?;
+    initialize_builtins(home, &official)?;
+    Ok(())
+}
+
+fn initialize_builtins(
+    home: &phi_core::home::PhiHome,
+    official: &phi_core::plugin::OfficialPluginCatalog,
+) -> Result<()> {
+    let version_root = home.builtin_version_root();
+    std::fs::create_dir_all(&version_root)?;
+    remove_stale_staging_directories(&version_root)?;
+
+    let snapshot_id = bundled_snapshot_id(official)?;
+    let target = version_root.join(&snapshot_id);
+    let backup = version_root.join(format!(".backup-{snapshot_id}"));
+    if std::fs::symlink_metadata(&target).is_err() && is_real_directory(&backup)? {
+        std::fs::rename(&backup, &target)?;
+    } else if is_real_directory(&backup)? {
+        std::fs::remove_dir_all(&backup)?;
     }
-    let commit = env!("PHI_BUILD_COMMIT");
-    if !commit.is_empty() {
-        phi_core::plugin::write_official_state(home, commit)?;
+
+    if !bundled_snapshot_matches(&target, &snapshot_id, official)? {
+        let staged = tempfile::Builder::new()
+            .prefix(".staging-")
+            .tempdir_in(&version_root)?;
+        write_bundled_snapshot(staged.path(), &snapshot_id, official)?;
+        let staged = staged.keep();
+        if std::fs::symlink_metadata(&target).is_ok() {
+            std::fs::rename(&target, &backup)?;
+        }
+        if let Err(error) = std::fs::rename(&staged, &target) {
+            if backup.exists() {
+                let _ = std::fs::rename(&backup, &target);
+            }
+            let _ = std::fs::remove_dir_all(&staged);
+            return Err(error.into());
+        }
+        if backup.exists() {
+            std::fs::remove_dir_all(&backup)?;
+        }
     }
-    for (relative, content) in PHI_HARNESS_SKILL {
-        write_bundled(
-            &home.builtin_skills().join("phi-harness").join(relative),
-            content,
-        )?;
+
+    phi_core::write_atomic(
+        &version_root.join("current"),
+        snapshot_id.as_bytes(),
+        phi_core::AtomicWriteMode::Overwrite,
+    )?;
+    Ok(())
+}
+
+fn is_real_directory(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_dir()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
     }
-    for (relative, content) in PLANNING_SKILL {
-        write_bundled(
-            &home.builtin_skills().join("planning").join(relative),
-            content,
-        )?;
+}
+
+fn remove_stale_staging_directories(version_root: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(version_root)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir()
+            && entry.file_name().to_string_lossy().starts_with(".staging-")
+        {
+            std::fs::remove_dir_all(entry.path())?;
+        }
     }
     Ok(())
 }
 
-fn copy_official_plugin(home: &phi_core::home::PhiHome, name: &str, relative: &str) -> Result<()> {
+fn bundled_snapshot_id(official: &phi_core::plugin::OfficialPluginCatalog) -> Result<String> {
+    fn collect<'a>(directory: &'a Dir<'a>, files: &mut Vec<(&'a Path, &'a [u8])>) {
+        for entry in directory.entries() {
+            match entry {
+                DirEntry::Dir(directory) => collect(directory, files),
+                DirEntry::File(file) => files.push((file.path(), file.contents())),
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    collect(&BUNDLED_PLUGINS, &mut files);
+    files.sort_by(|left, right| left.0.cmp(right.0));
+    let mut hasher = blake3::Hasher::new();
+    for (path, content) in files {
+        hasher.update(path.to_string_lossy().as_bytes());
+        hasher.update(&[0]);
+        hasher.update(content);
+        hasher.update(&[0]);
+    }
+    for (relative, content) in PHI_HARNESS_SKILL.iter().chain(PLANNING_SKILL) {
+        hasher.update(relative.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(content.as_bytes());
+        hasher.update(&[0]);
+    }
+    hasher.update(&serde_json::to_vec(official)?);
+    hasher.update(env!("PHI_BUILD_COMMIT").as_bytes());
+    Ok(format!("snapshot-{}", hasher.finalize().to_hex()))
+}
+
+fn write_bundled_snapshot(
+    target: &Path,
+    snapshot_id: &str,
+    official: &phi_core::plugin::OfficialPluginCatalog,
+) -> Result<()> {
+    for plugin in &official.plugins {
+        copy_official_plugin(target, &plugin.name, &plugin.path)?;
+    }
+    let commit = env!("PHI_BUILD_COMMIT");
+    if !commit.is_empty() {
+        write_bundled(
+            &target.join("official-plugins-state.json"),
+            &serde_json::to_string_pretty(&phi_core::plugin::OfficialPluginState {
+                commit: commit.into(),
+            })?,
+        )?;
+    }
+    for (relative, content) in PHI_HARNESS_SKILL {
+        write_bundled(&target.join("skills/phi-harness").join(relative), content)?;
+    }
+    for (relative, content) in PLANNING_SKILL {
+        write_bundled(&target.join("skills/planning").join(relative), content)?;
+    }
+    std::fs::write(target.join(".complete"), snapshot_id)?;
+    Ok(())
+}
+
+fn bundled_snapshot_matches(
+    target: &Path,
+    snapshot_id: &str,
+    official: &phi_core::plugin::OfficialPluginCatalog,
+) -> Result<bool> {
+    if !is_real_directory(target)? {
+        return Ok(false);
+    }
+    if !matches!(
+        std::fs::read_to_string(target.join(".complete")),
+        Ok(content) if content == snapshot_id
+    ) {
+        return Ok(false);
+    }
+    for plugin in &official.plugins {
+        let relative = plugin.path.strip_prefix("plugins/").unwrap_or(&plugin.path);
+        let Some(source) = BUNDLED_PLUGINS.get_dir(relative) else {
+            bail!("official plugin package is missing: plugins/{relative}");
+        };
+        if !bundled_dir_matches(source, &target.join("plugins").join(&plugin.name))? {
+            return Ok(false);
+        }
+        if phi_core::plugin::validate_package(&target.join("plugins").join(&plugin.name)).is_err() {
+            return Ok(false);
+        }
+    }
+    for (relative, content) in PHI_HARNESS_SKILL {
+        if !matches!(
+            std::fs::read_to_string(target.join("skills/phi-harness").join(relative)),
+            Ok(actual) if actual == *content
+        ) {
+            return Ok(false);
+        }
+    }
+    for (relative, content) in PLANNING_SKILL {
+        if !matches!(
+            std::fs::read_to_string(target.join("skills/planning").join(relative)),
+            Ok(actual) if actual == *content
+        ) {
+            return Ok(false);
+        }
+    }
+    let commit = env!("PHI_BUILD_COMMIT");
+    if !commit.is_empty() {
+        let state = std::fs::read(target.join("official-plugins-state.json"))
+            .ok()
+            .and_then(|content| {
+                serde_json::from_slice::<phi_core::plugin::OfficialPluginState>(&content).ok()
+            });
+        if state.is_none_or(|state| state.commit != commit) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn bundled_dir_matches(source: &Dir<'_>, target: &Path) -> Result<bool> {
+    fn matches(base: &Path, directory: &Dir<'_>, target: &Path) -> Result<bool> {
+        for entry in directory.entries() {
+            let relative = entry.path().strip_prefix(base)?;
+            let path = target.join(relative);
+            match entry {
+                DirEntry::Dir(directory) => {
+                    if !path.is_dir() || !matches(base, directory, target)? {
+                        return Ok(false);
+                    }
+                }
+                DirEntry::File(file) => {
+                    if !matches!(std::fs::read(path), Ok(actual) if actual == file.contents()) {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+    Ok(is_real_directory(target)? && matches(source.path(), source, target)?)
+}
+
+fn copy_official_plugin(root: &Path, name: &str, relative: &str) -> Result<()> {
     let relative = relative.strip_prefix("plugins/").unwrap_or(relative);
-    let plugin = home.builtins().join("plugins").join(name);
+    let plugin = root.join("plugins").join(name);
     let source = BUNDLED_PLUGINS
         .get_dir(relative)
         .with_context(|| format!("official plugin package is missing: plugins/{relative}"))?;
-    if plugin.exists() {
-        std::fs::remove_dir_all(&plugin)?;
-    }
     extract_bundled_dir(source, &plugin)?;
     phi_core::plugin::validate_package(&plugin)?;
     Ok(())
@@ -341,14 +532,15 @@ fn write_bundled(path: &Path, content: &str) -> Result<()> {
 }
 
 fn write_if_missing(path: &Path, content: &str) -> Result<()> {
-    if path.exists() {
-        return Ok(());
+    let parent = path.parent().context("path has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(content.as_bytes())?;
+    match temporary.persist_noclobber(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error.error.into()),
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, content)?;
-    Ok(())
 }
 
 fn initialize_scheme_config(home: &phi_core::home::PhiHome) -> Result<()> {
@@ -2725,7 +2917,7 @@ mod tests {
     use super::*;
     use std::{
         sync::{Condvar, Mutex, mpsc as std_mpsc},
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     #[test]
@@ -4175,5 +4367,152 @@ mod tests {
             phi_core::plugin::official_catalog().unwrap().plugins.len(),
             12
         );
+    }
+
+    #[test]
+    fn concurrent_initialization_processes_publish_one_complete_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let sync = root.path().join("sync");
+        std::fs::create_dir(&sync).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let mut children = Vec::new();
+        for id in 0..6 {
+            children.push(
+                std::process::Command::new(&executable)
+                    .args([
+                        "--exact",
+                        "tests::concurrent_initialization_subprocess",
+                        "--ignored",
+                    ])
+                    .env("PHI_INITIALIZATION_TEST_HOME", &home)
+                    .env("PHI_INITIALIZATION_TEST_SYNC", &sync)
+                    .env("PHI_INITIALIZATION_TEST_ID", id.to_string())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while std::fs::read_dir(&sync).unwrap().count() < children.len() {
+            assert!(
+                Instant::now() < deadline,
+                "subprocesses did not become ready"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::fs::write(sync.join("go"), "").unwrap();
+
+        for child in children {
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "subprocess failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let home = phi_core::home::PhiHome { root: home };
+        let official = phi_core::plugin::official_catalog().unwrap();
+        let snapshot_id = bundled_snapshot_id(&official).unwrap();
+        assert!(
+            bundled_snapshot_matches(&home.builtins(), &snapshot_id, &official).unwrap(),
+            "published snapshot must be complete"
+        );
+        assert_eq!(
+            std::fs::read_dir(home.builtin_version_root())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("snapshot-"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    #[ignore = "subprocess helper"]
+    fn concurrent_initialization_subprocess() {
+        let Some(root) = std::env::var_os("PHI_INITIALIZATION_TEST_HOME") else {
+            return;
+        };
+        let sync = PathBuf::from(std::env::var_os("PHI_INITIALIZATION_TEST_SYNC").unwrap());
+        let id = std::env::var("PHI_INITIALIZATION_TEST_ID").unwrap();
+        std::fs::write(sync.join(format!("ready-{id}")), "").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !sync.join("go").is_file() {
+            assert!(
+                Instant::now() < deadline,
+                "parent did not release subprocess"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let home = phi_core::home::PhiHome {
+            root: PathBuf::from(root),
+        };
+        initialize_at(&home).unwrap();
+        resolve_sources(&home, Path::new(".")).unwrap();
+    }
+
+    #[test]
+    fn preserves_previous_snapshots_and_user_data_while_cleaning_staging() {
+        let root = tempfile::tempdir().unwrap();
+        let home = phi_core::home::PhiHome {
+            root: root.path().join("home"),
+        };
+        initialize_at(&home).unwrap();
+        let version_root = home.builtin_version_root();
+        let previous = version_root.join("snapshot-previous");
+        std::fs::rename(home.builtins(), &previous).unwrap();
+        std::fs::write(version_root.join("current"), "snapshot-previous").unwrap();
+        let stale = version_root.join(".staging-stale");
+        std::fs::create_dir(&stale).unwrap();
+        std::fs::write(stale.join("partial"), "partial").unwrap();
+        #[cfg(unix)]
+        let outside = {
+            let outside = root.path().join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            std::fs::write(outside.join("sentinel"), "outside").unwrap();
+            std::os::unix::fs::symlink(&outside, version_root.join(".staging-linked")).unwrap();
+            outside
+        };
+
+        std::fs::create_dir_all(home.plugins().join("custom/commit")).unwrap();
+        std::fs::write(
+            home.plugins().join("custom/commit/user-data"),
+            "user plugin",
+        )
+        .unwrap();
+        std::fs::write(home.config(), "user json config").unwrap();
+        std::fs::write(home.scheme_config(), "user scheme config").unwrap();
+        std::fs::write(home.state(), "user state").unwrap();
+        std::fs::write(home.plugin_lock(), "{\"plugins\":[]}").unwrap();
+
+        initialize_at(&home).unwrap();
+
+        assert!(previous.join(".complete").is_file());
+        assert!(previous.join("plugins/responses/plugin.scm").is_file());
+        assert!(!stale.exists());
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::read_to_string(outside.join("sentinel")).unwrap(),
+            "outside"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.plugins().join("custom/commit/user-data")).unwrap(),
+            "user plugin"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.config()).unwrap(),
+            "user json config"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.scheme_config()).unwrap(),
+            "user scheme config"
+        );
+        assert_eq!(std::fs::read_to_string(home.state()).unwrap(), "user state");
+        assert_ne!(home.builtins(), previous);
+        assert!(home.builtins().join(".complete").is_file());
     }
 }
