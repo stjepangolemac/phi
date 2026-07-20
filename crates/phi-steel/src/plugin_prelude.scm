@@ -593,6 +593,9 @@
       (let ([message (hash 'kind "message" 'role "assistant"
                            'content (provider-output-for model events))])
         (list (if result (hash-insert message 'phase result) message)))))
+(define (provider-message-phase-for model events)
+  (define messages (provider-output-messages-for model events))
+  (if (null? messages) #f (hash-try-get (car messages) 'phase)))
 
 (define (build-selected-prompt messages instructions tools)
   ((hash-ref (find-named prompt-builder-registry selected-prompt-builder) 'builder)

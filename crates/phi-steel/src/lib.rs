@@ -903,6 +903,147 @@ mod tests {
     }
 
     #[test]
+    fn pre_commentary_config_loads_with_current_provider_contract() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config.scm");
+        let current = fs::read_to_string(root.join("config.scm")).unwrap();
+        let current_response = r#"          (define output-messages (provider-output-messages-for model events))
+          (if usage
+              (set! last-usage
+                    (hash-insert usage '_message_tokens
+                                 (estimated-message-tokens messages))))
+          (set! messages (append messages preserved output-messages))
+          (if (not (null? calls))
+              (begin
+                (set! pending-context-calls calls)
+                (continue-context-calls))
+              (let* ([content (assistant-final-output output-messages)]
+                     [finished-content (if (equal? content "")
+                                           "Model returned no output."
+                                           content)])
+                (if (selected-compaction-needed? messages last-usage context-budget)"#;
+        let legacy_response = r#"          (if usage
+              (set! last-usage
+                    (hash-insert usage '_message_tokens
+                                 (estimated-message-tokens messages))))
+          (set! messages (append messages preserved))
+          (if (not (null? calls))
+              (begin
+                (set! pending-context-calls calls)
+                (continue-context-calls))
+              (let* ([content (provider-output-for model events)]
+                     [finished-content (if (equal? content "")
+                                           "Model returned no output."
+                                           content)]
+                     [phase (provider-message-phase-for model events)])
+                (set! messages
+                      (append messages
+                              (list (if phase
+                                        (hash 'kind "message" 'role "assistant"
+                                              'content content 'phase phase)
+                                        (hash 'kind "message" 'role "assistant"
+                                              'content content)))))
+                (if (selected-compaction-needed? messages last-usage context-budget)"#;
+        let source = current.replace(current_response, legacy_response);
+        assert_ne!(source, current, "current config response flow changed");
+        fs::write(&config, source).unwrap();
+
+        let mut policy = Policy::load(&config, &plugins(&root)).unwrap();
+        policy
+            .on_event(&Event::UserMessage {
+                content: "answer".into(),
+            })
+            .unwrap();
+        let output = policy
+            .on_event(&Event::HttpCompleted {
+                success: true,
+                status: 200,
+                events: vec![
+                    serde_json::json!({
+                        "type": "response.output_text.delta",
+                        "output_index": 0,
+                        "delta": "Done."
+                    }),
+                    serde_json::json!({
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": {
+                            "type": "message",
+                            "role": "assistant",
+                            "phase": "final_answer",
+                            "content": []
+                        }
+                    }),
+                ],
+                error: String::new(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            output.effects,
+            vec![Effect::Finish {
+                content: "Done.".into()
+            }]
+        );
+        let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
+        assert_eq!(state["messages"][1]["phase"], "final_answer");
+    }
+
+    #[test]
+    fn provider_callback_returning_one_phase_is_normalized() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let temp = tempfile::tempdir().unwrap();
+        let provider = temp.path().join("provider.scm");
+        fs::write(
+            &provider,
+            r#"(register-provider!
+                 "legacy" provider-effect responses-calls responses-arguments
+                 responses-output responses-usage
+                 (lambda (events) (responses-preserved-items "legacy" events))
+                 (lambda (_events) "commentary"))
+               (register-model!
+                 "legacy"
+                 (hash 'id "model" 'label "legacy" 'description ""
+                       'context_window 1000 'compaction_token_limit 900
+                       'function_tools #t 'hosted_tools '()
+                       'reasoning '() 'default_reasoning ""
+                       'service_tiers '() 'default_service_tier ""))"#,
+        )
+        .unwrap();
+        let mut sources = plugins(&root);
+        sources.push(provider);
+        let mut policy = Policy::load(&root.join("config.scm"), &sources).unwrap();
+        policy
+            .on_event(&Event::ModelSelected {
+                model: "legacy/model".into(),
+                reasoning: String::new(),
+                service_tier: String::new(),
+            })
+            .unwrap();
+        policy
+            .on_event(&Event::UserMessage {
+                content: "answer".into(),
+            })
+            .unwrap();
+        policy
+            .on_event(&Event::HttpCompleted {
+                success: true,
+                status: 200,
+                events: vec![serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "delta": "Still working."
+                })],
+                error: String::new(),
+            })
+            .unwrap();
+
+        let state: serde_json::Value = serde_json::from_str(policy.state()).unwrap();
+        assert_eq!(state["messages"][1]["content"], "Still working.");
+        assert_eq!(state["messages"][1]["phase"], "commentary");
+    }
+
+    #[test]
     fn prompt_plugin_controls_provider_neutral_prompt() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let temp = tempfile::tempdir().unwrap();
