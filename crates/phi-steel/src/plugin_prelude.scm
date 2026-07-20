@@ -37,8 +37,14 @@
 
 (define (set-current-plugin! name) (set! current-plugin name))
 
-(define (register-tool! builder)
-  (set! plugin-tool-registry (append plugin-tool-registry (list builder))))
+(define (register-tool! builder . routes)
+  ;; The one-argument form is retained for persisted and external plugins.
+  ;; Legacy built-in names are migrated below; all other tools keep the former
+  ;; direct-capability behavior.
+  (define route (if (null? routes) #f (car routes)))
+  (set! plugin-tool-registry
+        (append plugin-tool-registry
+                (list (hash 'builder builder 'route route)))))
 
 (define (register-provider! name effect call arguments output usage preserved messages)
   (set! provider-registry
@@ -406,13 +412,56 @@
 (define (built-plugin-tools builders)
   (cond [(null? builders) '()]
         [else
-         (define tool ((car builders)))
+         (define tool ((hash-ref (car builders) 'builder)))
          (if tool
              (cons tool (built-plugin-tools (cdr builders)))
              (built-plugin-tools (cdr builders)))]))
 
 (define (registered-tools)
   (append tool-registry (built-plugin-tools plugin-tool-registry)))
+
+(define (find-runtime-tool-route name routes)
+  (cond [(null? routes) #f]
+        [(equal? name (hash-ref (car routes) 'name)) (car routes)]
+        [else (find-runtime-tool-route name (cdr routes))]))
+
+(define (find-plugin-tool-route name entries)
+  (cond
+    [(null? entries) #f]
+    [else
+     (define tool ((hash-ref (car entries) 'builder)))
+     (if (and tool (equal? name (hash-ref tool 'name)))
+         (or (hash-ref (car entries) 'route) (legacy-tool-route name))
+         (find-plugin-tool-route name (cdr entries)))]))
+
+(define (legacy-tool-route name)
+  (cond
+    [(equal? name "exec_command")
+     (hash 'mode "managed_process" 'action "execute")]
+    [(equal? name "write_stdin")
+     (hash 'mode "managed_process" 'action "write_stdin")]
+    [(equal? name "list_processes")
+     (hash 'mode "managed_process" 'action "list")]
+    [(equal? name "terminate_process")
+     (hash 'mode "managed_process" 'action "terminate")]
+    [(equal? name "Workflow") (hash 'mode "workflow" 'action "launch")]
+    [(equal? name "TaskOutput") (hash 'mode "workflow" 'action "output")]
+    [(equal? name "TaskStop") (hash 'mode "workflow" 'action "stop")]
+    [(equal? name "reload_config") (hash 'mode "reload_config")]
+    [else (hash 'mode "capability")]))
+
+(define (local-tool-route name)
+  (cond
+    [(and (not (equal? selected-file-editor ""))
+          (equal? name (selected-file-editor-tool-name)))
+     (hash 'mode "file_edit")]
+    [else
+     (define plugin-route (find-plugin-tool-route name plugin-tool-registry))
+     (if plugin-route
+         plugin-route
+         (or (find-runtime-tool-route
+               name (runtime-config-value 'tool_routes '()))
+             (legacy-tool-route name)))]))
 (define (runtime-session-id) session-id)
 
 (define (find-named entries name)

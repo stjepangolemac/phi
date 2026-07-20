@@ -1110,7 +1110,9 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(&output.effects[0], Effect::RunTools { calls }
-            if calls.len() == 1 && calls[0].name == "read_file"));
+            if calls.len() == 1
+                && calls[0].name == "read_file"
+                && matches!(calls[0].execution, phi_protocol::ToolExecution::Capability)));
         let output = policy
             .on_event(&Event::ToolsCompleted {
                 results: vec![phi_protocol::ToolResult {
@@ -4154,5 +4156,101 @@ mod tests {
         };
         assert_eq!(calls[0].arguments["start_line"].as_u64(), Some(1));
         assert_eq!(calls[0].arguments["line_count"].as_u64(), Some(200));
+    }
+
+    #[test]
+    fn policy_routes_arbitrary_tool_names_through_existing_typed_effects() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let config = serde_json::json!({
+            "model": "openai/gpt-5.6-luna",
+            "reasoning": "low",
+            "service_tier": "default",
+            "tools": [{
+                "name": "process_alias",
+                "description": "List managed processes.",
+                "parameters": { "type": "object" }
+            }],
+            "tool_routes": [{
+                "name": "process_alias",
+                "mode": "managed_process",
+                "action": "list"
+            }]
+        })
+        .to_string();
+        let mut policy =
+            Policy::load_with_state(&root.join("config.scm"), &plugins(&root), &config, None)
+                .unwrap();
+        policy
+            .on_event(&Event::UserMessage {
+                content: "list".into(),
+            })
+            .unwrap();
+        let output = policy
+            .on_event(&response_call(
+                "process_alias",
+                "call-1",
+                serde_json::json!({}),
+            ))
+            .unwrap();
+
+        assert!(matches!(
+            &output.effects[0],
+            Effect::RunTools { calls }
+                if matches!(
+                    calls[0].execution,
+                    phi_protocol::ToolExecution::ManagedProcess {
+                        action: phi_protocol::ManagedProcessAction::List
+                    }
+                )
+        ));
+    }
+
+    #[test]
+    fn policy_routes_selected_editor_and_bundled_workflows_without_runtime_name_checks() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut editor = policy(&root);
+        editor
+            .on_event(&Event::UserMessage {
+                content: "edit".into(),
+            })
+            .unwrap();
+        let output = editor
+            .on_event(&response_call(
+                "patch",
+                "edit-1",
+                serde_json::json!({ "patch": "invalid" }),
+            ))
+            .unwrap();
+        assert!(matches!(
+            &output.effects[0],
+            Effect::RunTools { calls }
+                if matches!(calls[0].execution, phi_protocol::ToolExecution::FileEdit)
+        ));
+
+        let mut sources = plugins(&root);
+        sources.push(root.join("plugins/dynamic-workflows/plugin.scm"));
+        let mut workflow = Policy::load(&root.join("config.scm"), &sources).unwrap();
+        workflow
+            .on_event(&Event::UserMessage {
+                content: "delegate".into(),
+            })
+            .unwrap();
+        let output = workflow
+            .on_event(&response_call(
+                "Workflow",
+                "workflow-1",
+                serde_json::json!({ "name": "delegate", "args": {} }),
+            ))
+            .unwrap();
+        assert!(matches!(
+            &output.effects[0],
+            Effect::RunTools { calls }
+                if matches!(
+                    calls[0].execution,
+                    phi_protocol::ToolExecution::Workflow {
+                        action: phi_protocol::WorkflowAction::Launch
+                    }
+                )
+        ));
     }
 }

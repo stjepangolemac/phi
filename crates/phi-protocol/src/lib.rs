@@ -116,7 +116,18 @@ where
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum ToolExecution {
-    Direct,
+    #[doc(hidden)]
+    #[serde(rename = "direct")]
+    LegacyDirect,
+    Capability,
+    ManagedProcess {
+        action: ManagedProcessAction,
+    },
+    FileEdit,
+    Workflow {
+        action: WorkflowAction,
+    },
+    ReloadConfig,
     Http {
         implementation: String,
         parallel: bool,
@@ -126,6 +137,23 @@ pub enum ToolExecution {
         body: serde_json::Value,
         timeout_ms: u64,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedProcessAction {
+    Execute,
+    WriteStdin,
+    List,
+    Terminate,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowAction {
+    Launch,
+    Output,
+    Stop,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -256,5 +284,47 @@ mod tests {
         let option: PickerOptionSpec = serde_json::from_str(r#""low""#).unwrap();
         assert_eq!(option.id(), "low");
         assert_eq!(option.description(), "");
+    }
+
+    #[test]
+    fn tool_execution_rejects_unknown_modes_and_actions() {
+        let unknown_mode = serde_json::from_value::<ToolCall>(serde_json::json!({
+            "call_id": "1",
+            "name": "tool",
+            "arguments": {},
+            "mode": "unknown"
+        }))
+        .unwrap_err();
+        assert!(
+            unknown_mode
+                .to_string()
+                .contains("unknown variant `unknown`")
+        );
+
+        let unknown_action = serde_json::from_value::<ToolCall>(serde_json::json!({
+            "call_id": "1",
+            "name": "tool",
+            "arguments": {},
+            "mode": "managed_process",
+            "action": "unknown"
+        }))
+        .unwrap_err();
+        assert!(
+            unknown_action
+                .to_string()
+                .contains("unknown variant `unknown`")
+        );
+    }
+
+    #[test]
+    fn tool_execution_accepts_persisted_direct_mode_for_runtime_migration() {
+        let call = serde_json::from_value::<ToolCall>(serde_json::json!({
+            "call_id": "1",
+            "name": "legacy",
+            "arguments": {},
+            "mode": "direct"
+        }))
+        .unwrap();
+        assert_eq!(call.execution, ToolExecution::LegacyDirect);
     }
 }
