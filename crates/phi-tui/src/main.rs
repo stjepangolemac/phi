@@ -319,6 +319,10 @@ impl App {
                 "help" if invocation.arguments.is_empty() => {
                     self.push_transcript("note", self.help());
                 }
+                "keys" if invocation.arguments.is_empty() => {
+                    self.push_transcript("note", self.keybinding_help());
+                }
+                "keys" => self.push_transcript("error", "usage: /keys"),
                 "compact" if invocation.arguments.is_empty() => self.start_compaction(),
                 "compact" => self.push_transcript("error", "usage: /compact"),
                 "model" if invocation.arguments.is_empty() => self.open_model_picker(),
@@ -440,6 +444,39 @@ impl App {
             .join("\n")
     }
 
+    fn keybinding_help(&self) -> String {
+        let detail =
+            |value: Option<u64>| value.map_or_else(|| "—".into(), |value| value.to_string());
+        let context = match (self.estimated_tokens, self.token_budget) {
+            (Some(used), Some(budget)) => format!("{used} / {budget}"),
+            _ => "—".into(),
+        };
+        format!(
+            "## Keys\n\n\
+• **Send / steer:** `Enter` sends when idle or queues guidance for the active turn.\n\
+• **Queue next turn:** `Tab` during an active turn.\n\
+• **New line:** `Shift+Enter` or `Ctrl+Enter`.\n\
+• **Move:** arrow keys; `Alt+Left/Right` or `Alt+B/F` by word; `Home/End` or `Ctrl+A/E` by line; `Cmd+Up/Down` to the start/end.\n\
+• **Delete:** `Backspace/Delete`; `Alt+Backspace` by word; `Ctrl+U` or `Cmd+Backspace` to line start.\n\
+• **History:** `Up/Down` at the first/last composer row.\n\
+• **Scroll:** `Shift+Up/Down`, `PageUp/PageDown`, or mouse wheel.\n\
+• **Commands:** type `/`, then use `Up/Down` and `Enter`.\n\
+• **Cancel:** `Ctrl+C` cancels an active turn; `Esc` removes queued input before cancelling the turn. `Ctrl+C` quits when idle.\n\
+• **Picker:** `Up/Down`, `Enter` to select, `Esc` to cancel.\n\
+• **Approval:** `y` allows once; `n` or `Esc` denies.\n\n\
+## Token details\n\n\
+• Context: {context}\n\
+• Input: {}\n\
+• Cached input: {}\n\
+• Cache write: {}\n\
+• Output: {}",
+            detail(self.input_tokens),
+            detail(self.cached_tokens),
+            detail(self.cache_write_tokens),
+            detail(self.output_tokens),
+        )
+    }
+
     fn start_command(&mut self, invocation: CommandInvocation) {
         let options = self.options.clone();
         self.command_task = Some(tokio::task::spawn_blocking(move || {
@@ -535,7 +572,12 @@ impl App {
                 *selected = (*selected + 1).min(options.len().saturating_sub(1));
             }
             KeyCode::Esc => {
-                self.push_transcript("note", "Model selection cancelled.");
+                let stage = match picker {
+                    Picker::Model { .. } => "Model",
+                    Picker::Reasoning { .. } => "Reasoning",
+                    Picker::ServiceTier { .. } => "Service tier",
+                };
+                self.push_transcript("note", format!("{stage} selection cancelled."));
                 self.follow = true;
                 return;
             }
@@ -1222,6 +1264,12 @@ impl App {
             if let Some(handle) = &self.handle {
                 handle.cancel();
                 self.status = "cancelling".into();
+            } else if self.command_task.is_some() {
+                self.push_transcript(
+                    "note",
+                    "Slash command cancellation is unavailable; waiting for it to finish.",
+                );
+                self.follow = true;
             } else if self.command_task.is_none() {
                 self.quit = true;
             }
@@ -3077,13 +3125,14 @@ fn human_tokens(tokens: u64) -> String {
     format!("{}K", formatted.trim_end_matches('0').trim_end_matches('.'))
 }
 
-fn centered(area: Rect, percent: u16, height: u16) -> Rect {
-    let width = area.width.saturating_mul(percent) / 100;
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
     Rect {
         x: area.x + area.width.saturating_sub(width) / 2,
         y: area.y + area.height.saturating_sub(height) / 2,
         width,
-        height: height.min(area.height),
+        height,
     }
 }
 
@@ -4319,6 +4368,57 @@ mod tests {
         assert!(!content.contains("context"));
         assert!(!content.contains("cache"));
         assert!(!content.contains("output"));
+    }
+
+    #[test]
+    fn keys_view_documents_interactions_and_exposes_detailed_tokens() {
+        let mut app = app();
+        app.on_runtime(RuntimeEvent::ContextUpdated {
+            estimated_tokens: 1_500,
+            token_budget: 6_000,
+            compactions: 0,
+            input_tokens: Some(1_234),
+            cached_tokens: Some(1_024),
+            cache_write_tokens: Some(128),
+            output_tokens: Some(50),
+        });
+        app.composer.text = "/keys".into();
+
+        app.submit();
+
+        assert!(app.command_task.is_none());
+        let (role, content) = app.transcript.last().unwrap();
+        assert_eq!(role, "note");
+        for expected in [
+            "Send / steer",
+            "History",
+            "Scroll",
+            "Queue next turn",
+            "Cancel",
+            "Picker",
+            "Approval",
+            "Context: 1500 / 6000",
+            "Input: 1234",
+            "Cached input: 1024",
+            "Cache write: 128",
+            "Output: 50",
+        ] {
+            assert!(
+                content.contains(expected),
+                "missing {expected:?}: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn keys_command_rejects_arguments_locally() {
+        let mut app = app();
+        app.composer.text = "/keys now".into();
+        app.submit();
+        assert_eq!(
+            app.transcript.last().unwrap(),
+            &("error".into(), "usage: /keys".into())
+        );
     }
 
     #[test]
@@ -6032,6 +6132,57 @@ mod tests {
     }
 
     #[test]
+    fn picker_cancellation_names_the_active_stage() {
+        let cases = [
+            (Picker::Model { selected: 0 }, "Model selection cancelled."),
+            (
+                Picker::Reasoning {
+                    model: "test/model".into(),
+                    selected: 0,
+                },
+                "Reasoning selection cancelled.",
+            ),
+            (
+                Picker::ServiceTier {
+                    model: "test/model".into(),
+                    reasoning: "low".into(),
+                    selected: 0,
+                },
+                "Service tier selection cancelled.",
+            ),
+        ];
+
+        for (picker, expected) in cases {
+            let mut app = app();
+            app.picker = Some(picker);
+            app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert!(app.picker.is_none());
+            assert_eq!(app.transcript.last().unwrap().1, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_during_slash_command_reports_unavailable_cancellation() {
+        let mut app = app();
+        app.command_task = Some(tokio::spawn(async {
+            pending::<Result<CommandExecution>>().await
+        }));
+
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert!(!app.quit);
+        assert!(app.command_task.is_some());
+        assert_eq!(
+            app.transcript.last().unwrap(),
+            &(
+                "note".into(),
+                "Slash command cancellation is unavailable; waiting for it to finish.".into()
+            )
+        );
+        app.command_task.take().unwrap().abort();
+    }
+
+    #[test]
     fn help_uses_loaded_catalog_without_starting_command_work() {
         let mut app = app();
         app.composer.text = "/help".into();
@@ -6186,6 +6337,23 @@ mod tests {
     fn picker_is_anchored_directly_above_composer() {
         let composer = Rect::new(0, 20, 80, 3);
         assert_eq!(picker_area(composer, 8), Rect::new(0, 12, 80, 8));
+    }
+
+    #[test]
+    fn approval_dialog_is_clamped_and_renders_on_narrow_terminals() {
+        for (width, height) in [(1, 1), (8, 3), (24, 4), (49, 8), (80, 10)] {
+            let terminal_area = Rect::new(0, 0, width, height);
+            let dialog = centered(terminal_area, 50, 5);
+            assert!(dialog.right() <= terminal_area.right());
+            assert!(dialog.bottom() <= terminal_area.bottom());
+            assert_eq!(dialog.width, width.min(50));
+            assert_eq!(dialog.height, height.min(5));
+
+            let mut app = app();
+            app.approval = Some("patch".into());
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        }
     }
 
     #[test]

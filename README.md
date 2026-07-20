@@ -30,6 +30,8 @@ New sessions are stored durably at `$PHI_HOME/sessions/<session-id>/` (normally 
 
 The shell tools run arbitrary commands through the user's shell, including pipelines and compound commands. Long-running commands yield a background session that survives model turns; the model can list sessions, poll them, or continue through stdin. Use `/ps` to inspect background processes and `/stop` to stop them. Use `/compact` to run the selected compactor immediately instead of waiting for the configured token threshold. PTYs are available for interactive programs. Tool approval is still required unless `--allow-shell` or `--yolo` is used. `--yolo` also lets file reads and edits target paths outside the workspace. OS sandboxing is intentionally not implemented yet.
 
+Run `/keys` in the TUI for the complete keybinding reference and detailed input, cached-input, cache-write, and output token counters. The essentials are: `Enter` sends or steers the active turn, `Tab` queues the next turn, `Shift+Enter` or `Ctrl+Enter` inserts a newline, `Up/Down` reaches composer history at the input boundaries, `Shift+Up/Down` or `PageUp/PageDown` scrolls, and `Ctrl+C` cancels an active turn or quits when idle. `Esc` manages queued input before cancelling a turn; pickers use `Up/Down`, `Enter`, and `Esc`; approvals use `y`, `n`, or `Esc`. Ctrl+C during a slash command reports that cancellation is unavailable rather than silently ignoring the key.
+
 ## Configuration
 
 Phi keeps behavior in Scheme and data in JSON:

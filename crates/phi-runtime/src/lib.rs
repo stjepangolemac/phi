@@ -1007,6 +1007,12 @@ pub fn execute_command(
     };
     let content = match invocation.name.as_str() {
         "help" => help(&initial_catalog),
+        "keys" => {
+            if !invocation.arguments.is_empty() {
+                bail!("usage: /keys");
+            }
+            "Run /keys in the interactive TUI to see keybindings and detailed token usage.".into()
+        }
         "ps" => process_list(&options.processes, &workspace)?,
         "stop" => {
             if !invocation.arguments.is_empty() {
@@ -1059,6 +1065,12 @@ fn catalog(policy: &mut phi_steel::Policy) -> Result<CommandCatalog> {
             name: "help".into(),
             usage: "/help".into(),
             description: "List available commands.".into(),
+            source: "core".into(),
+        },
+        CommandSpec {
+            name: "keys".into(),
+            usage: "/keys".into(),
+            description: "Show TUI keybindings and detailed token usage.".into(),
             source: "core".into(),
         },
         CommandSpec {
@@ -3218,6 +3230,12 @@ mod tests {
                 .commands
                 .iter()
                 .any(|command| command.name == "compact")
+        );
+        assert!(
+            catalog
+                .commands
+                .iter()
+                .any(|command| command.name == "keys")
         );
         assert!(catalog.commands.iter().any(|command| command.name == "ps"));
         assert!(

@@ -14,6 +14,8 @@ phi update-plugins
 
 Phi checks official and installed plugin sources on startup. Run `/update-plugins` in the TUI or `phi update-plugins` in the shell when an update notice appears, then `/reload` to adopt updated plugin code and skills in the current conversation. Existing sessions continue reading their pinned skill resources until reloaded.
 
+Run `/keys` in the TUI to see composer editing, history, scrolling, queueing, cancellation, picker, and approval controls. The same view exposes detailed input, cached-input, cache-write, and output token counters without expanding the normal status line. Ctrl+C cancels an active agent turn, quits when idle, and visibly reports when a running slash command cannot be cancelled.
+
 Direct file reads and edits normally allow the workspace and Phi home. Writes still require approval. `phi --yolo` removes approval and filesystem boundaries.
 
 ## Reconfigure
