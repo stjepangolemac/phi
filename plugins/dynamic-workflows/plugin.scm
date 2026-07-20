@@ -46,6 +46,6 @@
           'required (list "task_id")
           'additionalProperties #f)))
 
-(register-tool! workflow-tool)
-(register-tool! task-output-tool)
-(register-tool! task-stop-tool)
+(register-tool! workflow-tool (hash 'mode "workflow" 'action "launch"))
+(register-tool! task-output-tool (hash 'mode "workflow" 'action "output"))
+(register-tool! task-stop-tool (hash 'mode "workflow" 'action "stop"))

@@ -20,7 +20,7 @@ Rust owns mechanisms that require containment or reliability. Steel owns provide
 2. Snapshot that composition and every installed plugin's conventional skills into a new durable session under `$PHI_HOME/sessions/<session-id>/`.
 3. Build a provider-neutral prompt from instructions, messages, and compatible tools.
 4. Let the selected provider plugin build and stream the request.
-5. Execute returned tool calls through Rust capabilities or configured callable tools.
+5. Let Steel attach a typed execution route to each returned tool call, then execute the trusted capability, managed-process action, file edit, workflow action, config reload, or HTTP request in Rust.
 6. Feed results back until the policy finishes the turn.
 7. Compact after a completed model/tool cycle when the selected model threshold is crossed, immediately when the user runs `/compact`, or selectively when the model compacts closed context items.
 

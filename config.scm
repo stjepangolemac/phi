@@ -250,10 +250,15 @@
               'arguments arguments)
             'implementation (hash-ref implementation 'name))
           'parallel (hash-ref implementation 'parallel)))
-      (hash 'mode "direct"
-            'call_id (hash-ref call 'call_id)
-            'name (hash-ref call 'name)
-            'arguments (hash-ref call 'arguments))))
+      (let ([route (local-tool-route (hash-ref call 'name))])
+        (if (not route)
+            (error! (string-append "no execution route for tool: "
+                                   (hash-ref call 'name))))
+        (hash-insert
+          (hash-insert
+            (hash-insert route 'call_id (hash-ref call 'call_id))
+            'name (hash-ref call 'name))
+          'arguments (hash-ref call 'arguments)))))
 
 (define (tool-result-message result)
   (hash 'kind "tool_result"

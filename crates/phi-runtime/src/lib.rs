@@ -8,7 +8,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use include_dir::{Dir, DirEntry, include_dir};
-use phi_protocol::{Effect, Event, StreamRule, ToolCall, ToolExecution, ToolResult};
+use phi_protocol::{
+    Effect, Event, ManagedProcessAction, StreamRule, ToolCall, ToolExecution, ToolResult,
+    WorkflowAction,
+};
 use serde::{Deserialize, Serialize};
 use similar::TextDiff;
 use tokio::sync::mpsc;
@@ -1375,10 +1378,24 @@ fn policy_config_with_schema_and_workflows(
     tools.push(phi_core::capability::terminate_process_spec());
     tools.push(phi_core::capability::write_stdin_spec());
     tools.sort_by(|left, right| left.name.cmp(&right.name));
+    let mut tool_routes = capabilities
+        .specs()
+        .into_iter()
+        .map(|tool| serde_json::json!({ "name": tool.name, "mode": "capability" }))
+        .collect::<Vec<_>>();
+    tool_routes.extend([
+        serde_json::json!({ "name": "exec_command", "mode": "managed_process", "action": "execute" }),
+        serde_json::json!({ "name": "write_stdin", "mode": "managed_process", "action": "write_stdin" }),
+        serde_json::json!({ "name": "list_processes", "mode": "managed_process", "action": "list" }),
+        serde_json::json!({ "name": "terminate_process", "mode": "managed_process", "action": "terminate" }),
+        serde_json::json!({ "name": "reload_config", "mode": "reload_config" }),
+    ]);
+    tool_routes.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
     let mut value = serde_json::json!({
         "session_id": session_id,
         "skills": skills,
         "tools": tools,
+        "tool_routes": tool_routes,
         "workflow_help": workflow_help,
     });
     if let Some(model) = &user_state.model {
@@ -1604,7 +1621,7 @@ async fn run(
         )?;
     }
     let mut context_statuses = context_job_statuses(policy.state())?;
-    let mut file_editor_tool = policy.file_editor_tool_name()?;
+    let mut legacy_file_editor_tool = policy.file_editor_tool_name()?;
     let selected_model = state_string(policy.state(), "model")?;
     let tool_routes = policy.resolved_tool_routes(&selected_model)?;
     for route in tool_routes {
@@ -1840,7 +1857,7 @@ async fn run(
                     session: &session,
                     capabilities: Arc::clone(&capabilities),
                     config: Arc::new(config.clone()),
-                    file_editor_tool: &file_editor_tool,
+                    legacy_file_editor_tool: &legacy_file_editor_tool,
                     events,
                     cancellation,
                     full_access: options.full_access,
@@ -1880,7 +1897,7 @@ async fn run(
                     )?;
                     capabilities = bootstrap.capabilities;
                     policy = bootstrap.policy;
-                    file_editor_tool = policy.file_editor_tool_name()?;
+                    legacy_file_editor_tool = policy.file_editor_tool_name()?;
                 }
                 event = Event::ToolsCompleted { results };
             }
@@ -2088,6 +2105,7 @@ struct RawToolResult {
     call_id: String,
     name: String,
     result: RawToolOutput,
+    reloaded: bool,
 }
 
 enum RawToolOutput {
@@ -2114,7 +2132,7 @@ struct ToolBatchExecutor<'a> {
     session: &'a phi_core::session::Session,
     capabilities: Arc<phi_core::capability::Registry>,
     config: Arc<Config>,
-    file_editor_tool: &'a str,
+    legacy_file_editor_tool: &'a str,
     events: &'a mpsc::UnboundedSender<RuntimeEvent>,
     cancellation: &'a CancellationToken,
     full_access: bool,
@@ -2135,9 +2153,9 @@ async fn execute_tool_calls(
     let mut completed = Vec::new();
     let mut parallel = Vec::new();
     let mut reloaded = false;
-    for (index, call) in calls.into_iter().enumerate() {
-        let parallel_safe =
-            tool_call_parallel_safe(&call, &executor.capabilities, executor.file_editor_tool);
+    for (index, mut call) in calls.into_iter().enumerate() {
+        migrate_legacy_tool_execution(&mut call, executor.legacy_file_editor_tool);
+        let parallel_safe = tool_call_parallel_safe(&call, &executor.capabilities);
         if !parallel_safe {
             flush_parallel_calls(
                 executor,
@@ -2190,51 +2208,13 @@ async fn execute_tool_calls(
                 Some(format!("denied by tool approval policy: {detail}")),
             ),
         };
-        if approved && call.name == "reload_config" {
-            let result = reload_composition(
-                executor.home,
-                executor.config_path,
-                executor.workspace,
-                executor.session,
-                Some(policy.state().to_owned()),
-                executor.full_access,
-                executor.output_schema,
-            )
-            .map(|(_, catalog)| {
-                let _ = executor.events.send(RuntimeEvent::CatalogUpdated {
-                    catalog: catalog.clone(),
-                });
-                reloaded = true;
-                serde_json::json!({
-                    "reloaded": true,
-                    "models": catalog.models.len(),
-                    "commands": catalog.commands.len()
-                })
-            })
-            .unwrap_or_else(|error| serde_json::json!({ "error": runtime_error(&error) }));
-            send(
-                executor.events,
-                RuntimeEvent::ToolCompleted {
-                    call_id: call.call_id.clone(),
-                    name: call.name.clone(),
-                    result: result.clone(),
-                },
-            )?;
-            completed.push((
-                index,
-                ToolResult {
-                    call_id: call.call_id,
-                    name: call.name,
-                    result,
-                },
-            ));
-        } else if approved {
+        if approved {
             let pending = PendingToolCall { index, call };
             if parallel_safe {
                 parallel.push(pending);
             } else {
                 let raw = execute_serial_call(executor, pending, policy, shell_sessions).await;
-                finish_tool_call(raw, policy, executor.events, &mut completed)?;
+                reloaded |= finish_tool_call(raw, policy, executor.events, &mut completed)?;
             }
         } else {
             let result = serde_json::json!({
@@ -2369,23 +2349,50 @@ fn fallback_approval_detail(name: &str, arguments: &serde_json::Value) -> String
     }
 }
 
-fn tool_call_parallel_safe(
-    call: &ToolCall,
-    capabilities: &phi_core::capability::Registry,
-    file_editor_tool: &str,
-) -> bool {
-    if matches!(call.name.as_str(), "Workflow" | "TaskOutput" | "TaskStop") {
-        return false;
+fn migrate_legacy_tool_execution(call: &mut ToolCall, file_editor_tool: &str) {
+    if !matches!(call.execution, ToolExecution::LegacyDirect) {
+        return;
     }
+    call.execution = match call.name.as_str() {
+        "exec_command" => ToolExecution::ManagedProcess {
+            action: ManagedProcessAction::Execute,
+        },
+        "write_stdin" => ToolExecution::ManagedProcess {
+            action: ManagedProcessAction::WriteStdin,
+        },
+        "list_processes" => ToolExecution::ManagedProcess {
+            action: ManagedProcessAction::List,
+        },
+        "terminate_process" => ToolExecution::ManagedProcess {
+            action: ManagedProcessAction::Terminate,
+        },
+        "Workflow" => ToolExecution::Workflow {
+            action: WorkflowAction::Launch,
+        },
+        "TaskOutput" => ToolExecution::Workflow {
+            action: WorkflowAction::Output,
+        },
+        "TaskStop" => ToolExecution::Workflow {
+            action: WorkflowAction::Stop,
+        },
+        "reload_config" => ToolExecution::ReloadConfig,
+        name if name == file_editor_tool => ToolExecution::FileEdit,
+        _ => ToolExecution::Capability,
+    };
+}
+
+fn tool_call_parallel_safe(call: &ToolCall, capabilities: &phi_core::capability::Registry) -> bool {
     match &call.execution {
         ToolExecution::Http { parallel, .. } => *parallel,
-        ToolExecution::Direct => {
-            call.name == "exec_command"
-                || (call.name != "write_stdin"
-                    && call.name != "list_processes"
-                    && call.name != file_editor_tool
-                    && capabilities.parallel_safe(&call.name))
-        }
+        ToolExecution::Capability => capabilities.parallel_safe(&call.name),
+        ToolExecution::ManagedProcess {
+            action: ManagedProcessAction::Execute,
+        } => true,
+        ToolExecution::ManagedProcess { .. }
+        | ToolExecution::FileEdit
+        | ToolExecution::Workflow { .. }
+        | ToolExecution::ReloadConfig
+        | ToolExecution::LegacyDirect => false,
     }
 }
 
@@ -2422,7 +2429,7 @@ async fn flush_parallel_calls(
             .await?
             .context("parallel tool task missing")?
             .context("parallel tool task failed")?;
-        finish_tool_call(raw, policy, executor.events, completed)?;
+        let _ = finish_tool_call(raw, policy, executor.events, completed)?;
     }
     Ok(())
 }
@@ -2443,31 +2450,8 @@ async fn execute_parallel_call(
         arguments,
         execution,
     } = call;
-    if name == "exec_command" {
-        let event_name = name.clone();
-        let event_call_id = call_id.clone();
-        let result = shell_sessions
-            .exec_with_access(&workspace, &arguments, full_access, move |content| {
-                let _ = events.send(RuntimeEvent::ToolOutput {
-                    call_id: event_call_id.clone(),
-                    name: event_name.clone(),
-                    content: content.to_owned(),
-                });
-            })
-            .await
-            .unwrap_or_else(|error| serde_json::json!({ "error": runtime_error(&error) }));
-        return RawToolResult {
-            index,
-            call_id,
-            name,
-            result: RawToolOutput::Value {
-                result,
-                display: None,
-            },
-        };
-    }
     let result = match execution {
-        ToolExecution::Direct => {
+        ToolExecution::Capability => {
             let tool_name = name.clone();
             let result = tokio::task::spawn_blocking(move || {
                 capabilities.execute(&workspace, &tool_name, arguments)
@@ -2476,6 +2460,26 @@ async fn execute_parallel_call(
             .map_err(|error| anyhow::anyhow!(error))
             .and_then(|result| result)
             .unwrap_or_else(|error| serde_json::json!({ "error": runtime_error(&error) }));
+            RawToolOutput::Value {
+                result,
+                display: None,
+            }
+        }
+        ToolExecution::ManagedProcess {
+            action: ManagedProcessAction::Execute,
+        } => {
+            let event_name = name.clone();
+            let event_call_id = call_id.clone();
+            let result = shell_sessions
+                .exec_with_access(&workspace, &arguments, full_access, move |content| {
+                    let _ = events.send(RuntimeEvent::ToolOutput {
+                        call_id: event_call_id.clone(),
+                        name: event_name.clone(),
+                        content: content.to_owned(),
+                    });
+                })
+                .await
+                .unwrap_or_else(|error| serde_json::json!({ "error": runtime_error(&error) }));
             RawToolOutput::Value {
                 result,
                 display: None,
@@ -2514,12 +2518,21 @@ async fn execute_parallel_call(
                 event,
             }
         }
+        ToolExecution::ManagedProcess { .. }
+        | ToolExecution::FileEdit
+        | ToolExecution::Workflow { .. }
+        | ToolExecution::ReloadConfig
+        | ToolExecution::LegacyDirect => RawToolOutput::Value {
+            result: serde_json::json!({ "error": "tool effect is not parallel-safe" }),
+            display: None,
+        },
     };
     RawToolResult {
         index,
         call_id,
         name,
         result,
+        reloaded: false,
     }
 }
 
@@ -2529,127 +2542,166 @@ async fn execute_serial_call(
     policy: &mut phi_steel::Policy,
     shell_sessions: &Arc<phi_core::process::ShellSessions>,
 ) -> RawToolResult {
-    let index = pending.index;
-    let call = pending.call;
-    if matches!(call.name.as_str(), "Workflow" | "TaskOutput" | "TaskStop") {
-        let result = cancellable(executor.cancellation, async {
-            match call.name.as_str() {
-                "Workflow" => {
-                    executor
-                        .workflows
-                        .launch(
-                            executor.workspace,
-                            &executor.home.root,
-                            executor.session.id(),
-                            executor.session.dir(),
-                            executor.plugin_roots,
-                            &call.arguments,
-                        )
-                        .await
+    let PendingToolCall { index, call } = pending;
+    let ToolCall {
+        call_id,
+        name,
+        arguments,
+        execution,
+    } = call;
+    let value = |result| RawToolOutput::Value {
+        result,
+        display: None,
+    };
+    let (result, reloaded) = match execution {
+        ToolExecution::Workflow { action } => {
+            let result = cancellable(executor.cancellation, async {
+                match action {
+                    WorkflowAction::Launch => {
+                        executor
+                            .workflows
+                            .launch(
+                                executor.workspace,
+                                &executor.home.root,
+                                executor.session.id(),
+                                executor.session.dir(),
+                                executor.plugin_roots,
+                                &arguments,
+                            )
+                            .await
+                    }
+                    WorkflowAction::Output => {
+                        executor
+                            .workflows
+                            .output(executor.session.dir(), &arguments)
+                            .await
+                    }
+                    WorkflowAction::Stop => {
+                        executor
+                            .workflows
+                            .stop(executor.session.dir(), &arguments)
+                            .await
+                    }
                 }
-                "TaskOutput" => {
-                    executor
-                        .workflows
-                        .output(executor.session.dir(), &call.arguments)
-                        .await
+            })
+            .await
+            .and_then(|result| result)
+            .unwrap_or_else(|error| serde_json::json!({ "error": runtime_error(&error) }));
+            (value(result), false)
+        }
+        ToolExecution::ManagedProcess { action } => {
+            let event_name = name.clone();
+            let event_call_id = call_id.clone();
+            let events = executor.events.clone();
+            let result = cancellable(executor.cancellation, async {
+                let emit = move |content: &str| {
+                    let _ = events.send(RuntimeEvent::ToolOutput {
+                        call_id: event_call_id.clone(),
+                        name: event_name.clone(),
+                        content: content.to_owned(),
+                    });
+                };
+                match action {
+                    ManagedProcessAction::Execute => {
+                        shell_sessions
+                            .exec_with_access(
+                                executor.workspace,
+                                &arguments,
+                                executor.full_access,
+                                emit,
+                            )
+                            .await
+                    }
+                    ManagedProcessAction::WriteStdin => {
+                        shell_sessions.write_stdin(&arguments, emit).await
+                    }
+                    ManagedProcessAction::Terminate => shell_sessions.terminate(&arguments).await,
+                    ManagedProcessAction::List => shell_sessions
+                        .list()
+                        .map(|processes| serde_json::json!({ "processes": processes })),
                 }
-                "TaskStop" => {
-                    executor
-                        .workflows
-                        .stop(executor.session.dir(), &call.arguments)
-                        .await
-                }
-                _ => unreachable!(),
-            }
-        })
-        .await
-        .and_then(|result| result)
-        .unwrap_or_else(|error| serde_json::json!({ "error": runtime_error(&error) }));
-        return RawToolResult {
-            index,
-            call_id: call.call_id,
-            name: call.name,
-            result: RawToolOutput::Value {
-                result,
-                display: None,
-            },
-        };
-    }
-    if matches!(
-        call.name.as_str(),
-        "exec_command" | "write_stdin" | "list_processes" | "terminate_process"
-    ) {
-        let name = call.name.clone();
-        let call_id = call.call_id.clone();
-        let events = executor.events.clone();
-        let result = cancellable(executor.cancellation, async {
-            let emit = move |content: &str| {
-                let _ = events.send(RuntimeEvent::ToolOutput {
-                    call_id: call_id.clone(),
-                    name: name.clone(),
-                    content: content.to_owned(),
+            })
+            .await
+            .and_then(|result| result)
+            .unwrap_or_else(|error| serde_json::json!({ "error": runtime_error(&error) }));
+            (value(result), false)
+        }
+        ToolExecution::FileEdit => {
+            let (result, display) = execute_file_edit(
+                executor.workspace,
+                &executor.home.root,
+                policy,
+                &name,
+                &arguments,
+                executor.full_access,
+            )
+            .map(|(result, display)| (result, Some(display)))
+            .unwrap_or_else(|error| (serde_json::json!({ "error": runtime_error(&error) }), None));
+            (RawToolOutput::Value { result, display }, false)
+        }
+        ToolExecution::ReloadConfig => {
+            let result = reload_composition(
+                executor.home,
+                executor.config_path,
+                executor.workspace,
+                executor.session,
+                Some(policy.state().to_owned()),
+                executor.full_access,
+                executor.output_schema,
+            )
+            .map(|(_, catalog)| {
+                let _ = executor.events.send(RuntimeEvent::CatalogUpdated {
+                    catalog: catalog.clone(),
                 });
+                serde_json::json!({
+                    "reloaded": true,
+                    "models": catalog.models.len(),
+                    "commands": catalog.commands.len()
+                })
+            })
+            .map(|result| (result, true))
+            .unwrap_or_else(|error| (serde_json::json!({ "error": runtime_error(&error) }), false));
+            (value(result.0), result.1)
+        }
+        execution @ (ToolExecution::Capability | ToolExecution::Http { .. }) => {
+            return execute_parallel_call(
+                PendingToolCall {
+                    index,
+                    call: ToolCall {
+                        call_id,
+                        name,
+                        arguments,
+                        execution,
+                    },
+                },
+                executor.workspace.to_owned(),
+                Arc::clone(&executor.capabilities),
+                Arc::clone(&executor.config),
+                Arc::clone(shell_sessions),
+                executor.events.clone(),
+                executor.full_access,
+            )
+            .await;
+        }
+        ToolExecution::LegacyDirect => {
+            return RawToolResult {
+                index,
+                call_id,
+                name,
+                result: value(serde_json::json!({
+                    "error": "legacy direct tool route was not migrated"
+                })),
+                reloaded: false,
             };
-            if call.name == "exec_command" {
-                shell_sessions
-                    .exec_with_access(
-                        executor.workspace,
-                        &call.arguments,
-                        executor.full_access,
-                        emit,
-                    )
-                    .await
-            } else if call.name == "write_stdin" {
-                shell_sessions.write_stdin(&call.arguments, emit).await
-            } else if call.name == "terminate_process" {
-                shell_sessions.terminate(&call.arguments).await
-            } else {
-                shell_sessions
-                    .list()
-                    .map(|processes| serde_json::json!({ "processes": processes }))
-            }
-        })
-        .await
-        .and_then(|result| result)
-        .unwrap_or_else(|error| serde_json::json!({ "error": runtime_error(&error) }));
-        return RawToolResult {
-            index,
-            call_id: call.call_id,
-            name: call.name,
-            result: RawToolOutput::Value {
-                result,
-                display: None,
-            },
-        };
+        }
+    };
+    RawToolResult {
+        index,
+        call_id,
+        name,
+        result,
+        reloaded,
     }
-    if call.name == executor.file_editor_tool {
-        let (result, display) = execute_file_edit(
-            executor.workspace,
-            &executor.home.root,
-            policy,
-            &call.name,
-            &call.arguments,
-            executor.full_access,
-        )
-        .map(|(result, display)| (result, Some(display)))
-        .unwrap_or_else(|error| (serde_json::json!({ "error": runtime_error(&error) }), None));
-        return RawToolResult {
-            index,
-            call_id: call.call_id,
-            name: call.name,
-            result: RawToolOutput::Value { result, display },
-        };
-    }
-    execute_parallel_call(
-        PendingToolCall { index, call },
-        executor.workspace.to_owned(),
-        Arc::clone(&executor.capabilities),
-        Arc::clone(&executor.config),
-        Arc::clone(shell_sessions),
-        executor.events.clone(),
-        executor.full_access,
-    )
-    .await
 }
 
 fn finish_tool_call(
@@ -2657,7 +2709,8 @@ fn finish_tool_call(
     policy: &mut phi_steel::Policy,
     events: &mpsc::UnboundedSender<RuntimeEvent>,
     completed: &mut Vec<(usize, ToolResult)>,
-) -> Result<()> {
+) -> Result<bool> {
+    let reloaded = raw.reloaded;
     let (result, display) = match raw.result {
         RawToolOutput::Value { result, display } => (result, display),
         RawToolOutput::Http {
@@ -2699,7 +2752,7 @@ fn finish_tool_call(
             result,
         },
     ));
-    Ok(())
+    Ok(reloaded)
 }
 
 fn emit_stream_events(
@@ -3448,7 +3501,7 @@ mod tests {
                     session: &session,
                     capabilities: registry,
                     config: Arc::new(load_config(&options.config_path).unwrap()),
-                    file_editor_tool: "patch",
+                    legacy_file_editor_tool: "patch",
                     events: &event_tx,
                     cancellation: &cancellation,
                     full_access: false,
@@ -3469,7 +3522,7 @@ mod tests {
                             "yield-time_ms": null,
                             "max_output_tokens": null
                         }),
-                        execution: ToolExecution::Direct,
+                        execution: ToolExecution::LegacyDirect,
                     }],
                     &executor,
                     &phi_core::permissions::Permissions {
@@ -4470,7 +4523,7 @@ mod tests {
                         call_id: call_id.into(),
                         name: "concurrent_test".into(),
                         arguments: serde_json::json!({ "id": call_id }),
-                        execution: ToolExecution::Direct,
+                        execution: ToolExecution::Capability,
                     })
                     .collect();
                 let cancellation = CancellationToken::new();
@@ -4482,7 +4535,7 @@ mod tests {
                     session: &session,
                     capabilities: registry,
                     config,
-                    file_editor_tool: "patch",
+                    legacy_file_editor_tool: "patch",
                     events: &event_tx,
                     cancellation: &cancellation,
                     full_access: false,
@@ -4515,6 +4568,92 @@ mod tests {
                 );
             })
             .await;
+    }
+
+    #[test]
+    fn typed_effect_parallel_safety_does_not_depend_on_tool_names() {
+        let capabilities = phi_core::capability::Registry::default();
+        let process = ToolCall {
+            call_id: "process".into(),
+            name: "arbitrary_process_alias".into(),
+            arguments: serde_json::json!({}),
+            execution: ToolExecution::ManagedProcess {
+                action: ManagedProcessAction::Execute,
+            },
+        };
+        let workflow = ToolCall {
+            call_id: "workflow".into(),
+            name: "arbitrary_workflow_alias".into(),
+            arguments: serde_json::json!({}),
+            execution: ToolExecution::Workflow {
+                action: WorkflowAction::Launch,
+            },
+        };
+
+        assert!(tool_call_parallel_safe(&process, &capabilities));
+        assert!(!tool_call_parallel_safe(&workflow, &capabilities));
+    }
+
+    #[test]
+    fn persisted_direct_routes_are_migrated_before_dispatch() {
+        let cases = [
+            (
+                "exec_command",
+                ToolExecution::ManagedProcess {
+                    action: ManagedProcessAction::Execute,
+                },
+            ),
+            (
+                "write_stdin",
+                ToolExecution::ManagedProcess {
+                    action: ManagedProcessAction::WriteStdin,
+                },
+            ),
+            (
+                "list_processes",
+                ToolExecution::ManagedProcess {
+                    action: ManagedProcessAction::List,
+                },
+            ),
+            (
+                "terminate_process",
+                ToolExecution::ManagedProcess {
+                    action: ManagedProcessAction::Terminate,
+                },
+            ),
+            (
+                "Workflow",
+                ToolExecution::Workflow {
+                    action: WorkflowAction::Launch,
+                },
+            ),
+            (
+                "TaskOutput",
+                ToolExecution::Workflow {
+                    action: WorkflowAction::Output,
+                },
+            ),
+            (
+                "TaskStop",
+                ToolExecution::Workflow {
+                    action: WorkflowAction::Stop,
+                },
+            ),
+            ("reload_config", ToolExecution::ReloadConfig),
+            ("custom_editor", ToolExecution::FileEdit),
+            ("custom_capability", ToolExecution::Capability),
+        ];
+
+        for (name, expected) in cases {
+            let mut call = ToolCall {
+                call_id: "legacy".into(),
+                name: name.into(),
+                arguments: serde_json::json!({}),
+                execution: ToolExecution::LegacyDirect,
+            };
+            migrate_legacy_tool_execution(&mut call, "custom_editor");
+            assert_eq!(call.execution, expected, "legacy route for {name}");
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4658,7 +4797,7 @@ mod tests {
                     session: &session,
                     capabilities: registry,
                     config: Arc::new(load_config(&options.config_path).unwrap()),
-                    file_editor_tool: "patch",
+                    legacy_file_editor_tool: "patch",
                     events: &event_tx,
                     cancellation: &cancellation,
                     full_access: false,
@@ -4671,7 +4810,7 @@ mod tests {
                         call_id: "reload".into(),
                         name: "reload_config".into(),
                         arguments: serde_json::json!({}),
-                        execution: ToolExecution::Direct,
+                        execution: ToolExecution::ReloadConfig,
                     }],
                     &executor,
                     &phi_core::permissions::Permissions {

@@ -13,6 +13,7 @@ Add model registrations and all provider or tool configuration to this compositi
 - Compactors decide when and how to summarize context.
 - File editors define the model-facing edit format and matching policy; Rust verifies revisions and writes files.
 - Hosted and callable tools declare compatible provider/model routes.
+- Local tools declare a typed Rust effect route rather than relying on their model-facing name.
 - Slash commands register local user operations.
 - Skills expose their name, description, and precedence-resolved `skill://NAME/SKILL.md` resource first. Read that file and its relative Markdown resources progressively with `read_file`; resource reads stay contained within the selected skill root. Every installed plugin may provide conventional `skills/NAME/SKILL.md` resources without Scheme registration or activation.
 
@@ -30,6 +31,8 @@ Provider plugins may register default models. Because plugin entrypoints are eva
 Keep complete model metadata in the registration spec: label, description, context and compaction limits, tool compatibility, reasoning options, and service tiers.
 
 Prefer Steel for configurable behavior. Add Rust only for trusted effects, containment, durable state, transport, scheduling, or primitives Steel cannot safely provide.
+
+Local execution routes form a closed protocol contract. `(register-tool! builder route)` accepts `capability`; `managed_process` with `execute`, `write_stdin`, `list`, or `terminate`; `workflow` with `launch`, `output`, or `stop`; and `reload_config`. Callable implementations route through `http`, while the selected file editor is assigned `file_edit` automatically. Steel policy selects the route and Rust executes it, so aliases and new tools backed by an existing effect do not require agent-loop changes. Invalid modes and actions fail during protocol decoding. For migration only, the one-argument `(register-tool! builder)` form remains valid: historical bundled names map to their typed effects and other external tools retain direct-capability dispatch. Sessions pinned to the former config may emit `mode: "direct"`; runtime translates that representation, including a pinned external editor, before typed dispatch. New plugins should always declare their route explicitly.
 
 The bundled `codex-patch` editor accepts locator text on an `@@` line or as a context-only hunk before a later changing hunk. Repeated plain update sections for one file run sequentially as one atomic edit. Each update must contain at least one syntactic change and must change file content or destination. Matching errors identify the file and hunk.
 
