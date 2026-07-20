@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     io::{Read, Write},
     path::{Path, PathBuf},
     process::Stdio,
@@ -44,26 +44,108 @@ pub async fn run(
     if let Some(mut pipe) = child.stdin.take() {
         pipe.write_all(stdin.as_bytes()).await?;
     }
-    let output = tokio::select! {
-        result = timeout(Duration::from_millis(timeout_ms), child.wait_with_output()) => {
-            result.context("process timed out")??
-        }
-        result = tokio::signal::ctrl_c() => {
-            result?;
-            bail!("process cancelled");
-        }
-    };
-    const MAX_OUTPUT: usize = 64 * 1024;
-    Ok(Event::ProcessCompleted {
-        success: output.status.success(),
-        exit_code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout[..output.stdout.len().min(MAX_OUTPUT)])
-            .into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr[..output.stderr.len().min(MAX_OUTPUT)])
-            .into_owned(),
-        stdout_truncated: output.stdout.len() > MAX_OUTPUT,
-        stderr_truncated: output.stderr.len() > MAX_OUTPUT,
+    let stdout = child.stdout.take().context("capture process stdout")?;
+    let stderr = child.stderr.take().context("capture process stderr")?;
+    let (status, stdout, stderr) = timeout(Duration::from_millis(timeout_ms), async {
+        tokio::try_join!(
+            child.wait(),
+            collect_bounded_output(stdout),
+            collect_bounded_output(stderr),
+        )
     })
+    .await
+    .context("process timed out")??;
+    let (stdout, stdout_truncated) = stdout.render();
+    let (stderr, stderr_truncated) = stderr.render();
+    Ok(Event::ProcessCompleted {
+        success: status.success(),
+        exit_code: status.code(),
+        stdout,
+        stderr,
+        stdout_truncated,
+        stderr_truncated,
+    })
+}
+
+/// Each one-shot output stream renders at most 64 KiB of source bytes, including
+/// an explicit marker between equally sized head and tail sections when truncated.
+const MAX_ONESHOT_OUTPUT_BYTES: usize = 64 * 1024;
+const OUTPUT_ELISION_MARKER: &[u8] = b"\n... output truncated ...\n";
+const TRUNCATED_PAYLOAD_BYTES: usize = MAX_ONESHOT_OUTPUT_BYTES - OUTPUT_ELISION_MARKER.len();
+const OUTPUT_HEAD_BYTES: usize = TRUNCATED_PAYLOAD_BYTES.div_ceil(2);
+const OUTPUT_TAIL_BYTES: usize = TRUNCATED_PAYLOAD_BYTES / 2;
+const OUTPUT_BUFFER_TAIL_BYTES: usize = MAX_ONESHOT_OUTPUT_BYTES - OUTPUT_HEAD_BYTES;
+
+struct BoundedOutput {
+    head: Vec<u8>,
+    tail: VecDeque<u8>,
+    total_bytes: usize,
+}
+
+impl BoundedOutput {
+    fn new() -> Self {
+        Self {
+            head: Vec::with_capacity(OUTPUT_HEAD_BYTES),
+            tail: VecDeque::with_capacity(OUTPUT_BUFFER_TAIL_BYTES),
+            total_bytes: 0,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.total_bytes = self.total_bytes.saturating_add(bytes.len());
+        let head_bytes = (OUTPUT_HEAD_BYTES - self.head.len()).min(bytes.len());
+        self.head.extend_from_slice(&bytes[..head_bytes]);
+        let bytes = &bytes[head_bytes..];
+        if bytes.is_empty() {
+            return;
+        }
+
+        if bytes.len() >= OUTPUT_BUFFER_TAIL_BYTES {
+            self.tail.clear();
+            self.tail
+                .extend(&bytes[bytes.len() - OUTPUT_BUFFER_TAIL_BYTES..]);
+        } else {
+            let overflow = self
+                .tail
+                .len()
+                .saturating_add(bytes.len())
+                .saturating_sub(OUTPUT_BUFFER_TAIL_BYTES);
+            self.tail.drain(..overflow);
+            self.tail.extend(bytes);
+        }
+    }
+
+    fn render(self) -> (String, bool) {
+        if self.total_bytes <= MAX_ONESHOT_OUTPUT_BYTES {
+            let mut bytes = self.head;
+            bytes.extend(self.tail);
+            return (String::from_utf8_lossy(&bytes).into_owned(), false);
+        }
+
+        let mut bytes = Vec::with_capacity(MAX_ONESHOT_OUTPUT_BYTES);
+        bytes.extend(self.head);
+        bytes.extend_from_slice(OUTPUT_ELISION_MARKER);
+        bytes.extend(
+            self.tail
+                .into_iter()
+                .skip(OUTPUT_BUFFER_TAIL_BYTES - OUTPUT_TAIL_BYTES),
+        );
+        (String::from_utf8_lossy(&bytes).into_owned(), true)
+    }
+}
+
+async fn collect_bounded_output(
+    mut reader: impl AsyncRead + Unpin,
+) -> std::io::Result<BoundedOutput> {
+    let mut output = BoundedOutput::new();
+    let mut buffer = [0; 8192];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok(output);
+        }
+        output.push(&buffer[..read]);
+    }
 }
 
 const DEFAULT_YIELD_MS: u64 = 10_000;
@@ -889,6 +971,141 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("timed out waiting for {}", path.display());
+    }
+
+    #[cfg(unix)]
+    async fn run_shell(workspace: &Path, command: &str, timeout_ms: u64) -> Result<Event> {
+        run(
+            workspace,
+            &HashSet::from(["/bin/sh".to_owned()]),
+            "/bin/sh",
+            &["-c".to_owned(), command.to_owned()],
+            "",
+            timeout_ms,
+        )
+        .await
+    }
+
+    #[test]
+    fn bounded_output_leaves_short_and_exact_boundary_output_unchanged() {
+        for bytes in [
+            b"short output".to_vec(),
+            vec![b'x'; MAX_ONESHOT_OUTPUT_BYTES],
+        ] {
+            let mut output = BoundedOutput::new();
+            output.push(&bytes);
+            let (rendered, truncated) = output.render();
+
+            assert_eq!(rendered.as_bytes(), bytes);
+            assert!(!truncated);
+        }
+    }
+
+    #[test]
+    fn bounded_output_preserves_head_and_tail_with_an_elision_marker() {
+        let mut bytes = b"diagnostic head\n".to_vec();
+        bytes.resize(MAX_ONESHOT_OUTPUT_BYTES + 100, b'x');
+        bytes.extend_from_slice(b"\ndiagnostic tail");
+        let mut output = BoundedOutput::new();
+        for chunk in bytes.chunks(997) {
+            output.push(chunk);
+        }
+        let (rendered, truncated) = output.render();
+
+        assert!(truncated);
+        assert_eq!(rendered.len(), MAX_ONESHOT_OUTPUT_BYTES);
+        assert!(rendered.starts_with("diagnostic head\n"));
+        assert!(rendered.contains(std::str::from_utf8(OUTPUT_ELISION_MARKER).unwrap()));
+        assert!(rendered.ends_with("\ndiagnostic tail"));
+    }
+
+    #[test]
+    fn bounded_output_handles_multibyte_characters_at_slice_boundaries() {
+        let mut bytes = vec![b'x'; OUTPUT_HEAD_BYTES - 1];
+        bytes.extend_from_slice("é".as_bytes());
+        bytes.resize(MAX_ONESHOT_OUTPUT_BYTES + 100, b'y');
+        bytes.extend_from_slice("終".as_bytes());
+        let mut output = BoundedOutput::new();
+        output.push(&bytes);
+        let (rendered, truncated) = output.render();
+
+        assert!(truncated);
+        assert!(rendered.contains('\u{fffd}'));
+        assert!(rendered.contains(std::str::from_utf8(OUTPUT_ELISION_MARKER).unwrap()));
+        assert!(rendered.ends_with('終'));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_bounds_stdout_and_stderr_while_preserving_both_ends() {
+        let workspace = tempfile::tempdir().unwrap();
+        let result = run_shell(
+            workspace.path(),
+            "printf 'stdout head\\n'; i=0; while [ $i -lt 7000 ]; do printf 1234567890; i=$((i+1)); done; printf '\\nstdout tail\\n'; printf 'stderr head\\n' >&2; i=0; while [ $i -lt 7000 ]; do printf abcdefghij >&2; i=$((i+1)); done; printf '\\nstderr tail\\n' >&2",
+            10_000,
+        )
+        .await
+        .unwrap();
+        let Event::ProcessCompleted {
+            stdout,
+            stderr,
+            stdout_truncated,
+            stderr_truncated,
+            ..
+        } = result
+        else {
+            panic!("expected process completion");
+        };
+
+        assert!(stdout_truncated);
+        assert!(stderr_truncated);
+        assert_eq!(stdout.len(), MAX_ONESHOT_OUTPUT_BYTES);
+        assert_eq!(stderr.len(), MAX_ONESHOT_OUTPUT_BYTES);
+        assert!(stdout.starts_with("stdout head\n"));
+        assert!(stdout.ends_with("\nstdout tail\n"));
+        assert!(stderr.starts_with("stderr head\n"));
+        assert!(stderr.ends_with("\nstderr tail\n"));
+        let marker = std::str::from_utf8(OUTPUT_ELISION_MARKER).unwrap();
+        assert!(stdout.contains(marker));
+        assert!(stderr.contains(marker));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_timeout_kills_the_child() {
+        let workspace = tempfile::tempdir().unwrap();
+        let error = run_shell(
+            workspace.path(),
+            ": > timeout-ready; sleep 0.3; printf survived > timeout-marker",
+            50,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("process timed out"));
+        assert!(workspace.path().join("timeout-ready").exists());
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(!workspace.path().join("timeout-marker").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_run_kills_the_child() {
+        let workspace = tempfile::tempdir().unwrap();
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(50),
+            run_shell(
+                workspace.path(),
+                ": > cancel-ready; sleep 0.3; printf survived > cancel-marker",
+                1_000,
+            ),
+        )
+        .await;
+
+        assert!(cancelled.is_err());
+        assert!(workspace.path().join("cancel-ready").exists());
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(!workspace.path().join("cancel-marker").exists());
     }
 
     #[tokio::test(flavor = "current_thread")]
