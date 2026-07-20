@@ -712,7 +712,7 @@ impl App {
             RuntimeEvent::ModelDelta { content } => {
                 self.current_commentary = None;
                 self.current_reasoning_summary = None;
-                self.mark_response_start_after_tools();
+                self.mark_response_start_after_activity();
                 self.current_model.push_str(&content);
                 self.current_model_changed();
             }
@@ -941,7 +941,7 @@ impl App {
                     && self.current_model.is_empty()
                     && !content.is_empty()
                 {
-                    self.mark_response_start_after_tools();
+                    self.mark_response_start_after_activity();
                     self.current_model = content;
                     self.current_model_changed();
                 }
@@ -1033,7 +1033,7 @@ impl App {
                             self.push_transcript("commentary", content)
                         }
                         Some("assistant") => {
-                            self.mark_response_start_after_tools();
+                            self.mark_response_start_after_activity();
                             self.push_transcript("phi", content);
                         }
                         _ => {}
@@ -1080,23 +1080,23 @@ impl App {
         }
     }
 
-    fn mark_response_start_after_tools(&mut self) {
-        if self.current_model.is_empty()
-            && self
-                .transcript
-                .iter()
-                .rev()
-                .find(|(role, content)| {
-                    !matches!(role.as_str(), "commentary" | "reasoning_summary")
-                        || !content.trim().is_empty()
-                })
-                .is_some_and(|(role, _)| {
-                    matches!(
-                        role.as_str(),
-                        "commentary" | "reasoning_summary" | "tool" | "patch"
-                    )
-                })
-        {
+    fn mark_response_start_after_activity(&mut self) {
+        if !self.current_model.is_empty() {
+            return;
+        }
+        let mut activity_rendered = false;
+        for (role, content) in self.transcript.iter().rev() {
+            match role.as_str() {
+                "you" | "turn_end" => break,
+                "response_start" => return,
+                "commentary" | "reasoning_summary" if !content.trim().is_empty() => {
+                    activity_rendered = true;
+                }
+                "tool" | "patch" => activity_rendered = true,
+                _ => {}
+            }
+        }
+        if activity_rendered {
             self.push_transcript("response_start", "");
         }
     }
@@ -3588,6 +3588,164 @@ mod tests {
         assert!(rendered.contains("Checked the request."));
         assert!(!rendered.contains("**"));
         assert_eq!(rendered.matches("Final answer").count(), 1);
+    }
+
+    #[test]
+    fn separates_streamed_final_response_after_reasoning_only() {
+        let mut app = app();
+        app.on_runtime(RuntimeEvent::ReasoningSummaryDelta {
+            content: "Checked the request.".into(),
+        });
+        app.on_runtime(RuntimeEvent::ModelDelta {
+            content: "Final ".into(),
+        });
+        app.on_runtime(RuntimeEvent::ModelDelta {
+            content: "answer".into(),
+        });
+        app.on_runtime(RuntimeEvent::Finished {
+            content: "Final answer".into(),
+        });
+
+        assert_eq!(
+            app.transcript
+                .iter()
+                .map(|(role, content)| (role.as_str(), content.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("reasoning_summary", "Checked the request."),
+                ("response_start", ""),
+                ("phi", "Final answer"),
+                ("turn_end", "Worked for 0s"),
+            ]
+        );
+        assert_eq!(
+            trimmed(&transcript_text(&mut app, 18).lines)[..6],
+            [
+                "  Checked the requ",
+                "  est.",
+                "",
+                "──────────────────",
+                "",
+                "• Final answer",
+            ]
+        );
+    }
+
+    #[test]
+    fn separates_finished_fallback_after_tool_and_patch_events() {
+        for name in ["read_file", "patch"] {
+            let mut app = app();
+            app.on_runtime(RuntimeEvent::ToolStarted {
+                call_id: name.into(),
+                name: name.into(),
+                arguments: serde_json::json!({ "path": "src/main.rs" }),
+            });
+            app.on_runtime(RuntimeEvent::ToolCompleted {
+                call_id: name.into(),
+                name: name.into(),
+                result: if name == "patch" {
+                    serde_json::json!({ "changes": [] })
+                } else {
+                    serde_json::json!({ "content": "source" })
+                },
+            });
+            app.on_runtime(RuntimeEvent::Finished {
+                content: "Fallback answer".into(),
+            });
+
+            assert_eq!(
+                app.transcript
+                    .iter()
+                    .filter(|(role, _)| role == "response_start")
+                    .count(),
+                1,
+                "{name} fallback"
+            );
+            assert_eq!(app.transcript[1].0, "response_start", "{name} fallback");
+            assert_eq!(app.transcript[2], ("phi".into(), "Fallback answer".into()));
+        }
+    }
+
+    #[test]
+    fn inserts_one_response_divider_after_multiple_activity_cycles() {
+        let mut app = app();
+        app.on_runtime(RuntimeEvent::ReasoningSummaryDelta {
+            content: "Planning.".into(),
+        });
+        app.on_runtime(RuntimeEvent::ToolStarted {
+            call_id: "read".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({ "path": "src/main.rs" }),
+        });
+        app.on_runtime(RuntimeEvent::ToolCompleted {
+            call_id: "read".into(),
+            name: "read_file".into(),
+            result: serde_json::json!({ "content": "source" }),
+        });
+        app.on_runtime(RuntimeEvent::ReasoningSummaryDelta {
+            content: "Reviewing.".into(),
+        });
+        app.on_runtime(RuntimeEvent::ContextCompactionStatus {
+            job_id: "J1".into(),
+            status: "applied".into(),
+        });
+        app.on_runtime(RuntimeEvent::ModelDelta {
+            content: "Final ".into(),
+        });
+        app.on_runtime(RuntimeEvent::ModelDelta {
+            content: "answer".into(),
+        });
+        app.on_runtime(RuntimeEvent::Finished {
+            content: "Final answer".into(),
+        });
+
+        assert_eq!(
+            app.transcript
+                .iter()
+                .filter(|(role, _)| role == "response_start")
+                .count(),
+            1
+        );
+        assert_eq!(
+            app.transcript
+                .iter()
+                .map(|(role, _)| role.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "reasoning_summary",
+                "tool",
+                "reasoning_summary",
+                "note",
+                "response_start",
+                "phi",
+                "turn_end",
+            ]
+        );
+    }
+
+    #[test]
+    fn does_not_separate_final_response_without_prior_activity() {
+        for fallback in [false, true] {
+            let mut app = app();
+            if fallback {
+                app.on_runtime(RuntimeEvent::Finished {
+                    content: "Ordinary answer".into(),
+                });
+            } else {
+                app.on_runtime(RuntimeEvent::ModelDelta {
+                    content: "Ordinary answer".into(),
+                });
+                app.on_runtime(RuntimeEvent::Finished {
+                    content: "Ordinary answer".into(),
+                });
+            }
+            assert!(
+                app.transcript
+                    .iter()
+                    .all(|(role, _)| role != "response_start")
+            );
+            assert_eq!(app.transcript[0], ("phi".into(), "Ordinary answer".into()));
+        }
     }
 
     #[test]
