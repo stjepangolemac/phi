@@ -17,6 +17,7 @@ const resultPath = join(taskDir, "result.json")
 const childrenPath = join(taskDir, "children.jsonl")
 const children = new Set()
 const setups = new Set()
+const agents = new Set()
 let progressQueue = Promise.resolve()
 const summary = {
   phase: null,
@@ -82,6 +83,7 @@ async function stopChildren() {
       resolve()
     })
   })))
+  await Promise.allSettled([...agents])
 }
 
 let worktrees = null
@@ -154,7 +156,9 @@ try {
     childStarted: child => children.add(child),
     childFinished: child => children.delete(child),
     setupStarted: setup => setups.add(setup),
-    setupFinished: setup => setups.delete(setup)
+    setupFinished: setup => setups.delete(setup),
+    agentStarted: operation => agents.add(operation),
+    agentFinished: operation => agents.delete(operation)
   })
   const module = await import(`${pathToFileURL(generatedPath).href}?task=${request.taskId}`)
   if (!module.meta || typeof module.meta.name !== "string"

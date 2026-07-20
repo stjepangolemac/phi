@@ -37,8 +37,15 @@ function progress(type, value = {}) {
   configured().progress({ type, phase: activePhase || null, ...value })
 }
 
-export async function agent(prompt, options = {}) {
+export function agent(prompt, options = {}) {
   const context = configured()
+  const operation = runAgent(context, prompt, options)
+  context.agentStarted?.(operation)
+  operation.finally(() => context.agentFinished?.(operation)).catch(() => {})
+  return operation
+}
+
+async function runAgent(context, prompt, options) {
   if (context.isClosing()) throw new Error("workflow is finishing")
   if (typeof prompt !== "string" || prompt.length === 0) {
     throw new TypeError("agent() requires a non-empty prompt")
@@ -87,6 +94,7 @@ export async function agent(prompt, options = {}) {
     await context.recordChild({ status: "allocating", ...relationship })
     await createChildSession(context, relationship)
     await context.recordChild({ status: "created", ...relationship })
+    if (context.isClosing()) throw new Error("workflow is finishing")
     progress("agent_started", {
       index,
       label,

@@ -101,6 +101,14 @@ function run(requestPath) {
   })
 }
 
+async function waitFor(description, check) {
+  for (let index = 0; index < 100; index += 1) {
+    if (await check()) return
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  assert.fail(`timed out waiting for ${description}`)
+}
+
 async function assertClean(fixtureValue) {
   const manifest = JSON.parse(await readFile(join(fixtureValue.taskDir, "worktrees.json")))
   assert.ok(manifest.entries.length > 0)
@@ -156,13 +164,15 @@ export default async function () {
       stdio: "ignore"
     })
     const manifestPath = join(value.taskDir, "worktrees.json")
-    for (let index = 0; index < 100; index += 1) {
+    await waitFor("the child agent to start in its managed worktree", async () => {
       try {
         const manifest = JSON.parse(await readFile(manifestPath))
-        if (manifest.entries[0]?.state === "active") break
+        const entry = manifest.entries[0]
+        if (entry?.state !== "active") return false
+        return (await stat(join(entry.path, "agent-change.txt"))).isFile()
       } catch {}
-      await new Promise(resolve => setTimeout(resolve, 20))
-    }
+      return false
+    })
     child.kill("SIGTERM")
     await new Promise(resolve => child.once("exit", resolve))
     const children = await assertClean(value)
