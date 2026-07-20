@@ -28,7 +28,7 @@ phi resume SESSION_ID "Continue"
 
 New sessions are stored durably at `$PHI_HOME/sessions/<session-id>/` (normally `~/.phi/sessions/<session-id>/`). The flat home store contains the conversation's events and state plus exact configuration, loaded plugin sources, and installed plugin skill resources. The working directory and temporary Git worktree are metadata only. Existing workspace-local `.phi/sessions/` data is left untouched and is not migrated or resumed implicitly.
 
-The shell tools run arbitrary commands through the user's shell, including pipelines and compound commands. Long-running commands yield a background session that survives model turns; the model can list sessions, poll them, or continue through stdin. Use `/ps` to inspect background processes and `/stop` to stop them. Use `/compact` to run the selected compactor immediately instead of waiting for the configured token threshold. PTYs are available for interactive programs. Tool approval is still required unless `--allow-shell` or `--yolo` is used. `--yolo` also lets file reads and edits target paths outside the workspace. OS sandboxing is intentionally not implemented yet.
+The shell tools run arbitrary commands through the user's shell, including pipelines and compound commands. Long-running commands yield a background session that survives model turns; the model can list sessions, poll them, or continue through stdin. Use `/ps` to inspect background processes and `/stop` to stop them. Use `/compact` to run the selected compactor immediately instead of waiting for the configured token threshold. PTYs are available for interactive programs. Tool approval is still required unless `--allow-shell` or `--yolo` is used. The bundled argument-aware policy intentionally still asks for destructive, local-mutating, remote-mutating, shell-composed, or ambiguous Git commands under `--allow-shell`; common simple reads such as `git status`, `git diff`, `git log`, and `git show` remain allowed. `--yolo` is the explicit bypass and also removes filesystem boundaries. OS sandboxing is intentionally not implemented yet.
 
 Run `/keys` in the TUI for the complete keybinding reference and detailed input, cached-input, cache-write, and output token counters. The essentials are: `Enter` sends or steers the active turn, `Tab` queues the next turn, `Shift+Enter` or `Ctrl+Enter` inserts a newline, `Up/Down` reaches composer history at the input boundaries, `Shift+Up/Down` or `PageUp/PageDown` scrolls, and `Ctrl+C` cancels an active turn or quits when idle. `Esc` manages queued input before cancelling a turn; pickers use `Up/Down`, `Enter`, and `Esc`; approvals use `y`, `n`, or `Esc`. Ctrl+C during a slash command reports that cancellation is unavailable rather than silently ignoring the key.
 
@@ -87,6 +87,19 @@ Phi keeps behavior in Scheme and data in JSON:
         'retain_messages 16
         'retain_token_limit 24000))
 ```
+
+Tool approval may be tightened in `config.scm` with an optional Steel hook:
+
+```scheme
+(set-tool-approval-policy!
+  (lambda (name arguments)
+    (if (and (equal? name "exec_command")
+             (equal? (hash-ref arguments 'cmd) "git push --force"))
+        (hash 'decision "deny" 'detail "shell: git push --force")
+        (hash 'decision "allow" 'detail name))))
+```
+
+The hook receives the model-facing tool name and its parsed JSON arguments and must return a hash containing `decision` (`"allow"`, `"ask"`, or `"deny"`) and a concise `detail` for approval frontends. Rust evaluates the CLI permission fallback and the Steel result, enforces the stricter decision, and performs the capability only after authorization. Thus a hook can attenuate `--allow-shell` or `--allow-write`, but cannot expand them; without a hook the existing flags remain the fallback. The trusted `--yolo` mode bypasses approval policy. Invalid hook output and hook failures stop the turn rather than executing the tool, while non-interactive modes return a tool error for `ask` or `deny` because no approval channel exists.
 
 The selected file editor owns its model-facing format and matching logic in Steel. Rust supplies contained file snapshots, checks revisions, requests write approval, and persists the proposed changes. The bundled `codex-patch` editor exposes one `patch` tool for add, update, delete, and move operations. Update operations accept locator text directly on an `@@` line or in a context-only hunk before a later changing hunk; repeated plain update sections for one file run sequentially as one atomic edit, and every update must still change file content or destination. Approved reads and edits may target the workspace or Phi home; `--yolo` removes all filesystem boundaries.
 

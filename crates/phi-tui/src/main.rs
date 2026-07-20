@@ -89,6 +89,11 @@ struct PickerItem {
     value: String,
 }
 
+struct ApprovalPrompt {
+    name: String,
+    detail: String,
+}
+
 struct App {
     options: RunOptions,
     catalog: CommandCatalog,
@@ -103,7 +108,7 @@ struct App {
     handle: Option<Handle>,
     command_task: Option<tokio::task::JoinHandle<Result<CommandExecution>>>,
     picker: Option<Picker>,
-    approval: Option<String>,
+    approval: Option<ApprovalPrompt>,
     status: String,
     estimated_tokens: Option<u64>,
     token_budget: Option<u64>,
@@ -975,7 +980,9 @@ impl App {
                     self.transcript_changed(index);
                 }
             }
-            RuntimeEvent::ApprovalRequested { name } => self.approval = Some(name),
+            RuntimeEvent::ApprovalRequested { name, detail } => {
+                self.approval = Some(ApprovalPrompt { name, detail });
+            }
             RuntimeEvent::Finished { content } => {
                 self.current_commentary = None;
                 self.current_reasoning_summary = None;
@@ -1540,12 +1547,28 @@ fn draw(frame: &mut Frame, app: &mut App) {
         draw_command_suggestions(frame, app, composer_area);
     }
 
-    if let Some(name) = &app.approval {
-        let area = centered(frame.area(), 50, 5);
+    if let Some(approval) = &app.approval {
+        let width = frame.area().width.min(60);
+        let content_width = width.saturating_sub(2).max(1) as usize;
+        let mut detail = wrap_line(&approval.detail, content_width);
+        let height = (detail.len() as u16)
+            .saturating_add(3)
+            .min(frame.area().height);
+        detail.truncate(height.saturating_sub(3) as usize);
+        let area = centered(frame.area(), width, height);
         frame.render_widget(Clear, area);
+        let mut lines = vec![Line::raw(format!("Allow {} once?", approval.name))];
+        lines.extend(detail.into_iter().map(Line::raw));
+        lines.push(Line::raw(""));
+        lines.push(Line::raw(if content_width >= 17 {
+            "[y] yes   [n] no"
+        } else if content_width >= 7 {
+            "[y] [n]"
+        } else {
+            "y/n"
+        }));
         frame.render_widget(
-            Paragraph::new(format!("Allow {name} once?\n\n[y] yes   [n] no"))
-                .style(Style::default().bg(Color::Rgb(45, 40, 25))),
+            Paragraph::new(lines).style(Style::default().bg(Color::Rgb(45, 40, 25))),
             area,
         );
     }
@@ -6343,16 +6366,38 @@ mod tests {
     fn approval_dialog_is_clamped_and_renders_on_narrow_terminals() {
         for (width, height) in [(1, 1), (8, 3), (24, 4), (49, 8), (80, 10)] {
             let terminal_area = Rect::new(0, 0, width, height);
-            let dialog = centered(terminal_area, 50, 5);
+            let dialog = centered(terminal_area, width.min(60), height.min(8));
             assert!(dialog.right() <= terminal_area.right());
             assert!(dialog.bottom() <= terminal_area.bottom());
-            assert_eq!(dialog.width, width.min(50));
-            assert_eq!(dialog.height, height.min(5));
+            assert_eq!(dialog.width, width.min(60));
+            assert_eq!(dialog.height, height.min(8));
 
             let mut app = app();
-            app.approval = Some("patch".into());
+            app.approval = Some(ApprovalPrompt {
+                name: "patch".into(),
+                detail: "patch: 240 characters across a deliberately narrow approval dialog".into(),
+            });
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            if height >= 3 {
+                let rendered = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>();
+                assert!(rendered.contains(if width >= 19 {
+                    "[y] yes   [n] no"
+                } else if width >= 9 {
+                    "[y] [n]"
+                } else {
+                    "y/n"
+                }));
+                if width >= 24 && height >= 4 {
+                    assert!(rendered.contains("patch: 240"));
+                }
+            }
         }
     }
 

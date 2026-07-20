@@ -1,6 +1,94 @@
 (set-agent-instructions!
   "You are a coding agent running inside a Phi harness in the user's current workspace. Work directly on the user's requests using the available tools. Inspect before editing, verify changes, and continue until the requested outcome is complete. Keep responses concise. Before the first tool call, send a short commentary update when tool work is needed. Send additional commentary only at meaningful checkpoints, when the plan changes, or when an important finding should be surfaced; do not narrate every trivial command or repeat tool output. Reserve final_answer for the completed response to the user. Commentary is ordinary user-visible progress, not raw reasoning or private chain-of-thought. Use context_mark proactively after completing a substantial phase or when changing focus so older work becomes eligible for selective compaction. When context pressure rises, inspect the active context and compact substantial closed older items when that preserves focus without losing needed details. When working on or reconfiguring the Phi harness itself, read the phi-harness skill with read_file before acting. The user can already see tool calls and their output, so do not repeat them verbatim; state only the conclusion or necessary interpretation. When reconfiguring Phi, edit the active config.scm, validate the change, and reload it into the current conversation.")
 
+(define (approval-result decision detail)
+  (hash 'decision decision 'detail detail))
+
+(define (approval-shell-metachar? characters)
+  (if (null? characters)
+      #f
+      (let ([character (car characters)])
+        (if (or (equal? character #\;)
+                (equal? character #\|)
+                (equal? character #\&)
+                (equal? character #\>)
+                (equal? character #\<)
+                (equal? character #\newline)
+                (equal? character #\return)
+                (equal? character #\`)
+                (equal? character #\$)
+                (equal? character #\\)
+                (equal? character #\")
+                (equal? character #\'))
+            #t
+            (approval-shell-metachar? (cdr characters))))))
+
+(define (approval-safe-git-read? command)
+  (define arguments (split-whitespace command))
+  (and (not (approval-shell-metachar? (string->list command)))
+       (>= (length arguments) 2)
+       (equal? (car arguments) "git")
+       (let ([operation (car (cdr arguments))])
+         (or (equal? operation "status")
+             (equal? operation "diff")
+             (equal? operation "log")
+             (equal? operation "show")
+             (equal? operation "rev-parse")
+             (equal? operation "ls-files")
+             (equal? operation "grep")
+             (equal? operation "blame")
+             (equal? operation "cat-file")))))
+
+(define (approval-git-command? command)
+  (define arguments (split-whitespace command))
+  (and (not (null? arguments)) (equal? (car arguments) "git")))
+
+(define (approval-truncate value limit)
+  (if (> (string-length value) limit)
+      (string-append (substring value 0 (- limit 1)) "…")
+      value))
+
+(define (approval-detail name arguments)
+  (cond
+    [(equal? name "exec_command")
+     (string-append "shell: "
+                    (approval-truncate
+                      (or (hash-try-get arguments 'cmd) "") 160))]
+    [(equal? name "write_stdin")
+     (string-append "process "
+                    (number->string (or (hash-try-get arguments 'session_id) 0))
+                    ": "
+                    (approval-truncate
+                      (or (hash-try-get arguments 'chars) "") 120))]
+    [(equal? name "terminate_process")
+     (string-append "stop process "
+                    (number->string (or (hash-try-get arguments 'session_id) 0)))]
+    [(equal? name "patch")
+     (string-append "patch: "
+                    (number->string
+                      (string-length (or (hash-try-get arguments 'patch) "")))
+                    " characters")]
+    [(equal? name "create_plan")
+     (string-append "create plan: "
+                    (or (hash-try-get arguments 'name) "unnamed"))]
+    [else name]))
+
+;; This bundled hook only tightens the Rust CLI fallback: ordinary calls remain
+;; compatible, while shell-composed, mutating, and remote Git commands ask even
+;; under --allow-shell. --yolo remains the explicit trusted bypass in Rust.
+(set-tool-approval-policy!
+  (lambda (name arguments)
+    (define detail (approval-detail name arguments))
+    (if (equal? name "exec_command")
+        (let ([command (or (hash-try-get arguments 'cmd) "")])
+          (cond
+            [(approval-safe-git-read? command)
+             (approval-result "allow" detail)]
+            [(approval-git-command? command)
+             (approval-result "ask" detail)]
+            [else (approval-result "allow" detail)]))
+        (approval-result "allow" detail))))
+
 (define active-context-items '())
 (define next-context-span 2)
 (define next-context-summary 1)

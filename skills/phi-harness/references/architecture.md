@@ -12,7 +12,7 @@ Phi is a Rust-hosted agent harness whose behavior is composed in sandboxed Steel
 - `phi-tui`: Ratatui frontend and transcript rendering.
 - `plugins/`: bundled convention-based plugin packages.
 
-Rust owns mechanisms that require containment or reliability. Steel owns provider behavior, prompt assembly, tool routing, compaction policy, editor formats, commands, and the agent loop.
+Rust owns mechanisms that require containment or reliability. Steel owns provider behavior, prompt assembly, tool routing, compaction policy, editor formats, commands, the agent loop, and optional argument-aware approval policy. Approval hooks return `allow`, `ask`, or `deny` plus frontend detail, but trusted Rust combines that result with CLI permissions, enforces the stricter decision, and executes capabilities only after authorization. Malformed or failing policy evaluation cannot fall through to execution.
 
 ## Turn lifecycle
 

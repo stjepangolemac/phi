@@ -21,6 +21,7 @@
 (define session-id "")
 (define runtime-config (hash))
 (define current-plugin "")
+(define tool-approval-policy #f)
 
 (define (configure-runtime! encoded-config)
   (define config (string->jsexpr encoded-config))
@@ -30,6 +31,15 @@
 
 (define (set-agent-instructions! value)
   (set! agent-instructions value))
+
+(define (set-tool-approval-policy! handler)
+  (set! tool-approval-policy handler))
+
+(define (tool-approval-policy-configured?)
+  (if tool-approval-policy #t #f))
+
+(define (evaluate-tool-approval name arguments)
+  (tool-approval-policy name arguments))
 
 (define (register-command! spec handler)
   (set! command-registry

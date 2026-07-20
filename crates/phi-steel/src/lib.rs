@@ -14,6 +14,20 @@ pub struct Policy {
     state: String,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalDecision {
+    Allow,
+    Ask,
+    Deny,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct ToolApproval {
+    pub decision: ApprovalDecision,
+    pub detail: String,
+}
+
 #[derive(Debug)]
 struct PolicyRejected {
     message: String,
@@ -135,6 +149,31 @@ impl Policy {
 
     pub fn file_editor_tool_name(&mut self) -> Result<String> {
         eval_string(&mut self.vm, "(selected-file-editor-tool-name)")
+    }
+
+    pub fn tool_approval(
+        &mut self,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<Option<ToolApproval>> {
+        let configured: bool = eval_json(
+            &mut self.vm,
+            &json_invocation("tool-approval-policy-configured?", []),
+            "decode tool approval policy presence",
+        )?;
+        if !configured {
+            return Ok(None);
+        }
+        eval_json(
+            &mut self.vm,
+            &json_invocation(
+                "evaluate-tool-approval",
+                [scheme_string(name), json_argument(arguments)?],
+            ),
+            "decode tool approval policy output",
+        )
+        .with_context(|| format!("evaluate tool approval policy for {name}"))
+        .map(Some)
     }
 
     pub fn composition_status(&mut self) -> Result<CompositionStatus> {
@@ -391,6 +430,20 @@ mod tests {
         Policy::load(&root.join("config.scm"), &plugins(root)).unwrap()
     }
 
+    fn policy_with_config_suffix(root: &Path, suffix: &str) -> Policy {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config.scm");
+        fs::write(
+            &config,
+            format!(
+                "{}\n{suffix}\n",
+                fs::read_to_string(root.join("config.scm")).unwrap()
+            ),
+        )
+        .unwrap();
+        Policy::load(&config, &plugins(root)).unwrap()
+    }
+
     fn compact_policy(root: &Path, limit: u64) -> Policy {
         compact_policy_with_strict(root, limit, true)
     }
@@ -565,6 +618,150 @@ mod tests {
 
         assert_eq!(error.to_string(), "decode policy output");
         assert_eq!(policy.state(), state);
+    }
+
+    #[test]
+    fn bundled_tool_approval_distinguishes_git_operations_and_shell_edges() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut policy = policy(&root);
+        for command in [
+            "git status --short --branch",
+            "git diff --stat",
+            "git log -1",
+            "git rev-parse HEAD",
+        ] {
+            let approval = policy
+                .tool_approval("exec_command", &serde_json::json!({ "cmd": command }))
+                .unwrap()
+                .unwrap();
+            assert_eq!(approval.decision, ApprovalDecision::Allow, "{command}");
+            assert_eq!(approval.detail, format!("shell: {command}"));
+        }
+        for command in [
+            "git clean -fdx",
+            "git reset --hard HEAD~1",
+            "git commit -am change",
+            "git push --force origin main",
+            "git fetch origin",
+            "git status; rm -rf .",
+            "git status && git clean -fdx",
+            "git status $(dangerous)",
+            "git status 'quoted'",
+        ] {
+            let approval = policy
+                .tool_approval("exec_command", &serde_json::json!({ "cmd": command }))
+                .unwrap()
+                .unwrap();
+            assert_eq!(approval.decision, ApprovalDecision::Ask, "{command}");
+        }
+    }
+
+    #[test]
+    fn bundled_tool_approval_renders_write_invocations() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut policy = policy(&root);
+        let patch = policy
+            .tool_approval(
+                "patch",
+                &serde_json::json!({ "patch": "*** Begin Patch\n*** End Patch" }),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(patch.decision, ApprovalDecision::Allow);
+        assert_eq!(patch.detail, "patch: 29 characters");
+        let plan = policy
+            .tool_approval(
+                "create_plan",
+                &serde_json::json!({ "name": "security-review", "content": "..." }),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.decision, ApprovalDecision::Allow);
+        assert_eq!(plan.detail, "create plan: security-review");
+    }
+
+    #[test]
+    fn custom_tool_approval_hook_receives_arguments_and_can_deny() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut policy = policy_with_config_suffix(
+            &root,
+            r#"
+(set-tool-approval-policy!
+  (lambda (name arguments)
+    (cond
+      [(and (equal? name "patch")
+            (equal? (hash-ref arguments 'patch) "blocked"))
+       (hash 'decision "deny" 'detail "custom patch denial")]
+      [(equal? name "exec_command")
+       (hash 'decision "ask" 'detail "custom shell review")]
+      [else (hash 'decision "allow" 'detail "custom allow")])))
+"#,
+        );
+        assert_eq!(
+            policy
+                .tool_approval("patch", &serde_json::json!({ "patch": "blocked" }))
+                .unwrap()
+                .unwrap(),
+            ToolApproval {
+                decision: ApprovalDecision::Deny,
+                detail: "custom patch denial".into(),
+            }
+        );
+        assert_eq!(
+            policy
+                .tool_approval("exec_command", &serde_json::json!({ "cmd": "echo ok" }))
+                .unwrap()
+                .unwrap()
+                .decision,
+            ApprovalDecision::Ask
+        );
+        assert_eq!(
+            policy
+                .tool_approval("create_plan", &serde_json::json!({ "name": "ok" }))
+                .unwrap()
+                .unwrap()
+                .decision,
+            ApprovalDecision::Allow
+        );
+    }
+
+    #[test]
+    fn malformed_and_failing_tool_approval_hooks_fail_closed_actionably() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut malformed = policy_with_config_suffix(
+            &root,
+            r#"
+(set-tool-approval-policy!
+  (lambda (_name _arguments)
+    (hash 'decision "sometimes" 'detail "invalid")))
+"#,
+        );
+        let error = malformed
+            .tool_approval("patch", &serde_json::json!({}))
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("decode tool approval policy output"),
+            "{error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("evaluate tool approval policy for patch"),
+            "{error:#}"
+        );
+
+        let mut failing = policy_with_config_suffix(
+            &root,
+            r#"
+(set-tool-approval-policy!
+  (lambda (_name _arguments) (error! "approval hook rejected invocation")))
+"#,
+        );
+        let error = failing
+            .tool_approval("exec_command", &serde_json::json!({ "cmd": "git status" }))
+            .unwrap_err();
+        assert_eq!(
+            user_error_message(&error).as_deref(),
+            Some("approval hook rejected invocation")
+        );
     }
 
     #[test]

@@ -100,6 +100,7 @@ pub enum RuntimeEvent {
     },
     ApprovalRequested {
         name: String,
+        detail: String,
     },
     Finished {
         content: String,
@@ -2100,6 +2101,12 @@ enum RawToolOutput {
     },
 }
 
+enum ToolAuthorization {
+    Allow,
+    Ask(String),
+    Deny(String),
+}
+
 struct ToolBatchExecutor<'a> {
     workspace: &'a Path,
     home: &'a phi_core::home::PhiHome,
@@ -2149,21 +2156,39 @@ async fn execute_tool_calls(
                 arguments: call.arguments.clone(),
             },
         )?;
-        let approved = match permissions.authorize_tool(&call.name) {
-            Ok(()) => true,
-            Err(_) if interactive_approvals => {
+        let authorization = authorize_tool_call(
+            permissions,
+            policy,
+            &call.name,
+            &call.arguments,
+            executor.full_access,
+        )?;
+        let (approved, denial) = match authorization {
+            ToolAuthorization::Allow => (true, None),
+            ToolAuthorization::Ask(detail) if interactive_approvals => {
                 send(
                     executor.events,
                     RuntimeEvent::ApprovalRequested {
                         name: call.name.clone(),
+                        detail,
                     },
                 )?;
-                matches!(
+                let approved = matches!(
                     cancellable(executor.cancellation, commands.recv()).await?,
                     Some(RuntimeCommand::ApproveOnce)
-                )
+                );
+                (approved, (!approved).then(|| "approval denied".to_owned()))
             }
-            Err(_) => false,
+            ToolAuthorization::Ask(detail) => (
+                false,
+                Some(format!(
+                    "approval required but no approval channel is available: {detail}"
+                )),
+            ),
+            ToolAuthorization::Deny(detail) => (
+                false,
+                Some(format!("denied by tool approval policy: {detail}")),
+            ),
         };
         if approved && call.name == "reload_config" {
             let result = reload_composition(
@@ -2213,7 +2238,11 @@ async fn execute_tool_calls(
             }
         } else {
             let result = serde_json::json!({
-                "error": format!("{} approval denied", call.name)
+                "error": format!(
+                    "{} {}",
+                    call.name,
+                    denial.as_deref().unwrap_or("approval denied")
+                )
             });
             send(
                 executor.events,
@@ -2246,6 +2275,98 @@ async fn execute_tool_calls(
         completed.into_iter().map(|(_, result)| result).collect(),
         reloaded,
     ))
+}
+
+fn authorize_tool_call(
+    permissions: &phi_core::permissions::Permissions,
+    policy: &mut phi_steel::Policy,
+    name: &str,
+    arguments: &serde_json::Value,
+    full_access: bool,
+) -> Result<ToolAuthorization> {
+    if full_access {
+        return Ok(ToolAuthorization::Allow);
+    }
+    let fallback = if permissions.authorize_tool(name).is_ok()
+        && !bundled_git_requires_approval(name, arguments)
+    {
+        phi_steel::ApprovalDecision::Allow
+    } else {
+        phi_steel::ApprovalDecision::Ask
+    };
+    let policy = policy.tool_approval(name, arguments)?;
+    let detail = policy
+        .as_ref()
+        .map(|approval| approval.detail.trim())
+        .filter(|detail| !detail.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| fallback_approval_detail(name, arguments));
+    let decision = policy
+        .map(|approval| stricter_approval(fallback, approval.decision))
+        .unwrap_or(fallback);
+    Ok(match decision {
+        phi_steel::ApprovalDecision::Allow => ToolAuthorization::Allow,
+        phi_steel::ApprovalDecision::Ask => ToolAuthorization::Ask(detail),
+        phi_steel::ApprovalDecision::Deny => ToolAuthorization::Deny(detail),
+    })
+}
+
+fn bundled_git_requires_approval(name: &str, arguments: &serde_json::Value) -> bool {
+    if name != "exec_command" {
+        return false;
+    }
+    let Some(command) = arguments.get("cmd").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let words = command.split_whitespace().collect::<Vec<_>>();
+    if words.first() != Some(&"git") {
+        return false;
+    }
+    let safe_operation = words.get(1).is_some_and(|operation| {
+        matches!(
+            *operation,
+            "status"
+                | "diff"
+                | "log"
+                | "show"
+                | "rev-parse"
+                | "ls-files"
+                | "grep"
+                | "blame"
+                | "cat-file"
+        )
+    });
+    let shell_metacharacter = command.chars().any(|character| {
+        matches!(
+            character,
+            ';' | '|' | '&' | '>' | '<' | '\n' | '\r' | '`' | '$' | '\\' | '\'' | '"'
+        )
+    });
+    !safe_operation || shell_metacharacter
+}
+
+fn stricter_approval(
+    fallback: phi_steel::ApprovalDecision,
+    policy: phi_steel::ApprovalDecision,
+) -> phi_steel::ApprovalDecision {
+    use phi_steel::ApprovalDecision::{Allow, Ask, Deny};
+    match (fallback, policy) {
+        (Deny, _) | (_, Deny) => Deny,
+        (Ask, _) | (_, Ask) => Ask,
+        (Allow, Allow) => Allow,
+    }
+}
+
+fn fallback_approval_detail(name: &str, arguments: &serde_json::Value) -> String {
+    let encoded = serde_json::to_string(arguments).unwrap_or_else(|_| "{}".into());
+    let detail = format!("{name}: {encoded}");
+    let mut characters = detail.chars();
+    let truncated = characters.by_ref().take(159).collect::<String>();
+    if characters.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
 }
 
 fn tool_call_parallel_safe(
@@ -3198,6 +3319,184 @@ mod tests {
             output_schema: None,
         };
         (workspace, options)
+    }
+
+    #[test]
+    fn rust_combines_cli_permissions_with_argument_aware_policy() {
+        let (workspace, options) = options();
+        let home = home_for_config(&options.config_path).unwrap();
+        let sources = resolve_sources(&home, workspace.path()).unwrap();
+        let mut policy = phi_steel::Policy::load_with_state(
+            &sources.config,
+            &entrypoints(&sources),
+            &policy_config(
+                &capabilities(&home, false),
+                "test",
+                &load_user_state(&home).unwrap(),
+                &[],
+            ),
+            None,
+        )
+        .unwrap();
+        let shell_allowed = phi_core::permissions::Permissions {
+            allow_shell: true,
+            allow_write: false,
+        };
+        assert!(matches!(
+            authorize_tool_call(
+                &shell_allowed,
+                &mut policy,
+                "exec_command",
+                &serde_json::json!({ "cmd": "git status --short" }),
+                false,
+            )
+            .unwrap(),
+            ToolAuthorization::Allow
+        ));
+        assert!(matches!(
+            authorize_tool_call(
+                &shell_allowed,
+                &mut policy,
+                "exec_command",
+                &serde_json::json!({ "cmd": "git push --force origin main" }),
+                false,
+            )
+            .unwrap(),
+            ToolAuthorization::Ask(detail) if detail.contains("git push --force")
+        ));
+        assert!(matches!(
+            authorize_tool_call(
+                &shell_allowed,
+                &mut policy,
+                "patch",
+                &serde_json::json!({ "patch": "change" }),
+                false,
+            )
+            .unwrap(),
+            ToolAuthorization::Ask(detail) if detail == "patch: 6 characters"
+        ));
+        assert!(matches!(
+            authorize_tool_call(
+                &shell_allowed,
+                &mut policy,
+                "exec_command",
+                &serde_json::json!({ "cmd": "git clean -fdx" }),
+                true,
+            )
+            .unwrap(),
+            ToolAuthorization::Allow
+        ));
+    }
+
+    #[test]
+    fn approval_precedence_is_fail_closed() {
+        use phi_steel::ApprovalDecision::{Allow, Ask, Deny};
+        assert_eq!(stricter_approval(Allow, Allow), Allow);
+        assert_eq!(stricter_approval(Allow, Ask), Ask);
+        assert_eq!(stricter_approval(Ask, Allow), Ask);
+        assert_eq!(stricter_approval(Allow, Deny), Deny);
+        assert_eq!(stricter_approval(Ask, Deny), Deny);
+        assert!(!bundled_git_requires_approval(
+            "exec_command",
+            &serde_json::json!({ "cmd": "git status --short" })
+        ));
+        assert!(bundled_git_requires_approval(
+            "exec_command",
+            &serde_json::json!({ "cmd": "git clean -fdx" })
+        ));
+        assert!(bundled_git_requires_approval(
+            "exec_command",
+            &serde_json::json!({ "cmd": "git status; git clean -fdx" })
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn non_interactive_argument_aware_ask_fails_closed_without_execution() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (workspace, options) = options();
+                let home = home_for_config(&options.config_path).unwrap();
+                let sources = resolve_sources(&home, workspace.path()).unwrap();
+                let session = phi_core::session::Session::create_composed(
+                    &home.sessions(),
+                    &sources.config,
+                    &sources.plugins,
+                    &sources.skill_plugins,
+                )
+                .unwrap();
+                let registry = Arc::new(capabilities(&home, false));
+                let mut policy = phi_steel::Policy::load_with_state(
+                    &sources.config,
+                    &entrypoints(&sources),
+                    &policy_config(
+                        &registry,
+                        session.id(),
+                        &load_user_state(&home).unwrap(),
+                        &[],
+                    ),
+                    None,
+                )
+                .unwrap();
+                let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+                let (_command_tx, mut command_rx) = mpsc::unbounded_channel();
+                let cancellation = CancellationToken::new();
+                let plugin_roots = std::collections::HashMap::new();
+                let executor = ToolBatchExecutor {
+                    workspace: workspace.path(),
+                    home: &home,
+                    config_path: &options.config_path,
+                    session: &session,
+                    capabilities: registry,
+                    config: Arc::new(load_config(&options.config_path).unwrap()),
+                    file_editor_tool: "patch",
+                    events: &event_tx,
+                    cancellation: &cancellation,
+                    full_access: false,
+                    output_schema: None,
+                    workflows: Arc::new(WorkflowTasks::default()),
+                    plugin_roots: &plugin_roots,
+                };
+                let (results, _) = execute_tool_calls(
+                    vec![ToolCall {
+                        call_id: "dangerous".into(),
+                        name: "exec_command".into(),
+                        arguments: serde_json::json!({
+                            "cmd": "git status; touch approval-bypass-marker",
+                            "workdir": null,
+                            "shell": null,
+                            "login": null,
+                            "tty": null,
+                            "yield-time_ms": null,
+                            "max_output_tokens": null
+                        }),
+                        execution: ToolExecution::Direct,
+                    }],
+                    &executor,
+                    &phi_core::permissions::Permissions {
+                        allow_shell: true,
+                        allow_write: true,
+                    },
+                    false,
+                    &mut command_rx,
+                    &mut policy,
+                    &Arc::new(phi_core::process::ShellSessions::default()),
+                )
+                .await
+                .unwrap();
+
+                assert!(
+                    results[0].result["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("no approval channel is available")
+                );
+                assert!(!workspace.path().join("approval-bypass-marker").exists());
+                assert!(
+                    !std::iter::from_fn(|| event_rx.try_recv().ok())
+                        .any(|event| matches!(event, RuntimeEvent::ApprovalRequested { .. }))
+                );
+            })
+            .await;
     }
 
     fn add_reloaded_model(home: &phi_core::home::PhiHome) {

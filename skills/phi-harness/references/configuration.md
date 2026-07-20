@@ -19,6 +19,12 @@ Never put secret values in `config.scm`, plugin configuration, status output, or
 
 Do not edit installed or official plugin files to reconfigure Phi. All provider, model, tool, prompt, compaction, and agent behavior changes belong in `config.scm`. If a plugin does not expose a required setting, extend its configuration interface rather than patching an installed package.
 
+## Tool approval policy
+
+`config.scm` may call `set-tool-approval-policy!` with a two-argument handler receiving the tool name and parsed JSON arguments. The handler returns `(hash 'decision "allow|ask|deny" 'detail "concise invocation")`. Rust remains the trusted enforcement point: it combines the CLI fallback with the hook and applies the stricter decision, so Steel can attenuate `--allow-shell` and `--allow-write` but cannot grant capabilities those flags withhold. If no hook is configured, the existing CLI flags are the fallback; `--yolo` explicitly bypasses approval policy. Invalid output and hook errors fail closed. Non-interactive runs cannot satisfy `ask`, so both `ask` and `deny` return tool errors without execution.
+
+The bundled hook renders approval detail and permits simple read-only Git commands while asking for local mutation, remote mutation, shell metacharacters, and ambiguous Git syntax. Rust mirrors that Git minimum so older configurations without the bundled hook receive the same intentional hardening.
+
 ## Workspace state
 
 - `.phi/skills/`: workspace skills; these override personal skills with the same name.
