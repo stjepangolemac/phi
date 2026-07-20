@@ -40,7 +40,7 @@ appendFileSync(${JSON.stringify(join(base, "invocations.jsonl"))}, JSON.stringif
 const createIndex = process.argv.indexOf("internal-create-session")
 if (createIndex !== -1) {
   const label = process.argv[process.argv.indexOf("--agent-label") + 1]
-  if (label === "setup-hang") await new Promise(() => {})
+  if (label === "setup-hang") await new Promise(() => setInterval(() => {}, 10_000))
   const id = process.argv[createIndex + 1]
   const session = home + "/sessions/" + id
   mkdirSync(session, { recursive: true })
@@ -421,6 +421,45 @@ export default async function () {
     await new Promise(resolve => child.once("exit", resolve))
     const children = await assertClean(value)
     assert.ok(children.some(entry => entry.status === "cancelled"))
+  } finally {
+    await rm(value.base, { recursive: true, force: true })
+  }
+})
+
+test("runner signal cancellation terminates child-session setup promptly", {
+  skip: process.platform === "win32"
+}, async () => {
+  const value = await fixture(`${header}
+export default async function () {
+  return agent("SETUP", { label: "setup-hang", timeout_ms: 60000 })
+}`)
+  try {
+    const child = spawn(process.execPath, [runnerPath, value.requestPath], {
+      stdio: "ignore"
+    })
+    await waitFor("child-session setup to start", async () => {
+      try {
+        return (await jsonLines(value.invocationsPath))
+          .some(args => args.includes("internal-create-session"))
+      } catch {}
+      return false
+    })
+    child.kill("SIGTERM")
+    const code = await Promise.race([
+      new Promise(resolve => child.once("exit", resolve)),
+      new Promise((_, reject) => setTimeout(
+        () => reject(new Error("workflow runner did not stop setup promptly")), 5000
+      ))
+    ])
+    assert.equal(code, 143)
+    const invocations = await jsonLines(value.invocationsPath)
+    assert.equal(invocations.filter(args => args.includes("rpc")).length, 0)
+    const children = await jsonLines(join(value.taskDir, "children.jsonl"))
+    assert.ok(children.some(entry =>
+      entry.agentLabel === "setup-hang"
+      && entry.status === "cancelled"
+      && entry.launched === false
+    ), JSON.stringify(children))
   } finally {
     await rm(value.base, { recursive: true, force: true })
   }

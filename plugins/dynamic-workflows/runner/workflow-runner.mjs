@@ -68,7 +68,6 @@ function enqueueProgress(event) {
 }
 
 async function stopChildren() {
-  await Promise.allSettled([...setups])
   const running = [...children]
   for (const child of running) {
     try { child.kill("SIGTERM") } catch {}
@@ -85,6 +84,7 @@ async function stopChildren() {
       resolve()
     })
   })))
+  await Promise.allSettled([...setups])
   await Promise.allSettled([...agents])
 }
 
