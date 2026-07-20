@@ -23,7 +23,7 @@ let progressQueue = Promise.resolve()
 const summary = {
   phase: null,
   latestLog: null,
-  agents: { started: 0, running: 0, completed: 0, failed: 0 }
+  agents: { started: 0, running: 0, completed: 0, failed: 0, timedOut: 0 }
 }
 
 async function atomicJson(path, value) {
@@ -54,6 +54,7 @@ async function progress(event) {
   } else if (event.type === "agent_failed") {
     summary.agents.running = Math.max(0, summary.agents.running - 1)
     summary.agents.failed += 1
+    if (event.status === "timed_out") summary.agents.timedOut += 1
     changed = true
   }
   if (changed) {
@@ -136,6 +137,8 @@ try {
     taskId: request.taskId,
     workspace: request.workspace,
     limits: request.limits,
+    deadlineAt: request.deadlineAt,
+    agentContext: request.agentContext,
     worktrees,
     isClosing: () => closing,
     progress: enqueueProgress,
@@ -150,7 +153,15 @@ try {
   const module = await import(`${pathToFileURL(generatedPath).href}?task=${request.taskId}`)
   const meta = validateWorkflowModule(module, request.name, request.args, true)
   await progress({ type: "workflow_started", name: request.name, meta })
-  const value = await module.default({ args: request.args })
+  const remaining = request.deadlineAt - Date.now()
+  if (remaining <= 0) throw new Error("workflow deadline exceeded")
+  let deadlineTimer
+  const value = await Promise.race([
+    module.default({ args: request.args }),
+    new Promise((_, reject) => {
+      deadlineTimer = setTimeout(() => reject(new Error("workflow deadline exceeded")), remaining)
+    })
+  ]).finally(() => clearTimeout(deadlineTimer))
   closing = true
   await stopChildren()
   await worktrees.cleanup()

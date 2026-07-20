@@ -8,6 +8,14 @@ let totalAgents = 0
 let runningAgents = 0
 let available = 0
 const waiters = []
+const cancellationGraceMs = 2_500
+
+class AgentTimeoutError extends Error {
+  constructor(timeoutMs) {
+    super(`agent timed out after ${timeoutMs} ms`)
+    this.name = "AgentTimeoutError"
+  }
+}
 
 export function configure(value) {
   runtime = value
@@ -19,17 +27,30 @@ function configured() {
   return runtime
 }
 
-async function acquire() {
+async function acquire(signal) {
+  if (signal.aborted) throw signal.reason
   if (available > 0) {
     available -= 1
     return
   }
-  await new Promise(resolve => waiters.push(resolve))
+  await new Promise((resolve, reject) => {
+    const waiter = { resolve, reject, signal, abort: null }
+    waiter.abort = () => {
+      const index = waiters.indexOf(waiter)
+      if (index !== -1) waiters.splice(index, 1)
+      reject(signal.reason)
+    }
+    signal.addEventListener("abort", waiter.abort, { once: true })
+    waiters.push(waiter)
+  })
 }
 
 function release() {
   const next = waiters.shift()
-  if (next) next()
+  if (next) {
+    next.signal.removeEventListener("abort", next.abort)
+    next.resolve()
+  }
   else available += 1
 }
 
@@ -51,7 +72,10 @@ async function runAgent(context, prompt, options) {
     throw new TypeError("agent() requires a non-empty prompt")
   }
   const unknown = Object.keys(options).filter(key =>
-    !["label", "schema", "branch", "branch_off"].includes(key)
+    ![
+      "label", "schema", "branch", "branch_off", "model", "reasoning",
+      "timeout_ms", "capabilities"
+    ].includes(key)
   )
   if (unknown.length > 0) {
     throw new TypeError(`unsupported agent option: ${unknown[0]}`)
@@ -59,40 +83,62 @@ async function runAgent(context, prompt, options) {
   if (options.branch_off !== undefined && options.branch === undefined) {
     throw new TypeError("agent branch_off requires branch")
   }
+  const execution = resolveExecution(context, options)
   if (totalAgents >= context.limits.maxAgents) {
     throw new Error(`workflow agent limit exceeded (${context.limits.maxAgents})`)
   }
   totalAgents += 1
   const index = totalAgents
   const label = options.label ?? `agent-${index}`
-  await acquire()
-  runningAgents += 1
+  const childSessionId = randomUUID()
+  let relationship = {
+    childSessionId,
+    parentSessionId: context.parentSessionId,
+    workflowTaskId: context.taskId,
+    agentLabel: label,
+    logicalBranch: options.branch ?? null,
+    branch: null,
+    workspace: context.workspace,
+    worktreePath: null,
+    model: execution.model,
+    reasoning: execution.reasoning,
+    serviceTier: execution.serviceTier,
+    timeoutMs: execution.timeoutMs,
+    capabilityProfile: execution.capabilityProfile
+  }
+  const controller = new AbortController()
+  const timeout = execution.expired ? null : setTimeout(
+    () => controller.abort(new AgentTimeoutError(execution.timeoutMs)), execution.timeoutMs
+  )
+  if (execution.expired) controller.abort(new AgentTimeoutError(0))
+  let acquired = false
   let managed = null
   let managedBranch = null
-  let childSessionId = null
-  let relationship = null
+  let childCreated = false
   try {
+    await acquire(controller.signal)
+    acquired = true
+    runningAgents += 1
     if (context.isClosing()) throw new Error("workflow is finishing")
     if (options.branch !== undefined) {
-      managed = await context.worktrees.prepare(options.branch, options.branch_off)
+      managed = await context.worktrees.prepare(
+        options.branch, options.branch_off, controller.signal
+      )
       managedBranch = options.branch
     }
+    if (controller.signal.aborted) throw controller.signal.reason
     if (context.isClosing()) throw new Error("workflow is finishing")
     const workspace = managed?.workspace ?? context.workspace
     const branchContext = managed?.promptContext ?? context.worktrees.promptContext()
-    childSessionId = randomUUID()
     relationship = {
-      childSessionId,
-      parentSessionId: context.parentSessionId,
-      workflowTaskId: context.taskId,
-      agentLabel: label,
-      logicalBranch: options.branch ?? null,
+      ...relationship,
       branch: managed?.branch ?? null,
       workspace,
-      worktreePath: managed?.worktreePath ?? null
+      worktreePath: managed?.worktreePath ?? null,
     }
     await context.recordChild({ status: "allocating", ...relationship })
-    await createChildSession(context, relationship)
+    await createChildSession(context, relationship, execution, controller.signal)
+    childCreated = true
     await context.recordChild({ status: "created", ...relationship })
     if (context.isClosing()) throw new Error("workflow is finishing")
     progress("agent_started", {
@@ -102,7 +148,7 @@ async function runAgent(context, prompt, options) {
       workspace,
       childSessionId
     })
-    const value = await runPhi(context, childSessionId, branchContext + prompt, options.schema, workspace, event => {
+    const value = await runPhi(context, childSessionId, branchContext + prompt, options.schema, workspace, execution, controller.signal, event => {
       if (event.type === "model_delta") {
         progress("agent_output", { index, label, content: event.content })
       }
@@ -112,41 +158,133 @@ async function runAgent(context, prompt, options) {
     progress("agent_completed", { index, label })
     return value
   } catch (error) {
-    await context.worktrees.finished(managedBranch, "failed").catch(() => {})
-    if (childSessionId && relationship) {
-      const status = context.isClosing() ? "cancelled" : "failed"
-      await context.recordChild({ status, error: error.message, ...relationship }).catch(() => {})
-    }
-    progress("agent_failed", { index, label, error: error.message })
+    const timedOut = error instanceof AgentTimeoutError || controller.signal.reason instanceof AgentTimeoutError
+    const status = timedOut ? "timed_out" : context.isClosing() ? "cancelled" : "failed"
+    await context.worktrees.finished(managedBranch, status).catch(() => {})
+    await context.recordChild({ status, launched: childCreated, error: error.message, ...relationship }).catch(() => {})
+    progress("agent_failed", { index, label, status, error: error.message })
     throw error
   } finally {
-    runningAgents -= 1
-    release()
+    clearTimeout(timeout)
+    if (acquired) {
+      runningAgents -= 1
+      release()
+    }
   }
 }
 
-function createChildSession(context, relationship) {
+function resolveExecution(context, options) {
+  const parent = context.agentContext
+  const model = options.model ?? parent.model
+  if (typeof model !== "string" || model.length === 0) {
+    throw new TypeError("agent model must be a non-empty string")
+  }
+  const spec = parent.models.find(candidate => candidate.id === model)
+  if (!spec) throw new Error(`unknown agent model: ${model}`)
+  const reasoning = options.reasoning ?? parent.reasoning
+  if (typeof reasoning !== "string") throw new TypeError("agent reasoning must be a string")
+  if (spec.reasoning.length > 0 && !spec.reasoning.some(option =>
+    (typeof option === "string" ? option : option.id) === reasoning
+  )) {
+    throw new Error(`unsupported agent reasoning for ${model}: ${reasoning}`)
+  }
+  const serviceTier = options.model === undefined
+    ? parent.serviceTier
+    : spec.default_service_tier
+  const requestedTimeout = options.timeout_ms ?? context.limits.maxDurationMs
+  if (!Number.isInteger(requestedTimeout) || requestedTimeout < 1
+      || requestedTimeout > context.limits.maxDurationMs) {
+    throw new RangeError(
+      `agent timeout_ms must be an integer between 1 and ${context.limits.maxDurationMs}`
+    )
+  }
+  const remaining = context.deadlineAt - Date.now()
+  const timeoutMs = Math.min(requestedTimeout, Math.max(1, remaining - cancellationGraceMs))
+  const capabilityProfile = options.capabilities ?? "parent"
+  if (!["parent", "read-only", "workspace-write"].includes(capabilityProfile)) {
+    throw new TypeError(`unsupported agent capabilities profile: ${capabilityProfile}`)
+  }
+  if (capabilityProfile === "workspace-write"
+      && !parent.allowWrite && !parent.fullAccess) {
+    throw new Error("agent workspace-write capabilities exceed parent authority")
+  }
+  const capabilities = capabilityProfile === "parent"
+    ? {
+        allowShell: parent.allowShell,
+        allowWrite: parent.allowWrite,
+        fullAccess: parent.fullAccess,
+        workspaceOnly: parent.workspaceOnly === true
+      }
+    : capabilityProfile === "workspace-write"
+      ? { allowShell: false, allowWrite: true, fullAccess: false, workspaceOnly: true }
+      : { allowShell: false, allowWrite: false, fullAccess: false, workspaceOnly: true }
+  return {
+    model, reasoning, serviceTier, timeoutMs, capabilityProfile, capabilities,
+    expired: remaining <= 0
+  }
+}
+
+function permissionArgs(execution) {
+  if (execution.capabilities.fullAccess) return ["--yolo"]
+  return [
+    ...(execution.capabilities.allowShell ? ["--allow-shell"] : []),
+    ...(execution.capabilities.allowWrite ? ["--allow-write"] : []),
+    ...(execution.capabilities.workspaceOnly ? ["--workspace-only"] : [])
+  ]
+}
+
+function createChildSession(context, relationship, execution, signal) {
   return runCommand(context, [
     "--workspace", relationship.workspace,
-    "--yolo",
+    ...permissionArgs(execution),
     "internal-create-session", relationship.childSessionId,
     "--parent-session", relationship.parentSessionId,
     "--workflow-task", relationship.workflowTaskId,
     "--agent-label", relationship.agentLabel,
     ...(relationship.branch ? ["--branch", relationship.branch] : []),
-    ...(relationship.worktreePath ? ["--worktree-path", relationship.worktreePath] : [])
-  ])
+    ...(relationship.worktreePath ? ["--worktree-path", relationship.worktreePath] : []),
+    "--model", execution.model,
+    "--reasoning", execution.reasoning,
+    "--service-tier", execution.serviceTier,
+    "--timeout-ms", String(execution.timeoutMs),
+    "--capability-profile", execution.capabilityProfile
+  ], signal)
 }
 
-function runCommand(context, args) {
+function runCommand(context, args, signal) {
+  if (signal.aborted) return Promise.reject(signal.reason)
   const operation = new Promise((resolve, reject) => {
     const child = spawn(context.phi, args, { stdio: ["ignore", "pipe", "pipe"] })
+    context.childStarted(child)
     let stderr = ""
+    let settled = false
+    let abortReason = null
+    let killTimer = null
+    const abort = () => {
+      if (settled) return
+      abortReason = signal.reason
+      try { child.kill("SIGTERM") } catch {}
+      killTimer = setTimeout(() => {
+        try { child.kill("SIGKILL") } catch {}
+      }, 2_000)
+    }
+    signal.addEventListener("abort", abort, { once: true })
     child.stderr.setEncoding("utf8")
     child.stderr.on("data", chunk => { stderr += chunk })
-    child.on("error", reject)
+    child.on("error", error => {
+      if (!settled) {
+        settled = true
+        reject(abortReason ?? error)
+      }
+    })
     child.on("exit", code => {
-      if (code === 0) resolve()
+      context.childFinished(child)
+      signal.removeEventListener("abort", abort)
+      clearTimeout(killTimer)
+      if (settled) return
+      settled = true
+      if (abortReason) reject(abortReason)
+      else if (code === 0) resolve()
       else reject(new Error(stderr.trim() || `Phi exited with code ${code}`))
     })
   })
@@ -155,11 +293,12 @@ function runCommand(context, args) {
   return operation
 }
 
-function runPhi(context, childSessionId, prompt, schema, workspace, onEvent) {
+function runPhi(context, childSessionId, prompt, schema, workspace, execution, signal, onEvent) {
+  if (signal.aborted) return Promise.reject(signal.reason)
   return new Promise((resolve, reject) => {
     const child = spawn(
       context.phi,
-      ["--workspace", workspace, "--yolo", "rpc", "--session", childSessionId],
+      ["--workspace", workspace, ...permissionArgs(execution), "rpc", "--session", childSessionId],
       { stdio: ["pipe", "pipe", "pipe"] }
     )
     context.childStarted(child)
@@ -168,6 +307,17 @@ function runPhi(context, childSessionId, prompt, schema, workspace, onEvent) {
     child.stderr.on("data", chunk => { stderr += chunk })
     const lines = createInterface({ input: child.stdout })
     let settled = false
+    let abortReason = null
+    let killTimer = null
+    const abort = () => {
+      if (settled) return
+      abortReason = signal.reason
+      try { child.kill("SIGTERM") } catch {}
+      killTimer = setTimeout(() => {
+        try { child.kill("SIGKILL") } catch {}
+      }, 2_000)
+    }
+    signal.addEventListener("abort", abort, { once: true })
     lines.on("line", line => {
       let message
       try {
@@ -186,12 +336,19 @@ function runPhi(context, childSessionId, prompt, schema, workspace, onEvent) {
       }
     })
     child.on("error", error => {
-      if (!settled) reject(error)
+      if (!settled) {
+        settled = true
+        reject(abortReason ?? error)
+      }
     })
     child.on("exit", code => {
       context.childFinished(child)
+      signal.removeEventListener("abort", abort)
+      clearTimeout(killTimer)
       if (!settled) {
-        reject(new Error(stderr.trim() || `Phi agent exited with code ${code}`))
+        settled = true
+        if (abortReason) reject(abortReason)
+        else reject(new Error(stderr.trim() || `Phi agent exited with code ${code}`))
       }
     })
     child.stdin.end(JSON.stringify({

@@ -14,7 +14,22 @@ use uuid::Uuid;
 
 const MAX_CONCURRENCY: u64 = 8;
 const MAX_AGENTS: u64 = 32;
+const MAX_DURATION_MS: u64 = 60 * 60 * 1_000;
 const MAX_PROGRESS_BYTES: usize = 32 * 1024;
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkflowAgentContext {
+    pub models: Vec<crate::ModelSpec>,
+    pub model: String,
+    pub reasoning: String,
+    pub service_tier: String,
+    pub allow_shell: bool,
+    pub allow_write: bool,
+    pub full_access: bool,
+    pub interactive_approvals: bool,
+    pub workspace_only: bool,
+}
 
 struct TaskEntry {
     child: tokio::sync::Mutex<tokio::process::Child>,
@@ -27,13 +42,15 @@ pub struct WorkflowTasks {
 }
 
 impl WorkflowTasks {
-    pub async fn launch(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn launch(
         &self,
         workspace: &Path,
         home: &Path,
         parent_session_id: &str,
         session_dir: &Path,
         plugin_roots: &HashMap<String, PathBuf>,
+        agent_context: WorkflowAgentContext,
         arguments: &Value,
     ) -> Result<Value> {
         let name = arguments
@@ -60,6 +77,7 @@ impl WorkflowTasks {
         let dir = session_dir.join("workflows").join(&task_id);
         fs::create_dir_all(&dir)?;
         let started_at = now_ms()?;
+        let deadline_at = started_at + u128::from(MAX_DURATION_MS);
         write_json(
             &dir.join("state.json"),
             &json!({
@@ -90,9 +108,12 @@ impl WorkflowTasks {
             "git": git,
             "worktreeRoot": worktree_root,
             "startedAt": started_at,
+            "deadlineAt": deadline_at,
+            "agentContext": agent_context,
             "limits": {
                 "maxConcurrency": MAX_CONCURRENCY,
                 "maxAgents": MAX_AGENTS,
+                "maxDurationMs": MAX_DURATION_MS,
             }
         });
         let request_path = dir.join("request.json");
@@ -848,6 +869,35 @@ async fn terminate(entry: &TaskEntry) {
 mod tests {
     use super::*;
 
+    fn agent_context() -> WorkflowAgentContext {
+        WorkflowAgentContext {
+            models: vec![crate::ModelSpec {
+                provider: "test".into(),
+                id: "test/model".into(),
+                model: "model".into(),
+                label: "Test".into(),
+                description: String::new(),
+                context_window: 1_000,
+                compaction_token_limit: 900,
+                strict_json_schema_capable: true,
+                function_tools: true,
+                hosted_tools: vec![],
+                reasoning: vec![crate::PickerOptionSpec::Simple("low".into())],
+                default_reasoning: "low".into(),
+                service_tiers: vec![crate::PickerOptionSpec::Simple("default".into())],
+                default_service_tier: "default".into(),
+            }],
+            model: "test/model".into(),
+            reasoning: "low".into(),
+            service_tier: "default".into(),
+            allow_shell: false,
+            allow_write: false,
+            full_access: false,
+            interactive_approvals: true,
+            workspace_only: false,
+        }
+    }
+
     fn initialize_repository(root: &Path) -> String {
         git_output(root, &["init", "-q"]).unwrap();
         git_output(root, &["config", "user.name", "Phi Test"]).unwrap();
@@ -1240,6 +1290,7 @@ mod tests {
                 "11111111-1111-4111-8111-111111111111",
                 &session,
                 &plugins,
+                agent_context(),
                 &json!({ "name": ".hidden", "args": ["arbitrary", 7] }),
             )
             .await
@@ -1254,8 +1305,12 @@ mod tests {
             json!({
                 "maxConcurrency": MAX_CONCURRENCY,
                 "maxAgents": MAX_AGENTS,
+                "maxDurationMs": MAX_DURATION_MS,
             })
         );
+        assert_eq!(request["agentContext"]["model"], "test/model");
+        assert_eq!(request["agentContext"]["allowWrite"], false);
+        assert!(request["deadlineAt"].as_u64().unwrap() > request["startedAt"].as_u64().unwrap());
         let output = tasks
             .output(&session, &json!({ "task_id": task_id }))
             .await
@@ -1332,6 +1387,7 @@ mod tests {
                 "11111111-1111-4111-8111-111111111111",
                 &session,
                 &plugins,
+                agent_context(),
                 &json!({ "name": "review", "args": { "request": { "files": [""] } } }),
             )
             .await
@@ -1352,6 +1408,7 @@ mod tests {
                 "11111111-1111-4111-8111-111111111111",
                 &session,
                 &plugins,
+                agent_context(),
                 &json!({ "name": "review", "args": args }),
             )
             .await
@@ -1363,6 +1420,7 @@ mod tests {
                 "11111111-1111-4111-8111-111111111111",
                 &session,
                 &plugins,
+                agent_context(),
                 &json!({
                     "name": "review",
                     "path": ".phi/workflows/review.js",
@@ -1500,6 +1558,7 @@ mod tests {
                     "11111111-1111-4111-8111-111111111111",
                     &session,
                     &plugins,
+                    agent_context(),
                     &json!({ "name": "same", "path": path, "args": {} }),
                 )
                 .await
@@ -1552,6 +1611,7 @@ mod tests {
                 "11111111-1111-4111-8111-111111111111",
                 &session,
                 &plugins,
+                agent_context(),
                 &json!({ "name": "scheduling-example" }),
             )
             .await

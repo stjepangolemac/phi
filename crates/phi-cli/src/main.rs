@@ -23,6 +23,8 @@ struct Cli {
     /// Run all tool calls without approval.
     #[arg(long)]
     yolo: bool,
+    #[arg(long, hide = true)]
+    workspace_only: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -57,6 +59,16 @@ enum Command {
         branch: Option<String>,
         #[arg(long)]
         worktree_path: Option<PathBuf>,
+        #[arg(long)]
+        model: String,
+        #[arg(long, default_value = "")]
+        reasoning: String,
+        #[arg(long, default_value = "")]
+        service_tier: String,
+        #[arg(long)]
+        timeout_ms: u64,
+        #[arg(long)]
+        capability_profile: String,
     },
     Read {
         path: PathBuf,
@@ -116,7 +128,8 @@ async fn run() -> Result<()> {
         .canonicalize()
         .context("workspace does not exist")?;
     let home = phi_runtime::initialize_home()?;
-    let (allow_shell, allow_write, interactive_approvals) = approval_settings(&cli);
+    let interactive = !matches!(&cli.command, Some(Command::Rpc { .. }));
+    let (allow_shell, allow_write, interactive_approvals) = approval_settings(&cli, interactive);
     let processes = std::sync::Arc::new(phi_core::process::ShellSessions::default());
     let workflows = std::sync::Arc::new(phi_runtime::WorkflowTasks::default());
     let options = || phi_runtime::RunOptions {
@@ -127,6 +140,7 @@ async fn run() -> Result<()> {
         allow_write,
         interactive_approvals,
         full_access: cli.yolo,
+        workspace_only: cli.workspace_only,
         processes: std::sync::Arc::clone(&processes),
         workflows: std::sync::Arc::clone(&workflows),
         output_schema: None,
@@ -177,18 +191,32 @@ async fn run() -> Result<()> {
                 agent_label,
                 branch,
                 worktree_path,
+                model,
+                reasoning,
+                service_tier,
+                timeout_ms,
+                capability_profile,
             }) => {
-                phi_runtime::create_session_with_id(
+                phi_runtime::create_workflow_child_session_with_id(
                     &options(),
                     &id,
+                    &parent_session,
                     phi_core::session::SessionMetadata {
                         workspace: Some(workspace.clone()),
-                        parent_session_id: Some(parent_session),
+                        parent_session_id: Some(parent_session.clone()),
                         workflow_task_id: Some(workflow_task),
                         agent_label: Some(agent_label),
                         branch,
                         worktree_path,
+                        model: Some(model.clone()),
+                        reasoning: Some(reasoning.clone()),
+                        service_tier: Some(service_tier.clone()),
+                        timeout_ms: Some(timeout_ms),
+                        capability_profile: Some(capability_profile),
                     },
+                    &model,
+                    &reasoning,
+                    &service_tier,
                 )?;
                 println!("{id}");
                 Ok(())
@@ -333,11 +361,11 @@ fn rpc_error(id: serde_json::Value, code: i64, message: &str) -> Result<()> {
     }))
 }
 
-fn approval_settings(cli: &Cli) -> (bool, bool, bool) {
+fn approval_settings(cli: &Cli, interactive: bool) -> (bool, bool, bool) {
     (
         cli.allow_shell || cli.yolo,
         cli.allow_write || cli.yolo,
-        !cli.yolo,
+        interactive && !cli.yolo,
     )
 }
 
@@ -535,7 +563,13 @@ mod tests {
     #[test]
     fn yolo_preapproves_shell_and_writes() {
         let cli = Cli::try_parse_from(["phi", "--yolo"]).unwrap();
-        assert_eq!(approval_settings(&cli), (true, true, false));
+        assert_eq!(approval_settings(&cli, true), (true, true, false));
+    }
+
+    #[test]
+    fn rpc_never_waits_for_interactive_approval() {
+        let cli = Cli::try_parse_from(["phi", "--allow-write", "rpc"]).unwrap();
+        assert_eq!(approval_settings(&cli, false), (false, true, false));
     }
 
     #[test]

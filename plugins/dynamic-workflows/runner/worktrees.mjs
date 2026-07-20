@@ -27,22 +27,45 @@ function shortHash(value) {
   return createHash("sha256").update(value).digest("hex").slice(0, 8)
 }
 
-function git(repoRoot, args, { allowFailure = false } = {}) {
+function git(repoRoot, args, { allowFailure = false, signal } = {}) {
+  if (signal?.aborted) return Promise.reject(signal.reason)
   return new Promise((resolve, reject) => {
     const child = spawn("git", ["-C", repoRoot, ...args], {
       stdio: ["ignore", "pipe", "pipe"]
     })
     let stdout = ""
     let stderr = ""
+    let settled = false
+    let abortReason = null
+    let killTimer = null
+    const finish = callback => {
+      if (settled) return
+      settled = true
+      signal?.removeEventListener("abort", abort)
+      clearTimeout(killTimer)
+      callback()
+    }
+    const abort = () => {
+      if (settled) return
+      abortReason = signal.reason
+      try { child.kill("SIGTERM") } catch {}
+      killTimer = setTimeout(() => {
+        try { child.kill("SIGKILL") } catch {}
+      }, 2_000)
+    }
+    signal?.addEventListener("abort", abort, { once: true })
     child.stdout.setEncoding("utf8")
     child.stderr.setEncoding("utf8")
     child.stdout.on("data", chunk => { stdout += chunk })
     child.stderr.on("data", chunk => { stderr += chunk })
-    child.on("error", reject)
+    child.on("error", error => finish(() => reject(abortReason ?? error)))
     child.on("exit", code => {
       const result = { code, stdout: stdout.trim(), stderr: stderr.trim() }
-      if (code === 0 || allowFailure) resolve(result)
-      else reject(new Error(result.stderr || `git ${args.join(" ")} exited with code ${code}`))
+      finish(() => {
+        if (abortReason) reject(abortReason)
+        else if (code === 0 || allowFailure) resolve(result)
+        else reject(new Error(result.stderr || `git ${args.join(" ")} exited with code ${code}`))
+      })
     })
   })
 }
@@ -73,9 +96,11 @@ export function createWorktreeManager(config) {
     return persistQueue
   }
 
-  async function verifyRepository() {
+  async function verifyRepository(signal) {
     if (!config.git?.gitCommonDir) return
-    const result = await git(config.git.repoRoot, ["rev-parse", "--git-common-dir"])
+    const result = await git(
+      config.git.repoRoot, ["rev-parse", "--git-common-dir"], { signal }
+    )
     const common = await realpath(resolve(config.git.repoRoot, result.stdout))
     if (common !== config.git.gitCommonDir) {
       throw new Error("Git repository identity changed during workflow")
@@ -101,7 +126,7 @@ export function createWorktreeManager(config) {
     return rootReady
   }
 
-  async function resolveBase(branchOff) {
+  async function resolveBase(branchOff, signal) {
     if (branchOff === undefined || branchOff === null) {
       return config.git.startingCommit
     }
@@ -120,7 +145,7 @@ export function createWorktreeManager(config) {
     }
     const result = await git(config.git.repoRoot, [
       "rev-parse", "--verify", "--end-of-options", `${branchOff}^{commit}`
-    ])
+    ], { signal })
     return result.stdout
   }
 
@@ -138,13 +163,15 @@ export function createWorktreeManager(config) {
       "Do not modify another worktree directly.\n\n"
   }
 
-  async function prepareOperation(logicalBranch, branchOff) {
+  async function prepareOperation(logicalBranch, branchOff, signal) {
     validateLogicalBranch(logicalBranch)
+    signal?.throwIfAborted()
     if (!config.git) {
       throw new Error("agent branch requires a Git worktree workspace")
     }
-    await verifyRepository()
+    await verifyRepository(signal)
     await ensureRoot()
+    signal?.throwIfAborted()
     if (entries.has(logicalBranch) || reservations.has(logicalBranch)) {
       throw new Error(`duplicate managed branch: ${logicalBranch}`)
     }
@@ -154,11 +181,11 @@ export function createWorktreeManager(config) {
       const suffix = `${slug(logicalBranch)}-${shortHash(logicalBranch)}`
       const branch = `phi/${config.taskId.slice(0, 8)}/${suffix}`
       const path = join(config.worktreeRoot, suffix)
-      const baseCommit = await resolveBase(branchOff)
+      const baseCommit = await resolveBase(branchOff, signal)
       const existingBranch = await git(
         config.git.repoRoot,
         ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
-        { allowFailure: true }
+        { allowFailure: true, signal }
       )
       if (existingBranch.code === 0) {
         throw new Error(`managed branch already exists: ${branch}`)
@@ -180,10 +207,15 @@ export function createWorktreeManager(config) {
       entries.set(logicalBranch, entry)
       await persist()
       try {
-        await git(config.git.repoRoot, ["worktree", "add", "--detach", path, baseCommit])
+        await git(
+          config.git.repoRoot,
+          ["worktree", "add", "--detach", path, baseCommit],
+          { signal }
+        )
         entry.state = "worktree_created"
         await persist()
-        await git(path, ["checkout", "-b", branch])
+        signal?.throwIfAborted()
+        await git(path, ["checkout", "-b", branch], { signal })
         entry.branchCreated = true
         entry.state = "active"
         await persist()
@@ -213,9 +245,9 @@ export function createWorktreeManager(config) {
     }
   }
 
-  function prepare(logicalBranch, branchOff) {
+  function prepare(logicalBranch, branchOff, signal) {
     if (cleaning) return Promise.reject(new Error("managed worktree cleanup has started"))
-    const operation = prepareOperation(logicalBranch, branchOff)
+    const operation = prepareOperation(logicalBranch, branchOff, signal)
     operations.add(operation)
     operation.then(
       () => operations.delete(operation),

@@ -30,6 +30,16 @@ pub struct SessionMetadata {
     pub branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_profile: Option<String>,
 }
 
 #[derive(Clone)]
@@ -115,6 +125,11 @@ impl Session {
                     "agent_label": metadata.agent_label,
                     "branch": metadata.branch,
                     "worktree_path": metadata.worktree_path,
+                    "model": metadata.model,
+                    "reasoning": metadata.reasoning,
+                    "service_tier": metadata.service_tier,
+                    "timeout_ms": metadata.timeout_ms,
+                    "capability_profile": metadata.capability_profile,
                 }),
                 AtomicWriteMode::Overwrite,
             )?;
@@ -400,6 +415,11 @@ mod tests {
                 agent_label: Some("review".into()),
                 branch: Some("phi/task/review".into()),
                 worktree_path: Some(worktree.clone()),
+                model: Some("test/model".into()),
+                reasoning: Some("high".into()),
+                service_tier: Some("priority".into()),
+                timeout_ms: Some(30_000),
+                capability_profile: Some("read-only".into()),
             },
         )
         .unwrap();
@@ -409,6 +429,11 @@ mod tests {
         assert_eq!(metadata["workspace"], workspace.to_string_lossy().as_ref());
         assert_eq!(metadata["agent_label"], "review");
         assert_eq!(metadata["branch"], "phi/task/review");
+        assert_eq!(metadata["model"], "test/model");
+        assert_eq!(metadata["reasoning"], "high");
+        assert_eq!(metadata["service_tier"], "priority");
+        assert_eq!(metadata["timeout_ms"], 30_000);
+        assert_eq!(metadata["capability_profile"], "read-only");
         assert_eq!(
             metadata["worktree_path"],
             worktree.to_string_lossy().as_ref()

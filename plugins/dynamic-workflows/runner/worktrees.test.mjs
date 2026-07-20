@@ -188,3 +188,61 @@ test("agent and logical branch validation reject invalid combinations before spa
     await assert.rejects(manager.prepare(name), /branch|cleanup/)
   }
 })
+
+test("agent timeout during managed-worktree setup prevents child launch", async () => {
+  let spawned = false
+  const records = []
+  configure({
+    phi: "unused",
+    parentSessionId: "11111111-1111-4111-8111-111111111111",
+    taskId: "22222222-2222-4222-8222-222222222222",
+    workspace: "/unused",
+    deadlineAt: Date.now() + 10_000,
+    limits: { maxConcurrency: 1, maxAgents: 4, maxDurationMs: 10_000 },
+    agentContext: {
+      models: [{
+        id: "test/model",
+        reasoning: [{ id: "low" }],
+        default_reasoning: "low",
+        default_service_tier: "default"
+      }],
+      model: "test/model",
+      reasoning: "low",
+      serviceTier: "default",
+      allowShell: false,
+      allowWrite: false,
+      fullAccess: false
+    },
+    worktrees: {
+      prepare: async (_branch, _branchOff, signal) => new Promise((resolve, reject) => {
+        const timer = setTimeout(() => resolve({
+          workspace: "/managed",
+          promptContext: "",
+          branch: "phi/test/feature",
+          worktreePath: "/managed"
+        }), 5_000)
+        signal.addEventListener("abort", () => {
+          clearTimeout(timer)
+          reject(signal.reason)
+        }, { once: true })
+      }),
+      finished: async () => {},
+      promptContext: () => ""
+    },
+    isClosing: () => false,
+    progress: () => {},
+    recordChild: async record => records.push(record),
+    childStarted: () => { spawned = true },
+    childFinished: () => {},
+    setupStarted: () => {},
+    setupFinished: () => {},
+    agentStarted: () => {},
+    agentFinished: () => {}
+  })
+  await assert.rejects(
+    agent("test", { branch: "feature", timeout_ms: 10 }),
+    /timed out/
+  )
+  assert.equal(spawned, false)
+  assert.ok(records.some(record => record.status === "timed_out" && record.launched === false))
+})

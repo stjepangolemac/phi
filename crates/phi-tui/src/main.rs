@@ -3174,6 +3174,7 @@ mod tests {
                 allow_write: false,
                 interactive_approvals: true,
                 full_access: false,
+                workspace_only: false,
                 processes: std::sync::Arc::new(phi_runtime::ProcessManager::default()),
                 workflows: std::sync::Arc::new(phi_runtime::WorkflowTasks::default()),
                 output_schema: None,
