@@ -203,7 +203,10 @@ export function createWorktreeManager(config) {
       const relative = config.git.workspaceRelative
       return {
         workspace: relative && relative !== "." ? join(path, relative) : path,
-        promptContext: promptContext(logicalBranch)
+        promptContext: promptContext(logicalBranch),
+        branch,
+        logicalBranch,
+        worktreePath: path
       }
     } finally {
       reservations.delete(logicalBranch)

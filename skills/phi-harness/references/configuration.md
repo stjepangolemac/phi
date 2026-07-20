@@ -12,6 +12,7 @@ Run `phi --json status` first to see the resolved composition and active configu
 - `plugins.lock.json`: Git sources and resolved commits.
 - `plugins/`: immutable installed plugin packages.
 - `skills/`: manually copied personal skills.
+- `sessions/<session-id>/`: durable flat conversation storage, including exact composition snapshots, `events.jsonl`, `state.json`, workflow runs, and numbered plans.
 - `builtins/<version>/`: the official plugin snapshot embedded in that Phi build, plus bundled system skills.
 
 Never put secret values in `config.scm`, plugin configuration, status output, or the repository. Secret handles in `config.json` point to separate files.
@@ -21,8 +22,9 @@ Do not edit installed or official plugin files to reconfigure Phi. All provider,
 ## Workspace state
 
 - `.phi/skills/`: workspace skills; these override personal skills with the same name.
-- `.phi/sessions/`: session state and exact composition snapshots.
-- `.phi/PLAN.md`: persistent, human-readable state for nontrivial work. The bundled `planning` skill keeps it out of Git through the repository-local `.git/info/exclude` and retains it after the work is complete.
+- `.phi/workflows/`: workspace-specific reusable workflow definitions.
+
+Workspace and worktree paths are session metadata only. New conversations and plans are never stored under workspace `.phi/`. Existing workspace-local `.phi/sessions/` and `.phi/PLAN.md` data is left untouched and is not migrated or resumed implicitly.
 
 Every installed plugin may expose `skills/NAME/SKILL.md` without being loaded. Skill precedence is protected system skills, workspace skills, personal skills, then plugin skills. Duplicate names from different installed plugins are configuration errors.
 

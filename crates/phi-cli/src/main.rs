@@ -39,7 +39,24 @@ enum Command {
         prompt: String,
     },
     /// Serve one-shot agent requests over line-framed JSON-RPC on stdin/stdout.
-    Rpc,
+    Rpc {
+        #[arg(long)]
+        session: Option<String>,
+    },
+    #[command(hide = true)]
+    InternalCreateSession {
+        id: String,
+        #[arg(long)]
+        parent_session: String,
+        #[arg(long)]
+        workflow_task: String,
+        #[arg(long)]
+        agent_label: String,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long)]
+        worktree_path: Option<PathBuf>,
+    },
     Read {
         path: PathBuf,
     },
@@ -145,7 +162,34 @@ async fn run() -> Result<()> {
                 options.session_id = Some(session);
                 run_frontend(options, prompt, cli.json).await
             }
-            Some(Command::Rpc) => run_rpc(options()).await,
+            Some(Command::Rpc { session }) => {
+                let mut options = options();
+                options.session_id = session;
+                run_rpc(options).await
+            }
+            Some(Command::InternalCreateSession {
+                id,
+                parent_session,
+                workflow_task,
+                agent_label,
+                branch,
+                worktree_path,
+            }) => {
+                phi_runtime::create_session_with_id(
+                    &options(),
+                    &id,
+                    phi_core::session::SessionMetadata {
+                        workspace: Some(workspace.clone()),
+                        parent_session_id: Some(parent_session),
+                        workflow_task_id: Some(workflow_task),
+                        agent_label: Some(agent_label),
+                        branch,
+                        worktree_path,
+                    },
+                )?;
+                println!("{id}");
+                Ok(())
+            }
             Some(Command::Read { path }) => {
                 let mut registry = phi_core::capability::Registry::default();
                 registry.register(phi_core::capability::ReadFile {

@@ -10,7 +10,7 @@ Use named JavaScript workflows for multi-agent orchestration. Keep workflow defi
 - `~/.phi/workflows/` contains global reusable definitions.
 - `.phi/workflows/` contains workspace-specific definitions.
 - Loaded plugins may package definitions under `workflows/`.
-- `.phi/sessions/<session-id>/workflows/tasks/<task-id>/` contains session-local run state, copied source, progress, logs, and results.
+- `$PHI_HOME/sessions/<parent-session-id>/workflows/<task-id>/` contains durable run state, copied source, progress, logs, results, and child relationship records.
 
 When looking for an existing definition, inspect global workflows first, then workspace and loaded-plugin workflows. Name-only `Workflow` calls use that same global → workspace → plugin precedence. Create workspace-specific definitions in `.phi/workflows/` normally. Only when the user explicitly asks to make one global, copy or promote it into `~/.phi/workflows/`.
 
@@ -36,7 +36,7 @@ export default async function ({ args }) {
 
 Tasks passed to `parallel` or `batch` must be functions so work starts only when scheduled. `parallel` continuously fills its concurrency limit; `batch` runs fixed-size waves. Workflows are limited to 8 concurrent agents, 32 total agents, and 60 minutes.
 
-`agent(prompt, { label?, schema?, branch?, branch_off? })` starts a fresh `phi --workspace WORKSPACE --yolo rpc` child. A schema requests strict JSON-schema output. Use `Workflow` with `name`, optional exact `path`, and `args` to launch; use `TaskOutput` to inspect or wait and `TaskStop` to cancel.
+`agent(prompt, { label?, schema?, branch?, branch_off? })` allocates a fresh durable child session under `$PHI_HOME/sessions/` before starting `phi --workspace WORKSPACE --yolo rpc --session CHILD_ID`. The run records parent, task, label, branch, workspace, and worktree relationships. A schema requests strict JSON-schema output. Use `Workflow` with `name`, optional exact `path`, and `args` to launch; use `TaskOutput` to inspect or wait and `TaskStop` to cancel.
 
 ## Managed Git branches
 
@@ -64,4 +64,4 @@ await agent("Promote the completed integration branch into the original checkout
 
 Without `branch_off`, Phi branches from the immutable commit captured when the workflow launched. `branch_off` is valid only with `branch`; it may identify an external Git ref or a completed managed logical branch. Managed logical names are mapped to task-owned `phi/...` refs, and agents receive the mapping needed to merge completed managed branches.
 
-Branched agents run in the equivalent repository-relative subdirectory when Phi was launched below the repository root. They should commit their work and return commit hashes through schemas. Worktrees and their task-owned refs are temporary and are always removed on workflow exit, including cancellation and failure. Before the workflow exits, promote every wanted commit to a non-managed ref with an explicit unbranched `agent()` call. Never rely on a managed ref surviving the workflow.
+Branched agents run in the equivalent repository-relative subdirectory when Phi was launched below the repository root. They should commit their work and return commit hashes through schemas. Worktrees and their task-owned refs are temporary and are always removed on workflow exit, including cancellation and failure, while child sessions and run records remain durable. Before the workflow exits, promote every wanted commit to a non-managed ref with an explicit unbranched `agent()` call. Never rely on a managed ref surviving the workflow.

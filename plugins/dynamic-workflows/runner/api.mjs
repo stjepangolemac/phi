@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process"
+import { randomUUID } from "node:crypto"
 import { createInterface } from "node:readline"
 
 let runtime = null
@@ -61,6 +62,8 @@ export async function agent(prompt, options = {}) {
   runningAgents += 1
   let managed = null
   let managedBranch = null
+  let childSessionId = null
+  let relationship = null
   try {
     if (context.isClosing()) throw new Error("workflow is finishing")
     if (options.branch !== undefined) {
@@ -70,22 +73,42 @@ export async function agent(prompt, options = {}) {
     if (context.isClosing()) throw new Error("workflow is finishing")
     const workspace = managed?.workspace ?? context.workspace
     const branchContext = managed?.promptContext ?? context.worktrees.promptContext()
+    childSessionId = randomUUID()
+    relationship = {
+      childSessionId,
+      parentSessionId: context.parentSessionId,
+      workflowTaskId: context.taskId,
+      agentLabel: label,
+      logicalBranch: options.branch ?? null,
+      branch: managed?.branch ?? null,
+      workspace,
+      worktreePath: managed?.worktreePath ?? null
+    }
+    await context.recordChild({ status: "allocating", ...relationship })
+    await createChildSession(context, relationship)
+    await context.recordChild({ status: "created", ...relationship })
     progress("agent_started", {
       index,
       label,
       branch: options.branch ?? null,
-      workspace
+      workspace,
+      childSessionId
     })
-    const value = await runPhi(context, branchContext + prompt, options.schema, workspace, event => {
+    const value = await runPhi(context, childSessionId, branchContext + prompt, options.schema, workspace, event => {
       if (event.type === "model_delta") {
         progress("agent_output", { index, label, content: event.content })
       }
     })
     await context.worktrees.finished(managedBranch, "completed")
+    await context.recordChild({ status: "completed", ...relationship })
     progress("agent_completed", { index, label })
     return value
   } catch (error) {
     await context.worktrees.finished(managedBranch, "failed").catch(() => {})
+    if (childSessionId && relationship) {
+      const status = context.isClosing() ? "cancelled" : "failed"
+      await context.recordChild({ status, error: error.message, ...relationship }).catch(() => {})
+    }
     progress("agent_failed", { index, label, error: error.message })
     throw error
   } finally {
@@ -94,11 +117,41 @@ export async function agent(prompt, options = {}) {
   }
 }
 
-function runPhi(context, prompt, schema, workspace, onEvent) {
+function createChildSession(context, relationship) {
+  return runCommand(context, [
+    "--workspace", relationship.workspace,
+    "--yolo",
+    "internal-create-session", relationship.childSessionId,
+    "--parent-session", relationship.parentSessionId,
+    "--workflow-task", relationship.workflowTaskId,
+    "--agent-label", relationship.agentLabel,
+    ...(relationship.branch ? ["--branch", relationship.branch] : []),
+    ...(relationship.worktreePath ? ["--worktree-path", relationship.worktreePath] : [])
+  ])
+}
+
+function runCommand(context, args) {
+  const operation = new Promise((resolve, reject) => {
+    const child = spawn(context.phi, args, { stdio: ["ignore", "pipe", "pipe"] })
+    let stderr = ""
+    child.stderr.setEncoding("utf8")
+    child.stderr.on("data", chunk => { stderr += chunk })
+    child.on("error", reject)
+    child.on("exit", code => {
+      if (code === 0) resolve()
+      else reject(new Error(stderr.trim() || `Phi exited with code ${code}`))
+    })
+  })
+  context.setupStarted(operation)
+  operation.finally(() => context.setupFinished(operation)).catch(() => {})
+  return operation
+}
+
+function runPhi(context, childSessionId, prompt, schema, workspace, onEvent) {
   return new Promise((resolve, reject) => {
     const child = spawn(
       context.phi,
-      ["--workspace", workspace, "--yolo", "rpc"],
+      ["--workspace", workspace, "--yolo", "rpc", "--session", childSessionId],
       { stdio: ["pipe", "pipe", "pipe"] }
     )
     context.childStarted(child)

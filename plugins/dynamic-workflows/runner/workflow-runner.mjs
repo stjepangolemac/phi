@@ -14,7 +14,9 @@ const statePath = join(taskDir, "state.json")
 const progressPath = join(taskDir, "progress.jsonl")
 const summaryPath = join(taskDir, "summary.json")
 const resultPath = join(taskDir, "result.json")
+const childrenPath = join(taskDir, "children.jsonl")
 const children = new Set()
+const setups = new Set()
 let progressQueue = Promise.resolve()
 const summary = {
   phase: null,
@@ -63,6 +65,7 @@ function enqueueProgress(event) {
 }
 
 async function stopChildren() {
+  await Promise.allSettled([...setups])
   const running = [...children]
   for (const child of running) {
     try { child.kill("SIGTERM") } catch {}
@@ -140,13 +143,18 @@ try {
   })
   configure({
     phi: request.phi,
+    parentSessionId: request.parentSessionId,
+    taskId: request.taskId,
     workspace: request.workspace,
     limits: request.limits,
     worktrees,
     isClosing: () => closing,
     progress: enqueueProgress,
+    recordChild: value => appendFile(childrenPath, JSON.stringify({ at: Date.now(), ...value }) + "\n"),
     childStarted: child => children.add(child),
-    childFinished: child => children.delete(child)
+    childFinished: child => children.delete(child),
+    setupStarted: setup => setups.add(setup),
+    setupFinished: setup => setups.delete(setup)
   })
   const module = await import(`${pathToFileURL(generatedPath).href}?task=${request.taskId}`)
   if (!module.meta || typeof module.meta.name !== "string"

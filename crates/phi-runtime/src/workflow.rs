@@ -31,6 +31,7 @@ impl WorkflowTasks {
         &self,
         workspace: &Path,
         home: &Path,
+        parent_session_id: &str,
         session_dir: &Path,
         plugin_roots: &HashMap<String, PathBuf>,
         arguments: &Value,
@@ -55,7 +56,7 @@ impl WorkflowTasks {
         }
 
         let task_id = Uuid::new_v4().to_string();
-        let dir = session_dir.join("workflows/tasks").join(&task_id);
+        let dir = session_dir.join("workflows").join(&task_id);
         fs::create_dir_all(&dir)?;
         let started_at = now_ms()?;
         write_json(
@@ -77,6 +78,7 @@ impl WorkflowTasks {
         });
         let request = json!({
             "taskId": task_id,
+            "parentSessionId": parent_session_id,
             "name": name,
             "workflowPath": workflow_path,
             "args": args,
@@ -141,7 +143,7 @@ impl WorkflowTasks {
             .expect("workflow task registry poisoned")
             .get(task_id)
             .map(|entry| entry.dir.clone())
-            .unwrap_or_else(|| session_dir.join("workflows/tasks").join(task_id));
+            .unwrap_or_else(|| session_dir.join("workflows").join(task_id));
         if !dir.join("state.json").is_file() {
             bail!("workflow task not found: {task_id}");
         }
@@ -181,7 +183,7 @@ impl WorkflowTasks {
         let dir = entry
             .as_ref()
             .map(|entry| entry.dir.clone())
-            .unwrap_or_else(|| session_dir.join("workflows/tasks").join(task_id));
+            .unwrap_or_else(|| session_dir.join("workflows").join(task_id));
         let request = read_optional_json(&dir.join("request.json"))?;
         let state = read_optional_json(&dir.join("state.json"))?;
         let workflow = request["name"]
@@ -933,7 +935,8 @@ mod tests {
         assert!(skill.contains("inspect global workflows first"));
         assert!(skill.contains("global → workspace → plugin precedence"));
         assert!(skill.contains("user explicitly asks to make one global"));
-        assert!(skill.contains(".phi/sessions/<session-id>/workflows/tasks/<task-id>/"));
+        assert!(skill.contains("$PHI_HOME/sessions/<parent-session-id>/workflows/<task-id>/"));
+        assert!(skill.contains("child sessions and run records remain durable"));
     }
 
     #[test]
@@ -1050,7 +1053,7 @@ mod tests {
     async fn stale_task_reconciliation_marks_task_failed() {
         let session = tempfile::tempdir().unwrap();
         let task_id = "88888888-8888-4888-8888-888888888888";
-        let task_dir = session.path().join("workflows/tasks").join(task_id);
+        let task_dir = session.path().join("workflows").join(task_id);
         fs::create_dir_all(&task_dir).unwrap();
         write_json(
             &task_dir.join("request.json"),
@@ -1107,7 +1110,7 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let workspace = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        let session = workspace.path().join(".phi/sessions/test");
+        let session = home.path().join("sessions/test");
         fs::create_dir_all(&session).unwrap();
         let workflow = workspace.path().join(".phi/workflows/.hidden.js");
         fs::create_dir_all(workflow.parent().unwrap()).unwrap();
@@ -1129,6 +1132,7 @@ mod tests {
             .launch(
                 workspace.path(),
                 home.path(),
+                "11111111-1111-4111-8111-111111111111",
                 &session,
                 &plugins,
                 &json!({ "name": ".hidden", "args": { "ok": true } }),
@@ -1137,13 +1141,7 @@ mod tests {
             .unwrap();
         let task_id = launched["task_id"].as_str().unwrap();
         let request: Value = serde_json::from_slice(
-            &fs::read(
-                session
-                    .join("workflows/tasks")
-                    .join(task_id)
-                    .join("request.json"),
-            )
-            .unwrap(),
+            &fs::read(session.join("workflows").join(task_id).join("request.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -1183,7 +1181,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         let plugins_root = tempfile::tempdir().unwrap();
-        let session = workspace.path().join(".phi/sessions/test");
+        let session = home.path().join("sessions/test");
         fs::create_dir_all(&session).unwrap();
         let global = home.path().join("workflows/same.js");
         let workspace_definition = workspace.path().join(".phi/workflows/same.js");
@@ -1242,6 +1240,7 @@ mod tests {
                 .launch(
                     workspace.path(),
                     home.path(),
+                    "11111111-1111-4111-8111-111111111111",
                     &session,
                     &plugins,
                     &json!({ "name": "same", "path": path, "args": {} }),
@@ -1250,7 +1249,7 @@ mod tests {
                 .unwrap();
             let task_id = launched["task_id"].as_str().unwrap();
             assert!(task_ids.insert(task_id.to_owned()));
-            let task_dir = session.join("workflows/tasks").join(task_id);
+            let task_dir = session.join("workflows").join(task_id);
             let request = read_json(&task_dir.join("request.json")).unwrap();
             assert_eq!(
                 PathBuf::from(request["workflowPath"].as_str().unwrap()),
@@ -1281,7 +1280,7 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let workspace = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        let session = workspace.path().join(".phi/sessions/test");
+        let session = home.path().join("sessions/test");
         fs::create_dir_all(&session).unwrap();
         let mut plugins = HashMap::new();
         plugins.insert(
@@ -1293,6 +1292,7 @@ mod tests {
             .launch(
                 workspace.path(),
                 home.path(),
+                "11111111-1111-4111-8111-111111111111",
                 &session,
                 &plugins,
                 &json!({ "name": "scheduling-example" }),

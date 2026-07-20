@@ -11,7 +11,7 @@ impl Permissions {
             "exec_command" | "write_stdin" | "terminate_process" if !self.allow_shell => {
                 bail!("shell approval required: use --allow-shell")
             }
-            "patch" if !self.allow_write => {
+            "patch" | "create_plan" if !self.allow_write => {
                 bail!("write approval required: use --allow-write")
             }
             _ => Ok(()),
@@ -34,5 +34,6 @@ mod tests {
         assert!(permissions.authorize_tool("write_stdin").is_err());
         assert!(permissions.authorize_tool("terminate_process").is_err());
         assert!(permissions.authorize_tool("patch").is_err());
+        assert!(permissions.authorize_tool("create_plan").is_err());
     }
 }

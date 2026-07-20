@@ -1,17 +1,17 @@
 ---
 name: planning
-description: Create, maintain, resume, and finish a lightweight local plan for nontrivial multi-step work.
+description: Create, maintain, resume, and finish durable per-conversation plans for nontrivial multi-step work.
 ---
 
 # Planning
 
-Use `.phi/PLAN.md` as persistent execution state for nontrivial, multi-step work. Do not create a plan for a simple request that can be completed directly.
+Store plans in the current conversation's durable `plans/` directory under Phi home. Do not create a plan for a simple request that can be completed directly.
 
 ## Start or resume
 
-Before planning new work, check for `.phi/PLAN.md`. If it exists, read it and resume from its stage, current task, acceptance criteria, blockers, and notes instead of reconstructing progress from conversation history. This is also how work resumes after a new session or compaction.
+Before planning new work, inspect the current session's `plans/` directory when its path is available in prior tool output or conversation context. Read the relevant existing plan and resume from its stage, current task, acceptance criteria, blockers, and notes instead of reconstructing progress from conversation history. Multiple plans may coexist; infer the relevant plan from the user's request and the plan contents rather than maintaining an active-plan pointer.
 
-When starting a plan in a Git workspace, add the plan's repository-relative path to the repository-local exclude file reported by `git rev-parse --git-path info/exclude`. Do not modify `.gitignore` or another shared ignore file. Verify the plan is ignored before continuing.
+When starting a plan, call `create_plan` with a short descriptive name and the complete initial Markdown. The helper atomically allocates a zero-padded, monotonically increasing filename such as `0001-session-storage.md` in the current session. Use the returned path for subsequent reads and edits. Do not manually choose a number, create workspace `.phi/PLAN.md`, modify Git excludes, or introduce current-plan, archive, index, or database state.
 
 Create a human-readable Markdown file with this shape:
 
@@ -44,7 +44,7 @@ Important decisions and context needed to resume work.
 
 While the plan is in `writing`, gather enough relevant context from the user and workspace to make the goal, acceptance criteria, and approach reliable. Ask targeted questions when the user's intent or an important constraint is unclear. Read files and perform non-mutating discovery as needed, but do not begin implementation. Present the completed plan to the user and keep it in `writing` until the user explicitly approves it; clarifications and suggested edits are not approval.
 
-When the user approves the plan, set its stage to `executing` and mark the first current task with `[>]` before implementing. When `context_mark` is available, mark the start of writing and the switch to execution with concise descriptive labels. The plan file remains the durable execution state; context markers only create optional compaction boundaries.
+When the user approves the plan, edit the returned durable plan path to set its stage to `executing` and mark the first current task with `[>]` before implementing. When `context_mark` is available, mark the start of writing and the switch to execution with concise descriptive labels. The plan file remains the durable execution state; context markers only create optional compaction boundaries.
 
 ## Maintain
 
@@ -60,7 +60,7 @@ When the user approves the plan, set its stage to `executing` and mark the first
 
 ## Finish
 
-When all tasks are complete, all acceptance criteria have been verified and checked, and nothing else remains to do, set the plan stage to `done` and record any final context needed for handoff. Keep `.phi/PLAN.md`; never delete or commit it.
+When all tasks are complete, all acceptance criteria have been verified and checked, and nothing else remains to do, set the plan stage to `done` and record any final context needed for handoff. Keep completed plans in the session's `plans/` directory; never delete, archive, or move them automatically.
 
 When `context_mark` is available, a final marker may close the completed planning/execution span before handoff. Planning is only one producer of these generic boundaries; no active plan is required to use them.
 

@@ -16,6 +16,22 @@ pub struct Session {
     dir: PathBuf,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct SessionMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<PathBuf>,
+}
+
 #[derive(Clone)]
 pub struct PluginSource {
     pub name: String,
@@ -51,19 +67,63 @@ impl Session {
         skill_plugins: &[PluginSource],
     ) -> Result<Self> {
         let id = Uuid::new_v4().to_string();
-        let session = Self::at(root, &id)?;
-        fs::create_dir_all(&session.dir)?;
-        let snapshot = snapshot_composition(&session.dir, config, plugins, skill_plugins)?;
-        crate::write_json_atomic(
-            &session.dir.join("meta.json"),
-            &serde_json::json!({
-                "id": id,
-                "created_at": SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-                "config": config.display().to_string(),
-                "plugins": snapshot.plugins.iter().map(|plugin| &plugin.name).collect::<Vec<_>>(),
-            }),
-            AtomicWriteMode::Overwrite,
-        )?;
+        Self::create_composed_with_id(
+            root,
+            &id,
+            config,
+            plugins,
+            skill_plugins,
+            &Default::default(),
+        )
+    }
+
+    pub fn create_composed_with_metadata(
+        root: &Path,
+        config: &Path,
+        plugins: &[PluginSource],
+        skill_plugins: &[PluginSource],
+        metadata: &SessionMetadata,
+    ) -> Result<Self> {
+        let id = Uuid::new_v4().to_string();
+        Self::create_composed_with_id(root, &id, config, plugins, skill_plugins, metadata)
+    }
+
+    pub fn create_composed_with_id(
+        root: &Path,
+        id: &str,
+        config: &Path,
+        plugins: &[PluginSource],
+        skill_plugins: &[PluginSource],
+        metadata: &SessionMetadata,
+    ) -> Result<Self> {
+        let session = Self::at(root, id)?;
+        fs::create_dir_all(root)?;
+        fs::create_dir(&session.dir)
+            .with_context(|| format!("create session directory: {}", session.dir.display()))?;
+        let result = (|| -> Result<()> {
+            let snapshot = snapshot_composition(&session.dir, config, plugins, skill_plugins)?;
+            crate::write_json_atomic(
+                &session.dir.join("meta.json"),
+                &serde_json::json!({
+                    "id": id,
+                    "created_at": SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+                    "config": config.display().to_string(),
+                    "plugins": snapshot.plugins.iter().map(|plugin| &plugin.name).collect::<Vec<_>>(),
+                    "workspace": metadata.workspace,
+                    "parent_session_id": metadata.parent_session_id,
+                    "workflow_task_id": metadata.workflow_task_id,
+                    "agent_label": metadata.agent_label,
+                    "branch": metadata.branch,
+                    "worktree_path": metadata.worktree_path,
+                }),
+                AtomicWriteMode::Overwrite,
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = fs::remove_dir_all(&session.dir);
+            return Err(error);
+        }
         Ok(session)
     }
 
@@ -97,6 +157,39 @@ impl Session {
 
     pub fn load_state(&self) -> Result<String> {
         fs::read_to_string(self.dir.join("state.json")).context("session has no saved state")
+    }
+
+    pub fn create_plan(&self, name: &str, content: &str) -> Result<PathBuf> {
+        let name = plan_slug(name)?;
+        let plans = self.dir.join("plans");
+        fs::create_dir_all(&plans)?;
+        let mut number = next_plan_number(&plans)?;
+        loop {
+            let path = plans.join(format!("{number:04}-{name}.md"));
+            let reservation = plans.join(format!("{number:04}-.allocating"));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&reservation)
+            {
+                Ok(mut file) => {
+                    if let Err(error) = (|| -> std::io::Result<()> {
+                        file.write_all(content.as_bytes())?;
+                        file.sync_all()?;
+                        drop(file);
+                        fs::rename(&reservation, &path)
+                    })() {
+                        let _ = fs::remove_file(&reservation);
+                        return Err(error.into());
+                    }
+                    return Ok(path);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    number = number.checked_add(1).context("plan number overflow")?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 
     pub fn replace_composition(
@@ -134,6 +227,44 @@ impl Session {
             id,
         })
     }
+}
+
+fn plan_slug(name: &str) -> Result<String> {
+    let mut slug = String::new();
+    let mut separator = false;
+    for character in name.trim().chars() {
+        if character.is_ascii_alphanumeric() {
+            if separator && !slug.is_empty() {
+                slug.push('-');
+            }
+            separator = false;
+            slug.push(character.to_ascii_lowercase());
+        } else {
+            separator = true;
+        }
+        if slug.len() >= 64 {
+            break;
+        }
+    }
+    if slug.is_empty() {
+        anyhow::bail!("plan name must contain an ASCII letter or number");
+    }
+    Ok(slug)
+}
+
+fn next_plan_number(plans: &Path) -> Result<u64> {
+    let mut maximum = 0;
+    for entry in fs::read_dir(plans)? {
+        let name = entry?.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some((prefix, _)) = name.split_once('-') else {
+            continue;
+        };
+        if prefix.len() >= 4 && prefix.bytes().all(|byte| byte.is_ascii_digit()) {
+            maximum = maximum.max(prefix.parse::<u64>()?);
+        }
+    }
+    maximum.checked_add(1).context("plan number overflow")
 }
 
 fn snapshot_composition(
@@ -223,7 +354,15 @@ pub fn append(path: &Path, value: &impl Serialize) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::BTreeSet, sync::Arc, thread};
+
     use super::*;
+
+    fn empty_session(root: &Path) -> Session {
+        fs::write(root.join("config.scm"), "config").unwrap();
+        Session::create_composed(&root.join("sessions"), &root.join("config.scm"), &[], &[])
+            .unwrap()
+    }
 
     #[test]
     fn creates_and_resumes_state() {
@@ -239,6 +378,130 @@ mod tests {
             fs::read_to_string(resumed.composed_sources().unwrap().unwrap().config).unwrap(),
             "config"
         );
+    }
+
+    #[test]
+    fn stores_session_relationship_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("config.scm"), "config").unwrap();
+        let id = "11111111-1111-4111-8111-111111111111";
+        let workspace = root.path().join("workspace");
+        let worktree = root.path().join("worktree");
+        let session = Session::create_composed_with_id(
+            &root.path().join("sessions"),
+            id,
+            &root.path().join("config.scm"),
+            &[],
+            &[],
+            &SessionMetadata {
+                workspace: Some(workspace.clone()),
+                parent_session_id: Some("22222222-2222-4222-8222-222222222222".into()),
+                workflow_task_id: Some("33333333-3333-4333-8333-333333333333".into()),
+                agent_label: Some("review".into()),
+                branch: Some("phi/task/review".into()),
+                worktree_path: Some(worktree.clone()),
+            },
+        )
+        .unwrap();
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(session.dir().join("meta.json")).unwrap()).unwrap();
+        assert_eq!(metadata["id"], id);
+        assert_eq!(metadata["workspace"], workspace.to_string_lossy().as_ref());
+        assert_eq!(metadata["agent_label"], "review");
+        assert_eq!(metadata["branch"], "phi/task/review");
+        assert_eq!(
+            metadata["worktree_path"],
+            worktree.to_string_lossy().as_ref()
+        );
+    }
+
+    #[test]
+    fn explicit_id_collision_preserves_existing_session() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("config.scm"), "config").unwrap();
+        let id = "11111111-1111-4111-8111-111111111111";
+        let sessions = root.path().join("sessions");
+        let first = Session::create_composed_with_id(
+            &sessions,
+            id,
+            &root.path().join("config.scm"),
+            &[],
+            &[],
+            &Default::default(),
+        )
+        .unwrap();
+        fs::write(first.dir().join("sentinel"), "keep").unwrap();
+
+        assert!(
+            Session::create_composed_with_id(
+                &sessions,
+                id,
+                &root.path().join("config.scm"),
+                &[],
+                &[],
+                &Default::default(),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(first.dir().join("sentinel")).unwrap(),
+            "keep"
+        );
+    }
+
+    #[test]
+    fn creates_numbered_plans_concurrently() {
+        let root = tempfile::tempdir().unwrap();
+        let session = empty_session(root.path());
+        let sessions = Arc::new(root.path().join("sessions"));
+        let id = Arc::new(session.id().to_owned());
+        let workers = (0..16)
+            .map(|index| {
+                let sessions = Arc::clone(&sessions);
+                let id = Arc::clone(&id);
+                thread::spawn(move || {
+                    Session::open(&sessions, &id)
+                        .unwrap()
+                        .create_plan(&format!("Plan {index}"), &format!("content {index}"))
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let paths = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        let names = paths
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names.len(), 16);
+        let numbers = names
+            .iter()
+            .map(|name| name.split_once('-').unwrap().0.parse::<u64>().unwrap())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(numbers, (1..=16).collect());
+        assert!(paths.iter().all(|path| path.is_file()));
+        assert!(
+            fs::read_dir(session.dir().join("plans"))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with("-.allocating"))
+        );
+    }
+
+    #[test]
+    fn plan_names_are_sanitized_and_must_have_ascii_alphanumerics() {
+        let root = tempfile::tempdir().unwrap();
+        let session = empty_session(root.path());
+        let path = session
+            .create_plan("  Session storage!  ", "content")
+            .unwrap();
+        assert_eq!(path.file_name().unwrap(), "0001-session-storage.md");
+        assert!(session.create_plan("---", "content").is_err());
     }
 
     #[test]

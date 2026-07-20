@@ -42,6 +42,10 @@ impl PhiHome {
         self.root.join("skills")
     }
 
+    pub fn sessions(&self) -> PathBuf {
+        self.root.join("sessions")
+    }
+
     pub fn builtins(&self) -> PathBuf {
         self.root.join("builtins").join(env!("CARGO_PKG_VERSION"))
     }

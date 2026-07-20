@@ -455,7 +455,7 @@ fn resolve_policy_sources(
 ) -> Result<ResolvedPolicySources> {
     match session_id {
         Some(id) => {
-            let session = phi_core::session::Session::open(&workspace.join(".phi/sessions"), id)?;
+            let session = phi_core::session::Session::open(&home.sessions(), id)?;
             let sources = session
                 .composed_sources()?
                 .context("session has no composition snapshot")?;
@@ -476,7 +476,7 @@ fn resolve_session(
     workspace: &Path,
     session_id: Option<&str>,
 ) -> Result<SessionBootstrap> {
-    let sessions = workspace.join(".phi/sessions");
+    let sessions = home.sessions();
     match session_id {
         Some(id) => {
             let session = phi_core::session::Session::open(&sessions, id)?;
@@ -492,11 +492,15 @@ fn resolve_session(
         }
         None => {
             let current = resolve_sources(home, workspace)?;
-            let session = phi_core::session::Session::create_composed(
+            let session = phi_core::session::Session::create_composed_with_metadata(
                 &sessions,
                 &current.config,
                 &current.plugins,
                 &current.skill_plugins,
+                &phi_core::session::SessionMetadata {
+                    workspace: Some(workspace.to_owned()),
+                    ..Default::default()
+                },
             )?;
             let sources = session
                 .composed_sources()?
@@ -526,6 +530,7 @@ fn build_policy(
         full_access,
         &skills,
         sources.plugins.iter().any(|plugin| plugin.name == "skills"),
+        Some(&home.sessions().join(session_id)),
     ));
     let policy = phi_steel::Policy::load_with_state(
         &sources.config,
@@ -586,6 +591,35 @@ pub fn check_scheme_config(home: &phi_core::home::PhiHome, workspace: &Path) -> 
     let sources = resolve_sources(home, workspace)?;
     phi_steel::check(&sources.config, &entrypoints(&sources))?;
     phi_steel::replay_smoke(&sources.config, &entrypoints(&sources))
+}
+
+pub fn create_session_with_id(
+    options: &RunOptions,
+    id: &str,
+    metadata: phi_core::session::SessionMetadata,
+) -> Result<()> {
+    let workspace = options.workspace.canonicalize()?;
+    let _config = load_config(&options.config_path)?;
+    let home = home_for_config(&options.config_path)?;
+    let current = resolve_sources(&home, &workspace)?;
+    let session = phi_core::session::Session::create_composed_with_id(
+        &home.sessions(),
+        id,
+        &current.config,
+        &current.plugins,
+        &current.skill_plugins,
+        &metadata,
+    )?;
+    let bootstrap = build_policy(
+        &home,
+        &workspace,
+        &current,
+        None,
+        options.full_access,
+        session.id(),
+        options.output_schema.as_ref(),
+    )?;
+    session.save_state(bootstrap.policy.state())
 }
 
 fn load_user_state(home: &phi_core::home::PhiHome) -> Result<UserState> {
@@ -1144,7 +1178,7 @@ fn capabilities(
 ) -> phi_core::capability::Registry {
     let skills =
         phi_core::skill::discover(&home.builtin_skills(), &home.skills(), &home.root, &[]).unwrap();
-    capabilities_for_skills(home, full_access, &skills, true)
+    capabilities_for_skills(home, full_access, &skills, true, None)
 }
 
 fn capabilities_for_skills(
@@ -1152,6 +1186,7 @@ fn capabilities_for_skills(
     full_access: bool,
     skills: &phi_core::skill::SkillCatalog,
     expose_skills: bool,
+    session_dir: Option<&Path>,
 ) -> phi_core::capability::Registry {
     let mut capabilities = phi_core::capability::Registry::default();
     capabilities.register(phi_core::capability::ReadFile {
@@ -1162,6 +1197,11 @@ fn capabilities_for_skills(
             .then(|| skill_resource_help(&skills.skills))
             .flatten(),
     });
+    if let Some(session_dir) = session_dir {
+        capabilities.register(phi_core::capability::CreatePlan {
+            session_dir: session_dir.to_owned(),
+        });
+    }
     capabilities
 }
 
@@ -2149,6 +2189,7 @@ async fn execute_serial_call(
                         .launch(
                             executor.workspace,
                             &executor.home.root,
+                            executor.session.id(),
                             executor.session.dir(),
                             executor.plugin_roots,
                             &call.arguments,
@@ -3061,7 +3102,8 @@ mod tests {
 
     #[test]
     fn new_command_creates_a_fresh_session_and_preserves_the_old_one() {
-        let (workspace, mut options) = options();
+        let (_workspace, mut options) = options();
+        let home = home_for_config(&options.config_path).unwrap();
         let created = execute_command(
             &options,
             &CommandInvocation {
@@ -3091,17 +3133,26 @@ mod tests {
                 .iter()
                 .any(|command| command.name == "new")
         );
-        phi_core::session::Session::open(
-            &workspace.path().join(".phi/sessions"),
-            &created.session_id,
-        )
-        .unwrap();
-        let fresh_session = phi_core::session::Session::open(
-            &workspace.path().join(".phi/sessions"),
-            &fresh.session_id,
-        )
-        .unwrap();
+        phi_core::session::Session::open(&home.sessions(), &created.session_id).unwrap();
+        let fresh_session =
+            phi_core::session::Session::open(&home.sessions(), &fresh.session_id).unwrap();
         fresh_session.load_state().unwrap();
+    }
+
+    #[test]
+    fn resumes_a_home_session_from_a_different_workspace() {
+        let (_workspace, options) = options();
+        let home = home_for_config(&options.config_path).unwrap();
+        let original_workspace = options.workspace.canonicalize().unwrap();
+        let created = resolve_session(&home, &original_workspace, None).unwrap();
+        created.session.save_state("{\"messages\":[]}").unwrap();
+        let session_id = created.session.id().to_owned();
+
+        let other_workspace = tempfile::tempdir().unwrap();
+        let resumed = resolve_session(&home, other_workspace.path(), Some(&session_id)).unwrap();
+        assert_eq!(resumed.session.dir(), home.sessions().join(&session_id));
+        assert_eq!(resumed.saved_state.as_deref(), Some("{\"messages\":[]}"));
+        assert!(!other_workspace.path().join(".phi/sessions").exists());
     }
 
     #[test]
@@ -3352,7 +3403,7 @@ mod tests {
                 .any(|plugin| plugin.name == "unloaded")
         );
         let session = phi_core::session::Session::create_composed(
-            &workspace.path().join(".phi/sessions"),
+            &home.sessions(),
             &current.config,
             &current.plugins,
             &current.skill_plugins,
@@ -3479,6 +3530,7 @@ mod tests {
     #[test]
     fn model_command_creates_session_and_persists_selection() {
         let (_workspace, mut options) = options();
+        let home = home_for_config(&options.config_path).unwrap();
         let execution = execute_command(
             &options,
             &CommandInvocation {
@@ -3488,13 +3540,10 @@ mod tests {
         )
         .unwrap();
         options.session_id = Some(execution.session_id.clone());
-        let state = phi_core::session::Session::open(
-            &options.workspace.join(".phi/sessions"),
-            &execution.session_id,
-        )
-        .unwrap()
-        .load_state()
-        .unwrap();
+        let state = phi_core::session::Session::open(&home.sessions(), &execution.session_id)
+            .unwrap()
+            .load_state()
+            .unwrap();
         let state: serde_json::Value = serde_json::from_str(&state).unwrap();
         assert_eq!(state["model"], "openai/gpt-5.6-terra");
         assert_eq!(state["reasoning"], "high");
@@ -3506,12 +3555,8 @@ mod tests {
         .unwrap();
         assert_eq!(global.model.unwrap().id, "openai/gpt-5.6-terra");
 
-        let session = phi_core::session::Session::open(
-            &options.workspace.join(".phi/sessions"),
-            &execution.session_id,
-        )
-        .unwrap();
-        let home = home_for_config(&options.config_path).unwrap();
+        let session =
+            phi_core::session::Session::open(&home.sessions(), &execution.session_id).unwrap();
         let sources = session.composed_sources().unwrap().unwrap();
         let capabilities = capabilities(&home, false);
         let skills = discover_skills(&home, &options.workspace).unwrap();
@@ -3801,7 +3846,7 @@ mod tests {
                 let home = home_for_config(&options.config_path).unwrap();
                 let sources = resolve_sources(&home, workspace.path()).unwrap();
                 let session = phi_core::session::Session::create_composed(
-                    &workspace.path().join(".phi/sessions"),
+                    &home.sessions(),
                     &sources.config,
                     &sources.plugins,
                     &sources.skill_plugins,
@@ -3891,7 +3936,7 @@ mod tests {
                 let home = home_for_config(&options.config_path).unwrap();
                 let sources = resolve_sources(&home, workspace.path()).unwrap();
                 let session = phi_core::session::Session::create_composed(
-                    &workspace.path().join(".phi/sessions"),
+                    &home.sessions(),
                     &sources.config,
                     &sources.plugins,
                     &sources.skill_plugins,
@@ -3992,7 +4037,7 @@ mod tests {
                 let home = home_for_config(&options.config_path).unwrap();
                 let sources = resolve_sources(&home, workspace.path()).unwrap();
                 let session = phi_core::session::Session::create_composed(
-                    &workspace.path().join(".phi/sessions"),
+                    &home.sessions(),
                     &sources.config,
                     &sources.plugins,
                     &sources.skill_plugins,
@@ -4117,9 +4162,9 @@ mod tests {
         assert!(planning.contains("[>]"));
         assert!(!planning.contains("**Current:**"));
         assert!(planning.contains("explicitly approves"));
-        assert!(planning.contains("git rev-parse --git-path info/exclude"));
-        assert!(planning.contains("Keep `.phi/PLAN.md`"));
-        assert!(planning.contains("never delete or commit it"));
+        assert!(planning.contains("call `create_plan`"));
+        assert!(planning.contains("Multiple plans may coexist"));
+        assert!(planning.contains("never delete, archive, or move them automatically"));
         assert!(
             phi_core::plugin::read_lock(&home)
                 .unwrap()

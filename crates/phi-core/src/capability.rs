@@ -75,6 +75,51 @@ pub struct ReadFile {
     pub resource_help: Option<String>,
 }
 
+pub struct CreatePlan {
+    pub session_dir: PathBuf,
+}
+
+impl Tool for CreatePlan {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "create_plan".into(),
+            description: "Atomically allocate and create a numbered Markdown plan in the current conversation's durable plans directory. Multiple plans may coexist; this tool does not select an active plan.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Short descriptive name used in the filename." },
+                    "content": { "type": "string", "description": "Complete initial Markdown content." }
+                },
+                "required": ["name", "content"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn execute(&self, _workspace: &Path, arguments: Value) -> Result<Value> {
+        let name = arguments
+            .get("name")
+            .and_then(Value::as_str)
+            .context("create_plan requires name")?;
+        let content = arguments
+            .get("content")
+            .and_then(Value::as_str)
+            .context("create_plan requires content")?;
+        let id = self
+            .session_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .context("invalid session directory")?;
+        let root = self
+            .session_dir
+            .parent()
+            .context("session directory has no parent")?;
+        let session = crate::session::Session::open(root, id)?;
+        let path = session.create_plan(name, content)?;
+        Ok(json!({ "path": path }))
+    }
+}
+
 const DEFAULT_READ_LINES: usize = 200;
 const MAX_READ_LINES: usize = 1_000;
 const MAX_READ_BYTES: usize = 16 * 1024;
@@ -299,6 +344,29 @@ pub fn terminate_process_spec() -> ToolSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_plan_allocates_inside_the_bound_session() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let config = root.path().join("config.scm");
+        fs::write(&config, "config").unwrap();
+        let session =
+            crate::session::Session::create_composed(&sessions, &config, &[], &[]).unwrap();
+        let tool = CreatePlan {
+            session_dir: session.dir().to_owned(),
+        };
+        let result = tool
+            .execute(
+                root.path(),
+                json!({ "name": "Review storage", "content": "# Goal\n" }),
+            )
+            .unwrap();
+        let path = PathBuf::from(result["path"].as_str().unwrap());
+        assert_eq!(path.parent().unwrap(), session.dir().join("plans"));
+        assert_eq!(path.file_name().unwrap(), "0001-review-storage.md");
+        assert_eq!(fs::read_to_string(path).unwrap(), "# Goal\n");
+    }
 
     #[test]
     fn registry_dispatches_without_defining_an_editing_strategy() {

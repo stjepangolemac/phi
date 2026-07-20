@@ -16,9 +16,11 @@ function git(root, ...args) {
 async function fixture(source) {
   const base = await mkdtemp(join(tmpdir(), "phi-workflow-runner-test-"))
   const repository = join(base, "repository")
+  const home = join(base, "home")
   const taskDir = join(base, "task")
   const taskId = "66666666-6666-4666-8666-666666666666"
   await mkdir(repository)
+  await mkdir(home)
   await mkdir(taskDir)
   git(repository, "init", "-q")
   git(repository, "config", "user.name", "Phi Test")
@@ -32,8 +34,20 @@ async function fixture(source) {
   const fakePhi = join(base, "fake-phi.mjs")
   await writeFile(fakePhi, `#!/usr/bin/env node
 import { execFileSync } from "node:child_process"
-import { writeFileSync } from "node:fs"
+import { mkdirSync, writeFileSync } from "node:fs"
+const home = ${JSON.stringify(join(base, "home"))}
+const createIndex = process.argv.indexOf("internal-create-session")
+if (createIndex !== -1) {
+  const id = process.argv[createIndex + 1]
+  const session = home + "/sessions/" + id
+  mkdirSync(session, { recursive: true })
+  writeFileSync(session + "/meta.json", JSON.stringify({ id }) + "\\n")
+  writeFileSync(session + "/state.json", "{}\\n")
+  writeFileSync(session + "/events.jsonl", "")
+  process.exit(0)
+}
 const workspace = process.argv[process.argv.indexOf("--workspace") + 1]
+const sessionId = process.argv[process.argv.indexOf("--session") + 1]
 let input = ""
 process.stdin.setEncoding("utf8")
 process.stdin.on("data", chunk => { input += chunk })
@@ -44,7 +58,7 @@ process.stdin.on("end", () => {
   execFileSync("git", ["-C", workspace, "commit", "-qm", "agent change"])
   const commit = execFileSync("git", ["-C", workspace, "rev-parse", "HEAD"], { encoding: "utf8" }).trim()
   if (request.params.prompt.includes("HANG")) setInterval(() => {}, 10_000)
-  else console.log(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { value: { commit } } }))
+  else console.log(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { value: { commit }, sessionId } }))
 })
 `)
   await chmod(fakePhi, 0o755)
@@ -52,10 +66,12 @@ process.stdin.on("end", () => {
   const worktreeRoot = join(base, "worktrees", taskId)
   await writeFile(requestPath, JSON.stringify({
     taskId,
+    parentSessionId: "11111111-1111-4111-8111-111111111111",
     name: "managed-test",
     workflowPath,
     args: null,
     workspace: repository,
+    home,
     taskDir,
     phi: fakePhi,
     startedAt: Date.now(),
@@ -70,7 +86,7 @@ process.stdin.on("end", () => {
     worktreeRoot,
     limits: { maxConcurrency: 2, maxAgents: 4 }
   }))
-  return { base, repository, taskDir, requestPath, taskId, worktreeRoot }
+  return { base, home, repository, taskDir, requestPath, taskId, worktreeRoot }
 }
 
 function run(requestPath) {
@@ -94,6 +110,12 @@ async function assertClean(fixtureValue) {
     await assert.rejects(readFile(join(entry.path, "agent-change.txt")), /ENOENT/)
   }
   await assert.rejects(stat(fixtureValue.worktreeRoot), error => error?.code === "ENOENT")
+  const children = (await readFile(join(fixtureValue.taskDir, "children.jsonl"), "utf8"))
+    .trim().split("\n").map(line => JSON.parse(line))
+  const childSessionId = children.find(entry => entry.childSessionId)?.childSessionId
+  assert.ok(childSessionId)
+  assert.ok((await stat(join(fixtureValue.home, "sessions", childSessionId))).isDirectory())
+  return children
 }
 
 const header = `
@@ -143,7 +165,8 @@ export default async function () {
     }
     child.kill("SIGTERM")
     await new Promise(resolve => child.once("exit", resolve))
-    await assertClean(value)
+    const children = await assertClean(value)
+    assert.ok(children.some(entry => entry.status === "cancelled"))
   } finally {
     await rm(value.base, { recursive: true, force: true })
   }
