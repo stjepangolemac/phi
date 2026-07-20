@@ -46,7 +46,11 @@ test("bundled delegate forwards plain and structured agent requests", async () =
         additionalProperties: false
       },
       branch: "summary",
-      branch_off: "main"
+      branch_off: "main",
+      model: "openai/gpt-5.6-sol",
+      reasoning: "high",
+      timeout_ms: 30_000,
+      capabilities: "read-only"
     }
     validateWorkflowModule(
       loaded.module, "delegate", { prompt: "Summarize.", options }, true

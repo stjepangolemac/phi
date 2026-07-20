@@ -13,7 +13,7 @@ function git(root, ...args) {
   return execFileSync("git", ["-C", root, ...args], { encoding: "utf8" }).trim()
 }
 
-async function fixture(source, args = null, name = "managed-test") {
+async function fixture(source, args = null, name = "managed-test", overrides = {}) {
   const base = await mkdtemp(join(tmpdir(), "phi-workflow-runner-test-"))
   const repository = join(base, "repository")
   const home = join(base, "home")
@@ -34,10 +34,13 @@ async function fixture(source, args = null, name = "managed-test") {
   const fakePhi = join(base, "fake-phi.mjs")
   await writeFile(fakePhi, `#!/usr/bin/env node
 import { execFileSync } from "node:child_process"
-import { mkdirSync, writeFileSync } from "node:fs"
+import { appendFileSync, mkdirSync, writeFileSync } from "node:fs"
 const home = ${JSON.stringify(join(base, "home"))}
+appendFileSync(${JSON.stringify(join(base, "invocations.jsonl"))}, JSON.stringify(process.argv.slice(2)) + "\\n")
 const createIndex = process.argv.indexOf("internal-create-session")
 if (createIndex !== -1) {
+  const label = process.argv[process.argv.indexOf("--agent-label") + 1]
+  if (label === "setup-hang") await new Promise(() => {})
   const id = process.argv[createIndex + 1]
   const session = home + "/sessions/" + id
   mkdirSync(session, { recursive: true })
@@ -53,6 +56,13 @@ process.stdin.setEncoding("utf8")
 process.stdin.on("data", chunk => { input += chunk })
 process.stdin.on("end", () => {
   const request = JSON.parse(input.trim())
+  if (request.params.prompt.includes("TOOL_HANG")) {
+    console.log(JSON.stringify({ jsonrpc: "2.0", method: "agent.event", params: {
+      type: "tool_started", call_id: "tool-1", name: "exec_command", arguments: {}
+    } }))
+    setInterval(() => {}, 10_000)
+    return
+  }
   writeFileSync(workspace + "/agent-change.txt", request.params.prompt)
   execFileSync("git", ["-C", workspace, "add", "."])
   execFileSync("git", ["-C", workspace, "commit", "-qm", "agent change"])
@@ -75,6 +85,33 @@ process.stdin.on("end", () => {
     taskDir,
     phi: fakePhi,
     startedAt: Date.now(),
+    deadlineAt: Date.now() + 60_000,
+    agentContext: {
+      models: [{
+        provider: "test",
+        id: "test/model",
+        model: "model",
+        reasoning: [{ id: "low" }, { id: "high" }],
+        default_reasoning: "low",
+        service_tiers: [{ id: "default" }],
+        default_service_tier: "default"
+      }, {
+        provider: "other",
+        id: "other/model",
+        model: "model",
+        reasoning: [{ id: "high" }],
+        default_reasoning: "high",
+        service_tiers: [{ id: "priority" }],
+        default_service_tier: "priority"
+      }],
+      model: "test/model",
+      reasoning: "low",
+      serviceTier: "default",
+      allowShell: true,
+      allowWrite: true,
+      fullAccess: true,
+      interactiveApprovals: true
+    },
     git: {
       repoRoot: await realpath(repository),
       gitCommonDir: await realpath(join(repository, ".git")),
@@ -84,9 +121,13 @@ process.stdin.on("end", () => {
       repoHash: "test"
     },
     worktreeRoot,
-    limits: { maxConcurrency: 2, maxAgents: 4 }
+    limits: { maxConcurrency: 2, maxAgents: 4, maxDurationMs: 60_000 },
+    ...overrides
   }))
-  return { base, home, repository, taskDir, requestPath, taskId, worktreeRoot }
+  return {
+    base, home, repository, taskDir, requestPath, taskId, worktreeRoot,
+    invocationsPath: join(base, "invocations.jsonl")
+  }
 }
 
 function run(requestPath) {
@@ -126,6 +167,10 @@ async function assertClean(fixtureValue) {
   return children
 }
 
+async function jsonLines(path) {
+  return (await readFile(path, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse)
+}
+
 const header = `
 import { agent } from "phi:workflow"
 export const meta = { name: "managed-test", description: "managed test" }
@@ -147,9 +192,184 @@ test("runner persists bundled delegate results and child records", async () => {
       .trim().split("\n").map(line => JSON.parse(line))
     assert.equal(state.status, "completed")
     assert.equal(workflowResult.value.commit, git(value.repository, "rev-parse", "HEAD"))
-    assert.deepEqual(summary.agents, { started: 1, running: 0, completed: 1, failed: 0 })
+    assert.deepEqual(
+      summary.agents,
+      { started: 1, running: 0, completed: 1, failed: 0, timedOut: 0 }
+    )
     assert.ok(children.some(entry => entry.agentLabel === "focused" && entry.status === "created"))
     assert.ok(children.some(entry => entry.agentLabel === "focused" && entry.status === "completed"))
+  } finally {
+    await rm(value.base, { recursive: true, force: true })
+  }
+})
+
+test("agent execution controls inherit and attenuate parent selection and authority", async () => {
+  const value = await fixture(`${header}
+export default async function () {
+  await agent("PARENT", { label: "parent", timeout_ms: 5000, capabilities: "parent" })
+  await agent("READ", { label: "read", timeout_ms: 5000, capabilities: "read-only" })
+  return agent("WRITE", {
+    label: "write",
+    model: "other/model",
+    reasoning: "high",
+    timeout_ms: 5000,
+    capabilities: "workspace-write"
+  })
+}`)
+  try {
+    const result = await run(value.requestPath)
+    assert.equal(result.code, 0, result.stderr)
+    const children = await jsonLines(join(value.taskDir, "children.jsonl"))
+    const completed = Object.fromEntries(
+      children.filter(entry => entry.status === "completed").map(entry => [entry.agentLabel, entry])
+    )
+    assert.equal(completed.parent.model, "test/model")
+    assert.equal(completed.parent.reasoning, "low")
+    assert.equal(completed.parent.capabilityProfile, "parent")
+    assert.equal(completed.read.capabilityProfile, "read-only")
+    assert.equal(completed.write.model, "other/model")
+    assert.equal(completed.write.reasoning, "high")
+    assert.equal(completed.write.serviceTier, "priority")
+    assert.equal(completed.write.timeoutMs, 5000)
+
+    const creates = (await jsonLines(value.invocationsPath))
+      .filter(args => args.includes("internal-create-session"))
+    const byLabel = Object.fromEntries(creates.map(args => [
+      args[args.indexOf("--agent-label") + 1], args
+    ]))
+    assert.ok(byLabel.parent.includes("--yolo"))
+    assert.ok(!byLabel.read.includes("--yolo"))
+    assert.ok(!byLabel.read.includes("--allow-shell"))
+    assert.ok(!byLabel.read.includes("--allow-write"))
+    assert.ok(byLabel.write.includes("--allow-write"))
+    assert.ok(byLabel.write.includes("--workspace-only"))
+    assert.ok(!byLabel.write.includes("--allow-shell"))
+    assert.ok(!byLabel.write.includes("--yolo"))
+  } finally {
+    await rm(value.base, { recursive: true, force: true })
+  }
+})
+
+test("invalid model, reasoning, and capability escalation fail before child launch", async () => {
+  const invalid = [
+    ["unknown model", `{ model: "missing/model" }`],
+    ["invalid reasoning", `{ model: "other/model", reasoning: "low" }`]
+  ]
+  for (const [name, options] of invalid) {
+    const value = await fixture(`${header}
+export default async function () { return agent("INVALID", ${options}) }
+`)
+    try {
+      const result = await run(value.requestPath)
+      assert.equal(result.code, 1, `${name}: ${result.stderr}`)
+      await assert.rejects(readFile(value.invocationsPath), error => error?.code === "ENOENT")
+    } finally {
+      await rm(value.base, { recursive: true, force: true })
+    }
+  }
+
+  for (const interactiveApprovals of [true, false]) {
+    const value = await fixture(`${header}
+export default async function () {
+  return agent("ESCALATE", { capabilities: "workspace-write" })
+}`)
+    try {
+      const request = JSON.parse(await readFile(value.requestPath))
+      Object.assign(request.agentContext, {
+        allowShell: false,
+        allowWrite: false,
+        fullAccess: false,
+        interactiveApprovals
+      })
+      await writeFile(value.requestPath, JSON.stringify(request))
+      const result = await run(value.requestPath)
+      assert.equal(result.code, 1, result.stderr)
+      await assert.rejects(readFile(value.invocationsPath), error => error?.code === "ENOENT")
+    } finally {
+      await rm(value.base, { recursive: true, force: true })
+    }
+  }
+})
+
+test("agent timeouts cover queued and child-session setup phases", async () => {
+  const queued = await fixture(`${header}
+export default async function () {
+  const first = agent("HANG", { label: "running", timeout_ms: 500 })
+  const second = agent("QUEUED", { label: "queued", timeout_ms: 30 })
+  return Promise.allSettled([first, second])
+}`, null, "managed-test", {
+    limits: { maxConcurrency: 1, maxAgents: 4, maxDurationMs: 60_000 }
+  })
+  try {
+    const result = await run(queued.requestPath)
+    assert.equal(result.code, 0, result.stderr)
+    const terminal = (await jsonLines(join(queued.taskDir, "children.jsonl")))
+      .filter(entry => entry.status === "timed_out")
+    assert.ok(terminal.some(entry => entry.agentLabel === "queued" && entry.launched === false))
+    assert.ok(terminal.some(entry => entry.agentLabel === "running" && entry.launched === true))
+  } finally {
+    await rm(queued.base, { recursive: true, force: true })
+  }
+
+  const setup = await fixture(`${header}
+export default async function () {
+  try { await agent("SETUP", { label: "setup-hang", timeout_ms: 50 }) }
+  catch (error) { return error.message }
+}`)
+  try {
+    const result = await run(setup.requestPath)
+    assert.equal(result.code, 0, result.stderr)
+    const terminal = (await jsonLines(join(setup.taskDir, "children.jsonl")))
+      .find(entry => entry.status === "timed_out")
+    assert.equal(terminal.agentLabel, "setup-hang")
+    assert.equal(terminal.launched, false)
+    let invocations = []
+    try { invocations = await jsonLines(setup.invocationsPath) } catch (error) {
+      assert.equal(error?.code, "ENOENT")
+    }
+    assert.equal(invocations.filter(args => args.includes("rpc")).length, 0)
+  } finally {
+    await rm(setup.base, { recursive: true, force: true })
+  }
+})
+
+test("agent timeouts cancel model and tool work and clean managed worktrees", {
+  skip: process.platform === "win32"
+}, async () => {
+  for (const [label, prompt] of [["model", "HANG"], ["tool", "TOOL_HANG"]]) {
+    const value = await fixture(`${header}
+export default async function () {
+  try {
+    await agent(${JSON.stringify(prompt)}, {
+      label: ${JSON.stringify(label)}, branch: ${JSON.stringify(label)}, timeout_ms: 2000
+    })
+  } catch (error) { return error.message }
+}`)
+    try {
+      const result = await run(value.requestPath)
+      assert.equal(result.code, 0, result.stderr)
+      const children = await assertClean(value)
+      assert.ok(children.some(entry =>
+        entry.agentLabel === label && entry.status === "timed_out" && entry.launched === true
+      ))
+    } finally {
+      await rm(value.base, { recursive: true, force: true })
+    }
+  }
+})
+
+test("agent timeout is clamped to the workflow deadline", async () => {
+  const value = await fixture(`${header}
+export default async function () {
+  try { await agent("HANG", { timeout_ms: 5000 }) }
+  catch (error) { return error.message }
+}`, null, "managed-test", { deadlineAt: Date.now() + 1000 })
+  try {
+    const result = await run(value.requestPath)
+    assert.equal(result.code, 0, result.stderr)
+    const terminal = (await jsonLines(join(value.taskDir, "children.jsonl")))
+      .find(entry => entry.status === "timed_out")
+    assert.ok(terminal.timeoutMs > 0 && terminal.timeoutMs < 1000)
   } finally {
     await rm(value.base, { recursive: true, force: true })
   }

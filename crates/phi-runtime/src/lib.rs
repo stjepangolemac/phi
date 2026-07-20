@@ -33,6 +33,7 @@ pub struct RunOptions {
     pub allow_write: bool,
     pub interactive_approvals: bool,
     pub full_access: bool,
+    pub workspace_only: bool,
     pub processes: Arc<phi_core::process::ShellSessions>,
     pub workflows: Arc<WorkflowTasks>,
     pub output_schema: Option<serde_json::Value>,
@@ -717,12 +718,14 @@ fn resolve_session(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_policy(
     home: &phi_core::home::PhiHome,
     workspace: &Path,
     sources: &phi_core::session::ComposedSources,
     saved_state: Option<String>,
     full_access: bool,
+    workspace_only: bool,
     session_id: &str,
     output_schema: Option<&serde_json::Value>,
 ) -> Result<PolicyBootstrap> {
@@ -731,6 +734,7 @@ fn build_policy(
     let capabilities = Arc::new(capabilities_for_skills(
         home,
         full_access,
+        workspace_only,
         &skills,
         sources.plugins.iter().any(|plugin| plugin.name == "skills"),
         Some(&home.sessions().join(session_id)),
@@ -760,6 +764,7 @@ fn build_policy(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reload_composition(
     home: &phi_core::home::PhiHome,
     config_path: &Path,
@@ -767,6 +772,7 @@ fn reload_composition(
     session: &phi_core::session::Session,
     state: Option<String>,
     full_access: bool,
+    workspace_only: bool,
     output_schema: Option<&serde_json::Value>,
 ) -> Result<(PolicyBootstrap, CommandCatalog)> {
     let _config = load_config(config_path)?;
@@ -777,6 +783,7 @@ fn reload_composition(
         &sources,
         state,
         full_access,
+        workspace_only,
         session.id(),
         output_schema,
     )?;
@@ -791,6 +798,7 @@ fn reload_composition(
         &pinned,
         Some(bootstrap.policy.state().to_owned()),
         full_access,
+        workspace_only,
         session.id(),
         output_schema,
     )?;
@@ -826,8 +834,83 @@ pub fn create_session_with_id(
         &current,
         None,
         options.full_access,
+        options.workspace_only,
         session.id(),
         options.output_schema.as_ref(),
+    )?;
+    session.save_state(bootstrap.policy.state())
+}
+
+pub fn create_workflow_child_session_with_id(
+    options: &RunOptions,
+    id: &str,
+    parent_session_id: &str,
+    metadata: phi_core::session::SessionMetadata,
+    model: &str,
+    reasoning: &str,
+    service_tier: &str,
+) -> Result<()> {
+    let workspace = options.workspace.canonicalize()?;
+    let _config = load_config(&options.config_path)?;
+    let home = home_for_config(&options.config_path)?;
+    let parent = phi_core::session::Session::open(&home.sessions(), parent_session_id)?;
+    let sources = parent
+        .composed_sources()?
+        .context("workflow parent session has no composition snapshot")?;
+    let mut validation = build_policy(
+        &home,
+        &workspace,
+        &sources,
+        Some(parent.load_state()?),
+        options.full_access,
+        options.workspace_only,
+        parent.id(),
+        None,
+    )?;
+    let models = validation.policy.models()?;
+    let selected = models
+        .iter()
+        .find(|candidate| candidate.id == model)
+        .with_context(|| format!("unknown workflow agent model: {model}"))?;
+    if !selected.reasoning.is_empty()
+        && !selected
+            .reasoning
+            .iter()
+            .any(|option| option.id() == reasoning)
+    {
+        bail!("unsupported workflow agent reasoning for {model}: {reasoning}");
+    }
+    if !selected.service_tiers.is_empty()
+        && !selected
+            .service_tiers
+            .iter()
+            .any(|option| option.id() == service_tier)
+    {
+        bail!("unsupported workflow agent service tier for {model}: {service_tier}");
+    }
+
+    let mut bootstrap = build_policy(
+        &home,
+        &workspace,
+        &sources,
+        None,
+        options.full_access,
+        options.workspace_only,
+        id,
+        options.output_schema.as_ref(),
+    )?;
+    bootstrap.policy.on_event(&Event::ModelSelected {
+        model: model.to_owned(),
+        reasoning: reasoning.to_owned(),
+        service_tier: service_tier.to_owned(),
+    })?;
+    let session = phi_core::session::Session::create_composed_with_id(
+        &home.sessions(),
+        id,
+        &sources.config,
+        &sources.plugins,
+        &sources.skill_plugins,
+        &metadata,
     )?;
     session.save_state(bootstrap.policy.state())
 }
@@ -854,6 +937,7 @@ pub fn command_catalog(options: &RunOptions) -> Result<CommandCatalog> {
         &resolved.sources,
         resolved.saved_state,
         options.full_access,
+        options.workspace_only,
         options.session_id.as_deref().unwrap_or("catalog"),
         None,
     )?;
@@ -872,6 +956,7 @@ pub fn harness_status(options: &RunOptions) -> Result<HarnessStatus> {
         &resolved.sources,
         resolved.saved_state,
         options.full_access,
+        options.workspace_only,
         "status",
         None,
     )?;
@@ -934,6 +1019,7 @@ pub fn execute_command(
             &resolved.sources,
             resolved.saved_state,
             options.full_access,
+            options.workspace_only,
             resolved.session.id(),
             None,
         )?;
@@ -958,6 +1044,7 @@ pub fn execute_command(
             &resolved.session,
             resolved.saved_state,
             options.full_access,
+            options.workspace_only,
             None,
         )?;
         resolved.session.save_state(bootstrap.policy.state())?;
@@ -985,6 +1072,7 @@ pub fn execute_command(
             &resolved.sources,
             resolved.saved_state,
             options.full_access,
+            options.workspace_only,
             resolved.session.id(),
             None,
         )?;
@@ -1006,6 +1094,7 @@ pub fn execute_command(
         &resolved.sources,
         resolved.saved_state,
         options.full_access,
+        options.workspace_only,
         resolved.session.id(),
         None,
     )?;
@@ -1416,12 +1505,13 @@ fn capabilities(
 ) -> phi_core::capability::Registry {
     let skills =
         phi_core::skill::discover(&home.builtin_skills(), &home.skills(), &home.root, &[]).unwrap();
-    capabilities_for_skills(home, full_access, &skills, true, None)
+    capabilities_for_skills(home, full_access, false, &skills, true, None)
 }
 
 fn capabilities_for_skills(
     home: &phi_core::home::PhiHome,
     full_access: bool,
+    workspace_only: bool,
     skills: &phi_core::skill::SkillCatalog,
     expose_skills: bool,
     session_dir: Option<&Path>,
@@ -1429,7 +1519,7 @@ fn capabilities_for_skills(
     let mut capabilities = phi_core::capability::Registry::default();
     capabilities.register(phi_core::capability::ReadFile {
         full_access,
-        additional_root: Some(home.root.clone()),
+        additional_root: (!workspace_only).then(|| home.root.clone()),
         resource_roots: skills.resource_roots(),
         resource_help: expose_skills
             .then(|| skill_resource_help(&skills.skills))
@@ -1606,6 +1696,7 @@ async fn run(
         &resolved.sources,
         resolved.saved_state,
         options.full_access,
+        options.workspace_only,
         session.id(),
         options.output_schema.as_ref(),
     )?;
@@ -1860,7 +1951,11 @@ async fn run(
                     legacy_file_editor_tool: &legacy_file_editor_tool,
                     events,
                     cancellation,
+                    allow_shell: options.allow_shell,
+                    allow_write: options.allow_write,
+                    interactive_approvals: options.interactive_approvals,
                     full_access: options.full_access,
+                    workspace_only: options.workspace_only,
                     output_schema: options.output_schema.as_ref(),
                     workflows: Arc::clone(&options.workflows),
                     plugin_roots: &plugin_roots,
@@ -1892,6 +1987,7 @@ async fn run(
                         &sources,
                         Some(state),
                         options.full_access,
+                        options.workspace_only,
                         session.id(),
                         options.output_schema.as_ref(),
                     )?;
@@ -2135,10 +2231,36 @@ struct ToolBatchExecutor<'a> {
     legacy_file_editor_tool: &'a str,
     events: &'a mpsc::UnboundedSender<RuntimeEvent>,
     cancellation: &'a CancellationToken,
+    allow_shell: bool,
+    allow_write: bool,
+    interactive_approvals: bool,
     full_access: bool,
+    workspace_only: bool,
     output_schema: Option<&'a serde_json::Value>,
     workflows: Arc<WorkflowTasks>,
     plugin_roots: &'a std::collections::HashMap<String, PathBuf>,
+}
+
+fn workflow_agent_context(
+    policy: &mut phi_steel::Policy,
+    executor: &ToolBatchExecutor<'_>,
+) -> Result<workflow::WorkflowAgentContext> {
+    let state: serde_json::Value = serde_json::from_str(policy.state())?;
+    Ok(workflow::WorkflowAgentContext {
+        models: policy.models()?,
+        model: state["model"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .context("workflow parent has no selected model")?
+            .to_owned(),
+        reasoning: state["reasoning"].as_str().unwrap_or("").to_owned(),
+        service_tier: state["service_tier"].as_str().unwrap_or("").to_owned(),
+        allow_shell: executor.allow_shell,
+        allow_write: executor.allow_write,
+        full_access: executor.full_access,
+        interactive_approvals: executor.interactive_approvals,
+        workspace_only: executor.workspace_only,
+    })
 }
 
 async fn execute_tool_calls(
@@ -2557,19 +2679,23 @@ async fn execute_serial_call(
         ToolExecution::Workflow { action } => {
             let result = cancellable(executor.cancellation, async {
                 match action {
-                    WorkflowAction::Launch => {
-                        executor
-                            .workflows
-                            .launch(
-                                executor.workspace,
-                                &executor.home.root,
-                                executor.session.id(),
-                                executor.session.dir(),
-                                executor.plugin_roots,
-                                &arguments,
-                            )
-                            .await
-                    }
+                    WorkflowAction::Launch => match workflow_agent_context(policy, executor) {
+                        Ok(agent_context) => {
+                            executor
+                                .workflows
+                                .launch(
+                                    executor.workspace,
+                                    &executor.home.root,
+                                    executor.session.id(),
+                                    executor.session.dir(),
+                                    executor.plugin_roots,
+                                    agent_context,
+                                    &arguments,
+                                )
+                                .await
+                        }
+                        Err(error) => Err(error),
+                    },
                     WorkflowAction::Output => {
                         executor
                             .workflows
@@ -2634,6 +2760,7 @@ async fn execute_serial_call(
                 &name,
                 &arguments,
                 executor.full_access,
+                executor.workspace_only,
             )
             .map(|(result, display)| (result, Some(display)))
             .unwrap_or_else(|error| (serde_json::json!({ "error": runtime_error(&error) }), None));
@@ -2647,6 +2774,7 @@ async fn execute_serial_call(
                 executor.session,
                 Some(policy.state().to_owned()),
                 executor.full_access,
+                executor.workspace_only,
                 executor.output_schema,
             )
             .map(|(_, catalog)| {
@@ -3046,6 +3174,7 @@ fn execute_file_edit(
     name: &str,
     arguments: &serde_json::Value,
     full_access: bool,
+    workspace_only: bool,
 ) -> Result<(serde_json::Value, serde_json::Value)> {
     let preparation: phi_core::file_edit::EditPreparation =
         serde_json::from_value(policy.prepare_file_edit(name, arguments)?)?;
@@ -3053,7 +3182,7 @@ fn execute_file_edit(
         workspace,
         &preparation.targets,
         full_access,
-        Some(config_root),
+        (!workspace_only).then_some(config_root),
     )?;
     let changes: Vec<phi_core::file_edit::FileChange> = serde_json::from_value(
         policy.propose_file_edit(name, &preparation.plan, &serde_json::to_value(&snapshots)?)?,
@@ -3068,7 +3197,7 @@ fn execute_file_edit(
         &snapshots,
         &changes,
         full_access,
-        Some(config_root),
+        (!workspace_only).then_some(config_root),
     )?;
     Ok((
         serde_json::json!({ "changes": summaries }),
@@ -3367,11 +3496,83 @@ mod tests {
             allow_write: false,
             interactive_approvals: false,
             full_access: false,
+            workspace_only: false,
             processes: Arc::new(phi_core::process::ShellSessions::default()),
             workflows: Arc::new(WorkflowTasks::default()),
             output_schema: None,
         };
         (workspace, options)
+    }
+
+    #[test]
+    fn workflow_child_session_persists_validated_effective_selection() {
+        let (workspace, options) = options();
+        let home = home_for_config(&options.config_path).unwrap();
+        let sources = resolve_sources(&home, workspace.path()).unwrap();
+        let parent = phi_core::session::Session::create_composed(
+            &home.sessions(),
+            &sources.config,
+            &sources.plugins,
+            &sources.skill_plugins,
+        )
+        .unwrap();
+        let bootstrap = build_policy(
+            &home,
+            workspace.path(),
+            &sources,
+            None,
+            false,
+            false,
+            parent.id(),
+            None,
+        )
+        .unwrap();
+        parent.save_state(bootstrap.policy.state()).unwrap();
+
+        let child_id = "11111111-1111-4111-8111-111111111111";
+        create_workflow_child_session_with_id(
+            &options,
+            child_id,
+            parent.id(),
+            phi_core::session::SessionMetadata {
+                model: Some("openai/gpt-5.6-sol".into()),
+                reasoning: Some("high".into()),
+                service_tier: Some("default".into()),
+                timeout_ms: Some(30_000),
+                capability_profile: Some("read-only".into()),
+                ..Default::default()
+            },
+            "openai/gpt-5.6-sol",
+            "high",
+            "default",
+        )
+        .unwrap();
+        let child = phi_core::session::Session::open(&home.sessions(), child_id).unwrap();
+        let state: serde_json::Value = serde_json::from_str(&child.load_state().unwrap()).unwrap();
+        assert_eq!(state["model"], "openai/gpt-5.6-sol");
+        assert_eq!(state["reasoning"], "high");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(child.dir().join("meta.json")).unwrap()).unwrap();
+        assert_eq!(metadata["timeout_ms"], 30_000);
+        assert_eq!(metadata["capability_profile"], "read-only");
+
+        let invalid_id = "22222222-2222-4222-8222-222222222222";
+        let error = create_workflow_child_session_with_id(
+            &options,
+            invalid_id,
+            parent.id(),
+            Default::default(),
+            "openai/gpt-5.6-sol",
+            "invalid",
+            "default",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported workflow agent reasoning")
+        );
+        assert!(!home.sessions().join(invalid_id).exists());
     }
 
     #[test]
@@ -3504,7 +3705,11 @@ mod tests {
                     legacy_file_editor_tool: "patch",
                     events: &event_tx,
                     cancellation: &cancellation,
+                    allow_shell: false,
+                    allow_write: false,
+                    interactive_approvals: true,
                     full_access: false,
+                    workspace_only: false,
                     output_schema: None,
                     workflows: Arc::new(WorkflowTasks::default()),
                     plugin_roots: &plugin_roots,
@@ -3660,6 +3865,7 @@ mod tests {
             &command_session.sources,
             command_session.saved_state,
             options.full_access,
+            options.workspace_only,
             command_session.session.id(),
             None,
         )
@@ -3670,6 +3876,7 @@ mod tests {
             &run_session.sources,
             run_session.saved_state,
             options.full_access,
+            options.workspace_only,
             run_session.session.id(),
             Some(&schema),
         )
@@ -3693,6 +3900,7 @@ mod tests {
             &resumed_command.sources,
             resumed_command.saved_state,
             options.full_access,
+            options.workspace_only,
             resumed_command.session.id(),
             None,
         )
@@ -3703,6 +3911,7 @@ mod tests {
             &resumed_run.sources,
             resumed_run.saved_state,
             options.full_access,
+            options.workspace_only,
             resumed_run.session.id(),
             Some(&schema),
         )
@@ -4338,6 +4547,7 @@ mod tests {
                 )
             }),
             false,
+            true,
         )
         .unwrap();
 
@@ -4404,6 +4614,7 @@ mod tests {
                 )
             }),
             false,
+            false,
         )
         .unwrap();
 
@@ -4442,6 +4653,7 @@ mod tests {
                 )
             }),
             true,
+            false,
         )
         .unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap(), "new\n");
@@ -4474,10 +4686,78 @@ mod tests {
                 )
             }),
             false,
+            false,
         )
         .unwrap();
 
         assert_eq!(std::fs::read_to_string(path).unwrap(), "(configured #t)\n");
+    }
+
+    #[test]
+    fn workspace_only_editor_cannot_reconfigure_phi_home() {
+        let (workspace, options) = options();
+        let home = home_for_config(&options.config_path).unwrap();
+        let sources = resolve_sources(&home, workspace.path()).unwrap();
+        let capabilities = capabilities(&home, false);
+        let mut policy = phi_steel::Policy::load_with_state(
+            &sources.config,
+            &entrypoints(&sources),
+            &policy_config(&capabilities, "test", &load_user_state(&home).unwrap(), &[]),
+            None,
+        )
+        .unwrap();
+        let path = home.root.join("forbidden.scm");
+
+        execute_file_edit(
+            workspace.path(),
+            &home.root,
+            &mut policy,
+            "patch",
+            &serde_json::json!({
+                "patch": format!(
+                    "*** Begin Patch\n*** Add File: {}\n+(forbidden #t)\n*** End Patch\n",
+                    path.display()
+                )
+            }),
+            false,
+            true,
+        )
+        .unwrap_err();
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn workspace_only_reader_cannot_read_phi_home() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let home = phi_core::home::PhiHome {
+            root: root.path().join("home"),
+        };
+        std::fs::create_dir(&workspace).unwrap();
+        initialize_at(&home).unwrap();
+        std::fs::write(workspace.join("allowed.txt"), "allowed\n").unwrap();
+        let forbidden = home.root.join("forbidden.txt");
+        std::fs::write(&forbidden, "forbidden\n").unwrap();
+        let skills = discover_skills(&home, &workspace).unwrap();
+        let capabilities = capabilities_for_skills(&home, false, true, &skills, true, None);
+
+        let allowed = capabilities
+            .execute(
+                &workspace,
+                "read_file",
+                serde_json::json!({ "path": "allowed.txt" }),
+            )
+            .unwrap();
+        assert_eq!(allowed["content"], "allowed\n");
+        let error = capabilities
+            .execute(
+                &workspace,
+                "read_file",
+                serde_json::json!({ "path": forbidden }),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("outside allowed roots"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4538,7 +4818,11 @@ mod tests {
                     legacy_file_editor_tool: "patch",
                     events: &event_tx,
                     cancellation: &cancellation,
+                    allow_shell: false,
+                    allow_write: false,
+                    interactive_approvals: true,
                     full_access: false,
+                    workspace_only: false,
                     output_schema: None,
                     workflows: Arc::new(WorkflowTasks::default()),
                     plugin_roots: &plugin_roots,
@@ -4800,7 +5084,11 @@ mod tests {
                     legacy_file_editor_tool: "patch",
                     events: &event_tx,
                     cancellation: &cancellation,
+                    allow_shell: false,
+                    allow_write: false,
+                    interactive_approvals: true,
                     full_access: false,
+                    workspace_only: false,
                     output_schema: None,
                     workflows: Arc::new(WorkflowTasks::default()),
                     plugin_roots: &plugin_roots,
