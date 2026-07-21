@@ -12,6 +12,6 @@ Read only the references needed for the task. Use `read_file` with this skill's 
 - [architecture](references/architecture.md) for crate ownership and the request lifecycle.
 - [configuration](references/configuration.md) for paths, state, and precedence.
 - [extensions](references/extensions.md) for plugins and Steel extension points.
-- [operations](references/operations.md) for inspection, validation, reload, installation, and troubleshooting.
+- [operations](references/operations.md) for inspection, runtime logging and observability, process-output behavior, validation, reload, installation, and troubleshooting.
 
 Keep changes narrow. Inspect the active composition before editing, use existing commands and extension points, validate proportionally, then call `reload_config` to adopt the change in the current conversation.

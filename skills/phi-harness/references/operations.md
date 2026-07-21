@@ -18,6 +18,10 @@ Run `/keys` in the TUI to see composer editing, history, scrolling, queueing, ca
 
 Direct file reads and edits normally allow the workspace and Phi home. Writes still require approval. `phi --yolo` removes approval and filesystem boundaries.
 
+## Process output
+
+One-shot process execution retains at most 64 KiB separately for stdout and stderr. Short output is unchanged; longer output preserves equally sized head and tail sections around an explicit `... output truncated ...` marker and sets the corresponding `stdout_truncated` or `stderr_truncated` result flag. This keeps both startup context and trailing compiler or test failures visible while bounding tool-result size. Managed background-process collection has its own bounded buffer and reports dropped output through the same truncation flags.
+
 ## Runtime observability
 
 Runtime logging is explicitly opt-in:

@@ -17,6 +17,8 @@ Run `phi --json status` first to see the resolved composition and active configu
 - `sessions/<session-id>/`: durable flat conversation storage, including exact composition snapshots, `events.jsonl`, `state.json`, workflow runs, numbered plans, and opt-in sanitized `runtime.jsonl` observability.
 - `builtins/<version>/`: the official plugin snapshot embedded in that Phi build, plus bundled system skills.
 
+Home initialization is safe across concurrent Phi processes. Bundled files are assembled as a complete immutable snapshot and published atomically, so readers see either the previous complete snapshot or the new one rather than a partially replaced tree. Identical concurrent initialization is idempotent, stale staging directories are cleaned containment-safely, and user-owned configuration, installed plugins, and earlier complete snapshots are preserved.
+
 Never put secret values in `config.scm`, plugin configuration, status output, or the repository. Secret handles in `config.json` point to separate files.
 
 Do not edit installed or official plugin files to reconfigure Phi. All provider, model, tool, prompt, compaction, and agent behavior changes belong in `config.scm`. If a plugin does not expose a required setting, extend its configuration interface rather than patching an installed package.
